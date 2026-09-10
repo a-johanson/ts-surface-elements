@@ -1,0 +1,26 @@
+{
+    "name": "ts-surface-elements",
+    "version": "0.1.0",
+    "description": "Render textures on the surface of organic shapes using WebGL",
+    "main": "public/js/main.js",
+    "scripts": {
+        "check": "npx tsc --noEmit && npx biome check .",
+        "lint": "npx tsc --noEmit && npx biome check --write .",
+        "install-hook": "sh ./scripts/install-hook.sh",
+        "clean": "rm -rf ./public/js/*",
+        "build": "npm run clean && npx esbuild ./src/main.ts --bundle --format=esm --minify --target=es2024 --entry-names=[name] --outdir=./public/js",
+        "dev": "npx esbuild ./src/main.ts --bundle --sourcemap --format=esm --target=es2024 --entry-names=[name] --outdir=./public/js --servedir=./public"
+    },
+    "keywords": [
+        "typescript",
+        "canvas"
+    ],
+    "author": "Ane Johanson",
+    "license": "MIT",
+    "type": "module",
+    "devDependencies": {
+        "@biomejs/biome": "2.5.7",
+        "esbuild": "0.28.2",
+        "typescript": "7.0.2"
+    }
+}

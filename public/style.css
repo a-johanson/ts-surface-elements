@@ -1,0 +1,15 @@
+html,
+body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background: #000;
+    color: #fff;
+    font-family: system-ui, sans-serif;
+}
+
+canvas {
+    border: none;
+    display: block;
+    margin: 20px auto;
+}

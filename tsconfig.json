@@ -1,0 +1,14 @@
+{
+    "compilerOptions": {
+        "target": "ES2024",
+        "module": "ESNext",
+        "lib": ["ESNext", "DOM"],
+        "moduleResolution": "Bundler",
+        "strict": true,
+        "outDir": "./public/js",
+        "rootDir": "./src",
+        "noEmitOnError": true,
+        "sourceMap": true
+    },
+    "include": ["./src/**/*"]
+}
