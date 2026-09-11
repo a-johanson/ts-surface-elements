@@ -4,16 +4,16 @@
 
 Use this section to orient before opening files. Prefer the smallest relevant slice of the tree instead of reading every same-named variant. Keep this section up to date whenever a change alters module boundaries, file ownership, or the main data flow between components.
 
-This repository is currently a small canvas app with a thin TypeScript entrypoint and a static public shell.
+This repository is a WebGL 2.0 canvas app that renders elements on the surface
+of organic shapes, with a thin TypeScript entrypoint and a static public shell.
 
-* `src/main.ts` is the application entrypoint consumed by esbuild. It waits for DOM readiness, resolves `canvas#outputCanvas`, initializes the canvas element, and delegates one-frame drawing to the renderer.
-* `src/canvas-dimensions.ts` defines the `CanvasDimensions` value object that stores the physical canvas size in centimeters plus its derived pixel dimensions for a given DPI.
-* `src/render.ts` owns the single-frame renderer.
-* `src/sfc32.ts` provides the SFC32 pseudo-random number generator used by the renderer.
+* `src/main.ts` is the application entrypoint consumed by esbuild. It waits for DOM readiness, resolves `canvas#outputCanvas`, acquires a WebGL2 context, constructs a `Renderer`, and runs a `requestAnimationFrame` loop that passes elapsed time to the renderer.
+* `src/render.ts` owns the WebGL2 renderer (`Renderer` class). It compiles the surface-element shader program, sets up an empty vertex array object and immutable GL state, uploads the static view-projection and element-count uniforms once, and exposes `render(timeMs)` which uploads `uTime` and issues a single instanced draw call.
+* `src/shaders.ts` holds the GLSL ES 3.00 vertex/fragment shader sources for the surface-element renderer. The vertex shader is fully procedural (no vertex buffers) — it derives quad placement and per-element shading from `gl_VertexID`, `gl_InstanceID`, and uniforms. The fragment shader draws each element with anti-aliasing.
+* `src/mat4.ts` provides column-major `Float32Array(16)` matrix utilities (`createMat4Identity`, `createMat4Perspective`, `createMat4LookAt`, `multiplyMat4`) used to build the view-projection matrix.
 * `public/index.html` is the browser shell. It defines one `canvas#outputCanvas`, loads `public/style.css`, and boots the bundled module from `public/js/main.js`.
-* `public/style.css` holds the base page and canvas presentation styles.
+* `public/style.css` holds the base page and canvas presentation styles (black background).
 * `package.json` owns the development workflow: `dev` serves `public/` while bundling `src/main.ts`, `build` emits the production bundle to `public/js/`, `check` runs TypeScript plus Biome validation, and `lint` runs the same checks with Biome write-fixes enabled.
-* `biome.json` and `tsconfig.json` define formatting, linting, and TypeScript compiler behavior for the whole project.
 
 ## General guardrails and style
 
