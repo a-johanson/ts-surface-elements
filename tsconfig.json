@@ -8,7 +8,9 @@
         "outDir": "./public/js",
         "rootDir": "./src",
         "noEmitOnError": true,
-        "sourceMap": true
+        "sourceMap": true,
+        "skipLibCheck": true,
+        "types": ["@webgpu/types"]
     },
     "include": ["./src/**/*"]
 }

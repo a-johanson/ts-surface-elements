@@ -1,6 +1,6 @@
 # ts-surface-elements
 
-Render textures on the surface of organic shapes using WebGL
+Render textures on the surface of organic shapes using WebGPU
 
 ## Getting Started
 

@@ -1,7 +1,7 @@
 {
     "name": "ts-surface-elements",
     "version": "0.1.0",
-    "description": "Render textures on the surface of organic shapes using WebGL",
+    "description": "Render textures on the surface of organic shapes using WebGPU",
     "main": "public/js/main.js",
     "scripts": {
         "check": "npx tsc --noEmit && npx biome check .",
@@ -21,6 +21,7 @@
     "devDependencies": {
         "@biomejs/biome": "2.5.7",
         "esbuild": "0.28.2",
-        "typescript": "7.0.2"
+        "typescript": "7.0.2",
+        "@webgpu/types": "0.1.72"
     }
 }
