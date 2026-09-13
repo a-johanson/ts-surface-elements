@@ -1,10 +1,8 @@
-import {
-    BODY_FLOATS,
-    BodyBuffers,
-    createSphereSeed,
-    DEFAULT_BODY_COUNT,
-} from "./nbody/buffers.js";
+import { createMat4LookAt, createMat4Perspective, multiplyMat4 } from "./mat4.js";
+import { BodyBuffers, createSphereSeed } from "./nbody/buffers.js";
 import { ComputePipeline, DEFAULT_PARAMS, type SimParams } from "./nbody/compute-pipeline.js";
+import { RenderPipeline } from "./nbody/render-pipeline.js";
+import { OrbitControls } from "./orbit-controls.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
 /** Background clear color — near-black with a slight blue tint. */
@@ -15,8 +13,12 @@ const CLEAR_COLOR: GPUColorDict = {
     a: 1,
 };
 
-/** Number of bodies to log during the one-shot readback verification. */
-const VERIFY_LOG_COUNT = 3;
+/** Camera parameters. */
+const FIELD_OF_VIEW = (45 * Math.PI) / 180;
+const NEAR_PLANE = 0.1;
+const FAR_PLANE = 1000;
+const TARGET: readonly [number, number, number] = [0, 0, 0];
+const UP: readonly [number, number, number] = [0, 1, 0];
 
 /**
  * Returns the `#outputCanvas` element from the DOM.
@@ -33,60 +35,73 @@ function getCanvas(): HTMLCanvasElement {
 }
 
 /**
- * Logs the positions of the first {@link VERIFY_LOG_COUNT} bodies from
- * the given packed data array.
+ * Computes the view-projection matrix for the current canvas aspect ratio
+ * and camera eye position.
  *
- * @param label - Prefix label for the log output.
- * @param data - Packed body data (`count * {@link BODY_FLOATS}` floats).
+ * @param canvas - The canvas to derive the aspect ratio from.
+ * @param eye - Camera eye position [x, y, z].
+ * @returns Column-major view-projection matrix (16 floats).
  */
-function logBodies(label: string, data: Float32Array): void {
-    console.log(`${label} (first ${VERIFY_LOG_COUNT} bodies):`);
-    for (let i = 0; i < VERIFY_LOG_COUNT; i += 1) {
-        const offset = i * BODY_FLOATS;
-        console.log(
-            `  body ${i}: pos=(${data[offset].toFixed(4)}, ${data[offset + 1].toFixed(4)}, ${data[offset + 2].toFixed(4)}) mass=${data[offset + 3].toFixed(4)}`,
-        );
-    }
+function computeViewProj(
+    canvas: HTMLCanvasElement,
+    eye: readonly [number, number, number],
+): Float32Array {
+    const aspect = canvas.width / canvas.height;
+    const projection = createMat4Perspective(FIELD_OF_VIEW, aspect, NEAR_PLANE, FAR_PLANE);
+    const view = createMat4LookAt(
+        eye[0],
+        eye[1],
+        eye[2],
+        TARGET[0],
+        TARGET[1],
+        TARGET[2],
+        UP[0],
+        UP[1],
+        UP[2],
+    );
+    return multiplyMat4(projection, view);
 }
 
 /**
  * Starts the per-frame loop.
  *
- * Each frame records a compute dispatch (gravity integration step)
- * followed by a render pass that clears the canvas. The compute
- * dispatch alternates between the two ping-pong buffer directions.
+ * Each frame:
+ * 1. Syncs canvas size.
+ * 2. Records a compute dispatch (gravity integration, ping-pong swap).
+ * 3. Records a render pass that clears the canvas and draws all bodies
+ *    as instanced billboards.
+ * 4. Submits the command buffer.
  *
- * After the first compute step, a one-shot readback logs the updated
- * body positions to the console for verification.
- *
- * @param gpu - The WebGPU context to render with.
+ * @param gpu - The WebGPU context.
  * @param bodies - The ping-pong body storage buffers.
  * @param compute - The gravity compute pipeline.
+ * @param render - The billboard render pipeline.
  * @param params - Simulation parameters.
- * @param seed - The initial body data (used for pre-compute logging).
+ * @param controls - Orbit camera controls.
  */
 function startFrameLoop(
     gpu: GpuContext,
     bodies: BodyBuffers,
     compute: ComputePipeline,
+    render: RenderPipeline,
     params: SimParams,
-    seed: Float32Array,
+    controls: OrbitControls,
 ): void {
     const { device } = gpu;
     let readFromA = true;
-    let verifyFirstFrame = true;
 
-    logBodies("Before compute", seed);
-
-    const render = (): void => {
+    const frame = (): void => {
         syncCanvasSize(gpu);
+
+        const eye = controls.getEye();
+        const viewProj = computeViewProj(gpu.canvas, eye);
 
         const encoder = device.createCommandEncoder();
 
         // --- Compute pass: advance the simulation one step ---
         compute.dispatch(encoder, params, readFromA);
 
-        // --- Render pass: clear (bodies not yet rendered — step 4) ---
+        // --- Render pass: draw all bodies ---
         const texture = gpu.context.getCurrentTexture();
         const view = texture.createView();
         const pass = encoder.beginRenderPass({
@@ -99,34 +114,36 @@ function startFrameLoop(
                 },
             ],
         });
-        pass.end();
-        device.queue.submit([encoder.finish()]);
 
-        // --- One-shot readback verification after first compute step ---
-        if (verifyFirstFrame) {
-            verifyFirstFrame = false;
-            // The compute wrote to the *opposite* buffer.
-            const writtenBufferIsA = !readFromA;
-            void bodies.readback(device, writtenBufferIsA).then((data) => {
-                logBodies("After 1 compute step", data);
-            });
-        }
+        // Render reads the buffer that compute just wrote to.
+        const renderReadsA = !readFromA;
+        const invAspect = gpu.canvas.height / gpu.canvas.width;
+        render.render(pass, viewProj, eye, invAspect, renderReadsA, bodies.count);
+        pass.end();
+
+        device.queue.submit([encoder.finish()]);
 
         // Swap ping-pong direction for the next frame.
         readFromA = !readFromA;
-        requestAnimationFrame(render);
+        requestAnimationFrame(frame);
     };
 
-    requestAnimationFrame(render);
+    requestAnimationFrame(frame);
 }
 
 async function bootstrap(): Promise<void> {
     const canvas = getCanvas();
     const gpu = await createGpuContext(canvas);
-    const seed = createSphereSeed(DEFAULT_BODY_COUNT);
+    const seed = createSphereSeed(DEFAULT_PARAMS.bodyCount);
     const bodies = new BodyBuffers(gpu.device, seed);
     const compute = new ComputePipeline(gpu.device, bodies, DEFAULT_PARAMS);
-    startFrameLoop(gpu, bodies, compute, DEFAULT_PARAMS, seed);
+    const renderPl = new RenderPipeline(gpu.device, bodies, gpu.format);
+    const controls = new OrbitControls(canvas, {
+        azimuth: 0,
+        elevation: 0,
+        radius: 60,
+    });
+    startFrameLoop(gpu, bodies, compute, renderPl, DEFAULT_PARAMS, controls);
 }
 
 if (document.readyState === "loading") {

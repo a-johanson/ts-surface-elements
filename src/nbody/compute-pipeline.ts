@@ -28,12 +28,12 @@ export interface SimParams {
     readonly bodyCount: number;
 }
 
-/** Default simulation parameters — tuned for ~512 bodies in a sphere of radius 20. */
+/** Default simulation parameters — tuned for ~4096 bodies in a sphere of radius 20. */
 export const DEFAULT_PARAMS: SimParams = {
     dt: 0.005,
     g: 1.0,
-    softening: 0.5,
-    bodyCount: 512,
+    softening: 10.0,
+    bodyCount: 4 * 1024,
 };
 
 /**

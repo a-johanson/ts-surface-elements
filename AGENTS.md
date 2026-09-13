@@ -1,21 +1,22 @@
 # ts-surface-elements: render textures on the surface of organic shapes using WebGPU
 
+This repository is a WebGPU canvas app that renders elements on the surface of organic shapes, with a thin TypeScript entrypoint and a static public shell.
+
 ## Structural overview
 
-Use this section to orient before opening files. Prefer the smallest relevant slice of the tree instead of reading every same-named variant. Keep this section up to date whenever a change alters module boundaries, file ownership, or the main data flow between components.
+Use this section to orient before opening files. It describes module **responsibilities and ownership boundaries**, not the specific implementation details those modules currently happen to use. Add or modify a line only when a module's responsibility itself changes, when a new module appears, or when data flow between modules changes.
 
-This repository is a WebGPU canvas app that renders elements on the surface
-of organic shapes, with a thin TypeScript entrypoint and a static public shell.
-
-* `src/main.ts` is the application entrypoint. It resolves `canvas#outputCanvas`, initializes WebGPU via `createGpuContext`, creates the `BodyBuffers` ping-pong pair and `ComputePipeline`, and runs the `requestAnimationFrame` frame loop that dispatches the gravity compute pass and clears the canvas.
-* `src/webgpu.ts` owns WebGPU initialization (`createGpuContext`) and canvas backing-store size synchronization (`syncCanvasSize`). It exports the `GpuContext` interface bundling the device, canvas context, format, and canvas element.
-* `src/nbody/buffers.ts` defines the body data layout (two `vec4` per body: position+mass, velocity+pad), the `BodyBuffers` class managing the ping-pong storage buffer pair, the `createSphereSeed` initialization function, and a `readback` method for CPU-side verification.
-* `src/nbody/compute-pipeline.ts` owns the WGSL compute pipeline for O(n²) gravity integration. It pre-creates two bind groups (A→B and B→A) for ping-pong swapping, manages the params uniform buffer, and exposes a `dispatch` method.
-* `src/nbody/shaders.ts` holds the WGSL compute shader source string.
-* `src/mat4.ts` provides column-major `Float32Array(16)` matrix utilities (`createMat4Identity`, `createMat4Perspective`, `createMat4LookAt`, `multiplyMat4`).
-* `public/index.html` is the browser shell. It defines one `canvas#outputCanvas`, loads `public/style.css`, and boots the bundled module from `public/js/main.js`.
-* `public/style.css` holds the base page and canvas presentation styles (fullscreen black background).
-* `package.json` owns the development workflow: `dev` serves `public/` while bundling `src/main.ts`, `build` emits the production bundle to `public/js/`, `check` runs TypeScript plus Biome validation, and `lint` runs the same checks with Biome write-fixes enabled.
+* `src/main.ts` is the application entrypoint. It resolves the canvas, initializes WebGPU, seeds the body buffers, creates the compute/render pipelines and orbit camera, and runs the frame loop that advances the simulation and renders the bodies.
+* `src/webgpu.ts` owns WebGPU initialization and canvas backing-store size synchronization. It exports the `GpuContext` interface bundling the device, canvas context, format, and canvas element.
+* `src/orbit-controls.ts` owns the orbit camera — a mouse-driven spherical camera (drag to rotate, wheel to zoom) that exposes the eye position for view-matrix construction.
+* `src/nbody/buffers.ts` owns the body data layout and the ping-pong storage buffer pair, provides seed functions that produce initial body distributions, and exposes a readback method for CPU-side inspection.
+* `src/nbody/compute-pipeline.ts` owns the gravity integration compute pipeline and its ping-pong bind groups, manages the simulation parameter uniform, and exposes a method to advance the simulation one step.
+* `src/nbody/render-pipeline.ts` owns the body render pipeline and its ping-pong bind groups, manages the camera uniform, and exposes a method to draw all bodies.
+* `src/nbody/shaders.ts` holds the WGSL shader source strings.
+* `src/mat4.ts` provides column-major `Float32Array(16)` matrix utilities.
+* `public/index.html` is the browser shell. It defines the canvas, loads the stylesheet, and boots the bundled module.
+* `public/style.css` holds the base page and canvas presentation styles.
+* `package.json` owns the development workflow: `dev` serves `public/` while bundling the entrypoint, `build` emits the production bundle, `check` runs TypeScript plus Biome validation, and `lint` runs the same checks with Biome write-fixes enabled.
 
 ## General guardrails and style
 

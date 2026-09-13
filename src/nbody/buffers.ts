@@ -20,9 +20,6 @@ export const BODY_FLOATS = 8;
 /** Size of one body in bytes. */
 export const BODY_BYTES = BODY_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 
-/** Default number of bodies in the simulation. */
-export const DEFAULT_BODY_COUNT = 512;
-
 /** Buffer usage flags for body storage buffers. */
 const BODY_BUFFER_USAGE: GPUBufferUsageFlags =
     GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
