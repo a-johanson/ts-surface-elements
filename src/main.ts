@@ -1,6 +1,9 @@
 import { OrbitControls } from "./orbit-controls.js";
 import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
 import { type CameraConfig, DensityPipeline } from "./stipple/density-pipeline.js";
+import { PointBuffers } from "./stipple/point-buffers.js";
+import { PointRenderPipeline } from "./stipple/point-render-pipeline.js";
+import { SeedPipeline } from "./stipple/seed-pipeline.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
 /** Background clear color — black. */
@@ -16,6 +19,9 @@ const FIELD_OF_VIEW = (45 * Math.PI) / 180;
 const TARGET: readonly [number, number, number] = [0, 0, 0];
 const UP: readonly [number, number, number] = [0, 1, 0];
 
+/** Number of stipple points. */
+const POINT_COUNT = 4096;
+
 /**
  * Returns the `#outputCanvas` element from the DOM.
  *
@@ -29,32 +35,46 @@ function getCanvas(): HTMLCanvasElement {
     }
     return element;
 }
-
 /**
  * Starts the per-frame loop.
  *
  * Each frame:
  * 1. Syncs canvas size.
  * 2. Dispatches the density compute pass (ray-march → r32float texture).
- * 3. Begins a render pass on the canvas and blits the density texture
- *    as grayscale.
- * 4. Submits the command buffer.
+ * 3. If the canvas was resized (or this is the first frame), dispatches
+ *    the seed compute pass to regenerate the initial point distribution
+ *    into buffer A, and resets the ping-pong direction to read from A.
+ * 4. Begins a render pass that blits the density texture as grayscale,
+ *    then draws all stipple points as red billboard quads on top.
+ * 5. Submits the command buffer.
  *
  * @param gpu - The WebGPU context.
  * @param density - The density compute pipeline.
+ * @param seed - The seed compute pipeline.
+ * @param points - The ping-pong point buffer pair.
  * @param blit - The debug blit render pipeline.
+ * @param pointRender - The point render pipeline.
  * @param controls - Orbit camera controls.
  */
 function startFrameLoop(
     gpu: GpuContext,
     density: DensityPipeline,
+    seed: SeedPipeline,
+    points: PointBuffers,
     blit: DebugRenderPipeline,
+    pointRender: PointRenderPipeline,
     controls: OrbitControls,
 ): void {
     const { device } = gpu;
+    let lastCanvasWidth = 0;
+    let lastCanvasHeight = 0;
+    let readFromA = true;
 
     const frame = (): void => {
         syncCanvasSize(gpu);
+
+        const resized =
+            gpu.canvas.width !== lastCanvasWidth || gpu.canvas.height !== lastCanvasHeight;
 
         const eye = controls.getEye();
 
@@ -63,7 +83,15 @@ function startFrameLoop(
         // --- Compute pass: ray-march SDF → density texture ---
         density.dispatch(encoder, eye, gpu.canvas);
 
-        // --- Render pass: blit density to canvas ---
+        // --- Compute pass (one-shot on resize): seed buffer A ---
+        if (resized) {
+            seed.dispatch(encoder, density.getTexture(), points.bufferA, points.count);
+            lastCanvasWidth = gpu.canvas.width;
+            lastCanvasHeight = gpu.canvas.height;
+            readFromA = true;
+        }
+
+        // --- Render pass: blit density + draw points ---
         const texture = gpu.context.getCurrentTexture();
         const view = texture.createView();
         const pass = encoder.beginRenderPass({
@@ -78,6 +106,8 @@ function startFrameLoop(
         });
 
         blit.render(pass, density.getTexture());
+        pointRender.render(pass, gpu.canvas, readFromA, points.count);
+
         pass.end();
 
         device.queue.submit([encoder.finish()]);
@@ -99,14 +129,17 @@ async function bootstrap(): Promise<void> {
     };
 
     const density = new DensityPipeline(gpu.device, cameraConfig);
+    const seed = new SeedPipeline(gpu.device);
+    const points = new PointBuffers(gpu.device, POINT_COUNT);
     const blit = new DebugRenderPipeline(gpu.device, gpu.format);
+    const pointRender = new PointRenderPipeline(gpu.device, points, gpu.format);
     const controls = new OrbitControls(canvas, {
         azimuth: 0,
         elevation: 0.15,
         radius: 12,
     });
 
-    startFrameLoop(gpu, density, blit, controls);
+    startFrameLoop(gpu, density, seed, points, blit, pointRender, controls);
 }
 
 if (document.readyState === "loading") {

@@ -162,3 +162,169 @@ fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     return vec4f(v, v, v, 1.0);
 }
 `;
+
+/**
+ * Compute shader for GPU-side rejection sampling of the initial point
+ * distribution.
+ *
+ * One invocation per point index. Uses a PCG hash to generate pseudo-random
+ * `(x, y, r)` triples, where `(x, y)` is a candidate position in `[0,1]²`
+ * UV space and `r` is compared against the density value at that position.
+ * A point is accepted when `r < d` (i.e., with probability `d`). Up to
+ * `N_ATTEMPTS` candidates are tried.
+ *
+ * If all attempts are exhausted without acceptance, the shader writes the
+ * last candidate with non-negative density (if any), otherwise the first
+ * candidate (even if background). This guarantees a deterministic fallback
+ * — relaxation will pull stragglers inside the figure.
+ *
+ * The integer stride per point is `N_ATTEMPTS * 3` (two floats for the
+ * position, one for the comparison value per attempt), ensuring every
+ * invocation draws from a disjoint region of the hash sequence.
+ */
+export const SEED_SHADER = /* wgsl */ `
+struct SeedParams {
+    point_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var density_in: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> points_out: array<vec4f>;
+@group(0) @binding(2) var<uniform> params: SeedParams;
+
+const N_ATTEMPTS: u32 = 256u;
+
+fn pcg_hash(seed: u32) -> u32 {
+    let state = seed * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn pcg_rand(seed: u32) -> f32 {
+    return f32(pcg_hash(seed)) / 4294967295.0;
+}
+
+@compute @workgroup_size(64)
+fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let base = i * N_ATTEMPTS * 3u;
+    let dims = textureDimensions(density_in);
+
+    var accepted = false;
+    var temp = vec2f(0.5);
+    var last_hit = vec2f(0.5);
+    var last_hit_valid = false;
+
+    for (var a: u32 = 0u; a < N_ATTEMPTS; a = a + 1u) {
+        let s = base + a * 3u;
+        let x = pcg_rand(s + 0u);
+        let y = pcg_rand(s + 1u);
+        let r = pcg_rand(s + 2u);
+
+        let texel = min(vec2u(vec2f(x, y) * vec2f(dims)), dims - vec2u(1u));
+        let d = textureLoad(density_in, texel, 0).r;
+
+        if (a == 0u) {
+            temp = vec2f(x, y);
+        }
+
+        if (d >= 0.0) {
+            last_hit = vec2f(x, y);
+            last_hit_valid = true;
+            if (r < d) {
+                points_out[i] = vec4f(x, y, 0.0, 0.0);
+                accepted = true;
+                break;
+            }
+        }
+    }
+
+    if (!accepted) {
+        if (last_hit_valid) {
+            points_out[i] = vec4f(last_hit, 0.0, 0.0);
+        } else {
+            points_out[i] = vec4f(temp, 0.0, 0.0);
+        }
+    }
+}
+`;
+
+/**
+ * Render shader for stipple points as screen-space billboard quads.
+ *
+ * Each point is drawn as a two-triangle quad centered at the point's UV
+ * position (mapped to NDC). The quad radius is specified in pixels and
+ * converted to NDC using the canvas resolution, producing circular discs
+ * regardless of aspect ratio.
+ *
+ * The fragment shader paints a soft red disc: fragments outside radius
+ * 1.0 are discarded; alpha falls off smoothly near the edge. Uses
+ * additive blending so overlapping stipples brighten the underlying
+ * density visualization.
+ */
+export const POINT_SHADER = /* wgsl */ `
+struct PointUniform {
+    resolution: vec2u,
+    point_radius_px: f32,
+    _pad: f32,
+};
+
+@group(0) @binding(0) var<storage, read> points: array<vec4f>;
+@group(0) @binding(1) var<uniform> u: PointUniform;
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn point_vs(
+    @builtin(vertex_index) vid: u32,
+    @builtin(instance_index) iid: u32,
+) -> VertexOut {
+    // Two triangles covering [-1, 1]:
+    //   0:(-1,-1)  1:( 1,-1)  2:(-1, 1)
+    //   3:(-1, 1)  4:( 1,-1)  5:( 1, 1)
+    let corner = array<vec2f, 6>(
+        vec2f(-1.0, -1.0),
+        vec2f( 1.0, -1.0),
+        vec2f(-1.0,  1.0),
+        vec2f(-1.0,  1.0),
+        vec2f( 1.0, -1.0),
+        vec2f( 1.0,  1.0),
+    );
+
+    let point = points[iid].xy;
+    // UV [0,1] → NDC [-1,1], Y flipped (UV y-down → NDC y-up).
+    let center = vec2f(point.x * 2.0 - 1.0, 1.0 - point.y * 2.0);
+
+    // Convert pixel radius to NDC half-size.
+    let ndc_per_pixel_x = 2.0 / f32(u.resolution.x);
+    let ndc_per_pixel_y = 2.0 / f32(u.resolution.y);
+    let offset = vec2f(
+        corner[vid].x * u.point_radius_px * ndc_per_pixel_x,
+        corner[vid].y * u.point_radius_px * ndc_per_pixel_y,
+    );
+
+    var out: VertexOut;
+    out.clip_pos = vec4f(center + offset, 0.0, 1.0);
+    out.uv = corner[vid];
+    return out;
+}
+
+@fragment
+fn point_fs(in: VertexOut) -> @location(0) vec4f {
+    let dist = length(in.uv);
+    if (dist > 1.0) {
+        discard;
+    }
+    let alpha = smoothstep(1.0, 0.75, dist);
+    return vec4f(0.5, 0.1, 0.0, alpha);
+}
+`;
