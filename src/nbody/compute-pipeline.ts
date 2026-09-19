@@ -33,7 +33,7 @@ export const DEFAULT_PARAMS: SimParams = {
     dt: 0.005,
     g: 1.0,
     softening: 10.0,
-    bodyCount: 4 * 1024,
+    bodyCount: 8 * 1024,
 };
 
 /**

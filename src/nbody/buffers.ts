@@ -51,13 +51,16 @@ export function createSphereSeed(count: number, radius = 20, mass = 1): Float32A
         const theta = Math.random() * Math.PI * 2;
 
         data[offset + 0] = r * sinPhi * Math.cos(theta); // posX
-        data[offset + 1] = r * sinPhi * Math.sin(theta); // posY
+        data[offset + 1] = 0.05 * r * sinPhi * Math.sin(theta); // posY
         data[offset + 2] = r * cosPhi; // posZ
         data[offset + 3] = mass; // mass
 
         // Small random velocities — tuned later for stable orbits.
-        data[offset + 4] = (Math.random() - 0.5) * 0.5; // velX
-        data[offset + 5] = (Math.random() - 0.5) * 0.5; // velY
+        // data[offset + 4] = (Math.random() - 0.5) * 0.5; // velX
+        // data[offset + 5] = (Math.random() - 0.5) * 0.5; // velY
+        // data[offset + 6] = (Math.random() - 0.5) * 0.5; // velZ
+        data[offset + 4] = -0.5 * data[offset + 2]; // velX
+        data[offset + 5] = 0.5 * data[offset + 0]; // velY
         data[offset + 6] = (Math.random() - 0.5) * 0.5; // velZ
         data[offset + 7] = 0; // pad (unused)
     }
