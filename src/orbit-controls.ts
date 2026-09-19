@@ -28,10 +28,10 @@ const ROTATE_SENSITIVITY = 0.005;
 const ZOOM_SENSITIVITY = 0.05;
 
 /** Minimum orbit radius — prevents clipping into the scene. */
-const MIN_RADIUS = 10;
+const MIN_RADIUS = 3;
 
 /** Maximum orbit radius — prevents zooming out too far. */
-const MAX_RADIUS = 200;
+const MAX_RADIUS = 50;
 
 /** Clamp elevation to just under ±π/2 to avoid gimbal lock. */
 const MAX_ELEVATION = Math.PI / 2 - 0.01;
