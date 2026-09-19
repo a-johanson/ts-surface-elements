@@ -3,6 +3,11 @@ import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
 import { type CameraConfig, DensityPipeline } from "./stipple/density-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
 import { PointRenderPipeline } from "./stipple/point-render-pipeline.js";
+import {
+    DEFAULT_RELAX_PARAMS,
+    type RelaxParams,
+    RelaxPipeline,
+} from "./stipple/relax-pipeline.js";
 import { SeedPipeline } from "./stipple/seed-pipeline.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
@@ -35,6 +40,7 @@ function getCanvas(): HTMLCanvasElement {
     }
     return element;
 }
+
 /**
  * Starts the per-frame loop.
  *
@@ -44,25 +50,31 @@ function getCanvas(): HTMLCanvasElement {
  * 3. If the canvas was resized (or this is the first frame), dispatches
  *    the seed compute pass to regenerate the initial point distribution
  *    into buffer A, and resets the ping-pong direction to read from A.
- * 4. Begins a render pass that blits the density texture as grayscale,
+ * 4. Dispatches the relax compute pass (sample-densities + relax,
+ *    ping-pong) to redistribute points according to the density field.
+ * 5. Begins a render pass that blits the density texture as grayscale,
  *    then draws all stipple points as red billboard quads on top.
- * 5. Submits the command buffer.
+ * 6. Submits the command buffer.
  *
  * @param gpu - The WebGPU context.
  * @param density - The density compute pipeline.
  * @param seed - The seed compute pipeline.
+ * @param relax - The relax compute pipeline.
  * @param points - The ping-pong point buffer pair.
  * @param blit - The debug blit render pipeline.
  * @param pointRender - The point render pipeline.
+ * @param params - Relaxation parameters.
  * @param controls - Orbit camera controls.
  */
 function startFrameLoop(
     gpu: GpuContext,
     density: DensityPipeline,
     seed: SeedPipeline,
+    relax: RelaxPipeline,
     points: PointBuffers,
     blit: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
+    params: RelaxParams,
     controls: OrbitControls,
 ): void {
     const { device } = gpu;
@@ -91,6 +103,12 @@ function startFrameLoop(
             readFromA = true;
         }
 
+        // --- Compute passes: sample densities + relax (ping-pong) ---
+        relax.dispatch(encoder, density.getTexture(), points, params, readFromA);
+
+        // Render reads the buffer that relax just wrote to.
+        const renderReadsA = !readFromA;
+
         // --- Render pass: blit density + draw points ---
         const texture = gpu.context.getCurrentTexture();
         const view = texture.createView();
@@ -106,12 +124,14 @@ function startFrameLoop(
         });
 
         blit.render(pass, density.getTexture());
-        pointRender.render(pass, gpu.canvas, readFromA, points.count);
+        pointRender.render(pass, gpu.canvas, renderReadsA, points.count);
 
         pass.end();
 
         device.queue.submit([encoder.finish()]);
 
+        // Swap ping-pong direction for the next frame.
+        readFromA = !readFromA;
         requestAnimationFrame(frame);
     };
 
@@ -131,6 +151,7 @@ async function bootstrap(): Promise<void> {
     const density = new DensityPipeline(gpu.device, cameraConfig);
     const seed = new SeedPipeline(gpu.device);
     const points = new PointBuffers(gpu.device, POINT_COUNT);
+    const relax = new RelaxPipeline(gpu.device, points);
     const blit = new DebugRenderPipeline(gpu.device, gpu.format);
     const pointRender = new PointRenderPipeline(gpu.device, points, gpu.format);
     const controls = new OrbitControls(canvas, {
@@ -139,7 +160,17 @@ async function bootstrap(): Promise<void> {
         radius: 12,
     });
 
-    startFrameLoop(gpu, density, seed, points, blit, pointRender, controls);
+    startFrameLoop(
+        gpu,
+        density,
+        seed,
+        relax,
+        points,
+        blit,
+        pointRender,
+        DEFAULT_RELAX_PARAMS,
+        controls,
+    );
 }
 
 if (document.readyState === "loading") {

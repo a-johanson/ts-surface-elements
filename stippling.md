@@ -140,15 +140,17 @@ Points live in `[0, 1]²` UV space. Each frame, two compute dispatches:
    shape as the former n-body compute.
 
 For particle `i` at `p_i` with sampled `d_i`, neighbor `j` at `p_j`
-with `d_j`, let `r = p_j - p_i`, `r̂ = r / (|r| + ε)`:
+with `d_j`, let `r = p_i - p_j` (points *from* `j` *to* `i`),
+`r̂ = r / (|r| + ε)`:
 
 - Both inside (`d_i ≥ 0, d_j ≥ 0`):
   repel `F += k_rep · (1 - α · d_i · d_j) / (r² + ε²) · r̂`.
-  Weaker repulsion where density is high (dark) → tighter packing there.
+  `r̂` points away from `j` → repulsion. Weaker where density is high
+  (dark) → tighter packing there.
 - `i` inside, `j` outside (`d_j < 0`):
-  mild push `F += k_push / (r² + ε²) · r̂`.
+  mild push `F += k_push / (r² + ε²) · r̂` (away from `j`).
 - `i` outside (`d_i < 0`), `j` inside (`d_j ≥ 0`):
-  attract `F += k_att / (r² + ε²) · (-r̂)`.
+  attract `F += k_att / (r² + ε²) · (-r̂)` (toward `j`).
 - Both outside: no force (let them drift; insiders pull them in).
 
 Integrate with semi-implicit Euler and per-frame velocity damping:

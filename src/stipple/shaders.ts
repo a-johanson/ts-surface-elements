@@ -328,3 +328,132 @@ fn point_fs(in: VertexOut) -> @location(0) vec4f {
     return vec4f(0.5, 0.1, 0.0, alpha);
 }
 `;
+
+/**
+ * Shared parameter struct for the sample-densities and relax compute
+ * shaders.
+ *
+ * Both shaders bind the same uniform buffer; the sample-densities shader
+ * only reads `point_count`, the relax shader reads all fields.
+ */
+export const RELAX_PARAMS_DECL = /* wgsl */ `
+struct RelaxParams {
+    dt: f32,
+    k_rep: f32,
+    k_att: f32,
+    k_push: f32,
+    alpha: f32,
+    softening: f32,
+    damping: f32,
+    point_count: u32,
+};
+`;
+
+/**
+ * Sample-densities compute shader.
+ *
+ * One invocation per point. Samples the density texture at the point's
+ * UV position (nearest filtering) and writes the result into the
+ * `densities` storage buffer. This avoids O(n²) texture lookups in the
+ * relax pass — the hot loop reads densities from a buffer instead.
+ */
+export const SAMPLE_DENSITIES_SHADER = /* wgsl */ `
+${RELAX_PARAMS_DECL}
+
+@group(0) @binding(0) var density_in: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read> points_in: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> densities: array<f32>;
+@group(0) @binding(3) var<uniform> params: RelaxParams;
+
+@compute @workgroup_size(64)
+fn sample_densities_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let uv = points_in[i].xy;
+    let dims = textureDimensions(density_in);
+    let texel = min(vec2u(uv * vec2f(dims)), dims - vec2u(1u));
+    densities[i] = textureLoad(density_in, texel, 0).r;
+}
+`;
+
+/**
+ * Relax compute shader — O(n²) attraction/repulsion.
+ *
+ * One invocation per point `i`. Reads `p_i`, `v_i`, `d_i` from the input
+ * buffers, loops over all `j ≠ i` accumulating force according to the
+ * density-aware attraction/repulsion model, then integrates with
+ * semi-implicit Euler and writes the result to the output buffer.
+ *
+ * Force model (see `stippling.md`):
+ * - Both inside (`d_i ≥ 0, d_j ≥ 0`): repel, weakened by density product.
+ * - `i` inside, `j` outside (`d_j < 0`): mild push.
+ * - `i` outside (`d_i < 0`), `j` inside (`d_j ≥ 0`): attract.
+ * - Both outside: no force.
+ *
+ * The direction vector uses `diff / sqrt(r² + ε²)` (softened) instead of
+ * `diff / |diff|`, avoiding 0/0 when two points coincide and naturally
+ * softening the direction at close range.
+ */
+export const RELAX_SHADER = /* wgsl */ `
+${RELAX_PARAMS_DECL}
+
+@group(0) @binding(0) var<storage, read> points_in: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> points_out: array<vec4f>;
+@group(0) @binding(2) var<storage, read> densities: array<f32>;
+@group(0) @binding(3) var<uniform> params: RelaxParams;
+
+@compute @workgroup_size(64)
+fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let pi = points_in[i].xy;
+    let vi = points_in[i].zw;
+    let di = densities[i];
+
+    var force = vec2f(0.0);
+    let soft_sq = params.softening * params.softening;
+
+    for (var j: u32 = 0u; j < params.point_count; j = j + 1u) {
+        if (j == i) {
+            continue;
+        }
+
+        let pj = points_in[j].xy;
+        let dj = densities[j];
+
+        let diff = pi - pj;
+        let r2 = dot(diff, diff) + soft_sq;
+        let inv_r = 1.0 / sqrt(r2);
+        let inv_r2 = inv_r * inv_r;
+        let dir = diff * inv_r;
+
+        if (di >= 0.0) {
+            if (dj >= 0.0) {
+                // Both inside: repel, weaker in dense regions.
+                let rep = params.k_rep * (1.0 - params.alpha * di * dj) * inv_r2;
+                force = force + rep * dir;
+            } else {
+                // i inside, j outside: mild push.
+                force = force + params.k_push * inv_r2 * dir;
+            }
+        } else {
+            if (dj >= 0.0) {
+                // i outside, j inside: attract.
+                force = force + params.k_att * inv_r2 * (-dir);
+            }
+            // Both outside: no force.
+        }
+    }
+
+    var new_vel = (vi + force * params.dt) * params.damping;
+    var new_pos = clamp(pi + new_vel * params.dt, vec2f(0.0), vec2f(1.0));
+
+    points_out[i] = vec4f(new_pos, new_vel);
+}
+`;

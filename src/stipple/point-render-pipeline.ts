@@ -64,12 +64,12 @@ export class PointRenderPipeline {
                         blend: {
                             color: {
                                 srcFactor: "src-alpha",
-                                dstFactor: "one",
+                                dstFactor: "one-minus-src-alpha",
                                 operation: "add",
                             },
                             alpha: {
                                 srcFactor: "one",
-                                dstFactor: "one",
+                                dstFactor: "one-minus-src-alpha",
                                 operation: "add",
                             },
                         },
