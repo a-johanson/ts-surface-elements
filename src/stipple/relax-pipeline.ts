@@ -31,24 +31,16 @@ export interface RelaxParams {
     readonly softening: number;
     /** Per-frame velocity damping (0 = frozen, 1 = no damping). */
     readonly damping: number;
-    /** Number of points. */
-    readonly pointCount: number;
 }
 
 /**
  * Default relaxation parameters — initial guesses, need visual tuning.
- *
- * Points are in world space on a scene roughly 6 units across. With 4K
- * points the average nearest-neighbor spacing is on the order of
- * `sqrt(surface_area / 4096)`, small enough that a softening of `0.05`
- * keeps the force finite without dominating.
  */
 export const DEFAULT_RELAX_PARAMS: RelaxParams = {
     dt: 0.01,
-    kRep: 0.001,
-    softening: 0.05,
-    damping: 0.9,
-    pointCount: 4096,
+    kRep: 0.01,
+    softening: 0.0001,
+    damping: 0.95,
 };
 
 /**
@@ -57,6 +49,7 @@ export const DEFAULT_RELAX_PARAMS: RelaxParams = {
  */
 export class RelaxPipeline {
     private readonly device: GPUDevice;
+    private readonly points: PointBuffers;
     private readonly pipeline: GPUComputePipeline;
     private readonly layout: GPUBindGroupLayout;
     private readonly paramsBuffer: GPUBuffer;
@@ -72,6 +65,7 @@ export class RelaxPipeline {
      */
     public constructor(device: GPUDevice, points: PointBuffers) {
         this.device = device;
+        this.points = points;
 
         const module = device.createShaderModule({
             label: "stipple-relax-shader",
@@ -120,7 +114,8 @@ export class RelaxPipeline {
      * Writes the relaxation parameters into the uniform buffer.
      *
      * Layout (32 bytes): `dt, kRep, softening, damping` (4 × f32) followed
-     * by `point_count` and three padding `u32`s.
+     * by `point_count` (from the point buffer pair) and three padding
+     * `u32`s.
      *
      * @param params - The parameters to upload.
      */
@@ -132,7 +127,7 @@ export class RelaxPipeline {
         f32[1] = params.kRep;
         f32[2] = params.softening;
         f32[3] = params.damping;
-        u32[4] = params.pointCount;
+        u32[4] = this.points.count;
         this.device.queue.writeBuffer(this.paramsBuffer, 0, buffer);
     }
 
@@ -155,7 +150,7 @@ export class RelaxPipeline {
     ): void {
         this.writeParams(params);
 
-        const workgroupCount = Math.ceil(params.pointCount / WORKGROUP_SIZE);
+        const workgroupCount = Math.ceil(this.points.count / WORKGROUP_SIZE);
 
         const pass = encoder.beginComputePass();
         pass.setPipeline(this.pipeline);

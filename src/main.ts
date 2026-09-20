@@ -24,7 +24,7 @@ const TARGET: readonly [number, number, number] = [0, 0, 0];
 const UP: readonly [number, number, number] = [0, 1, 0];
 
 /** Number of stipple points. */
-const POINT_COUNT = 4096;
+const POINT_COUNT = 8 * 1024;
 
 /** Bounding box for rejection sampling of the seed distribution. */
 const SEED_PARAMS: SeedParams = {
