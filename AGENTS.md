@@ -10,10 +10,10 @@ Use this section to orient before opening files. It describes module **responsib
 * `src/webgpu.ts` owns WebGPU initialization and canvas backing-store size synchronization. It exports the `GpuContext` interface bundling the device, canvas context, format, and canvas element.
 * `src/orbit-controls.ts` owns the orbit camera — a mouse-driven spherical camera (drag to rotate, wheel to zoom) that exposes the eye position for view-matrix construction.
 * `src/stipple` owns the surface-stippling pipeline — distributing points on the surface of an SDF scene. Data flow is one-directional: seed → relax → render.
-  * `shaders.ts` owns all WGSL source, including a shared block (the scene SDF, gradient/normal helpers, and a surface-projection routine) interpolated into the seed, relax, and debug-render shaders.
-  * `point-buffers.ts` owns the 3D point data layout and the ping-pong storage buffer pair.
+  * `shaders.ts` owns all WGSL source, including a shared block (the scene SDF, gradient/normal helpers, and a surface-projection routine) interpolated into the seed, relax, normal-precompute, and debug-render shaders.
+  * `point-buffers.ts` owns the 3D point data layout (`pos` only, 16 bytes), the ping-pong storage buffer pair, and a single shared (non-ping-pong) normals buffer written every frame by the relax pipeline's normal-precompute sub-pass.
   * `seed-pipeline.ts` owns the one-shot seed compute pass: rejection sampling in a bounding box followed by surface projection. Writes buffer A at bootstrap; view-independent.
-  * `relax-pipeline.ts` owns the per-frame relax compute pass: 3D repulsion with surface re-projection. Ping-pongs between the two point buffers; view-independent.
+  * `relax-pipeline.ts` owns the per-frame relax compute pass, run as two sub-passes: a normal-precompute pass (writes the shared normals buffer from current positions) followed by curvature-aware repulsion with surface re-projection. Ping-pongs between the two point buffers; view-independent.
   * `debug-render-pipeline.ts` owns the SDF visualization — a full-screen shader that ray-marches the scene to the canvas. Owns the ray-based camera uniform and the `CameraConfig` type shared with the point renderer.
   * `point-render-pipeline.ts` owns the stipple-point renderer — billboard quads projected from world space via a view-projection matrix uniform. Reads whichever buffer relax most recently wrote.
 * `public/index.html` is the browser shell. It defines the canvas, loads the stylesheet, and boots the bundled module.

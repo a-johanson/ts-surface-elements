@@ -13,7 +13,9 @@
  * Interpolated into the seed, relax, and debug-render shaders. Contains
  * only functions, structs, and compile-time constants — no bindings.
  *
- * - `Point` — the per-point storage layout (pos + vel, 32 bytes).
+ * - `Point` — the per-point storage layout (pos only, 16 bytes). Surface
+ *   normals live in a separate shared buffer, written every frame by the
+ *   relax pipeline's normal-precompute sub-pass.
  * - `map(p)` — the scene signed distance field.
  * - `sdfGradient(p)` — central-difference gradient (6 taps); used by
  *   Newton projection so the magnitude is the true distance-field
@@ -30,7 +32,6 @@
 export const SDF_COMMON = /* wgsl */ `
 struct Point {
     pos: vec4f,
-    vel: vec4f,
 };
 
 const MAX_DIST: f32 = 50.0;
@@ -253,7 +254,6 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
         if (d < params.band) {
             let projected = projectToSurface(p, SEED_NEWTON_ITERS, SEED_ALPHA);
             points_out[i].pos = vec4f(projected, 0.0);
-            points_out[i].vel = vec4f(0.0, 0.0, 0.0, 0.0);
             accepted = true;
             break;
         }
@@ -262,30 +262,75 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
     if (!accepted) {
         let projected = projectToSurface(best_p, SEED_NEWTON_ITERS, SEED_ALPHA);
         points_out[i].pos = vec4f(projected, 0.0);
-        points_out[i].vel = vec4f(0.0, 0.0, 0.0, 0.0);
     }
 }
 `;
 
 /**
- * Relax compute shader — O(n²) surface-aware repulsion.
+ * Normal precompute shader — writes per-point surface normals.
+ *
+ * One invocation per point. Reads `points_in[i].pos` and writes
+ * `normalize(sdfGradient(p))` into `normals_out`. Runs every frame as a
+ * sub-pass of the relax pipeline, immediately before the repulsion pass,
+ * so the normals are fresh (computed from the same positions relax reads).
+ *
+ * The normals buffer is shared (not ping-ponged): relax consumes it for
+ * curvature-aware distance inflation, and the point renderer may later
+ * consume it for back-face culling.
+ */
+export const NORMAL_SHADER = /* wgsl */ `
+${SDF_COMMON}
+
+@group(0) @binding(0) var<storage, read> points_in: array<Point>;
+@group(0) @binding(1) var<storage, read_write> normals_out: array<vec4f>;
+@group(0) @binding(2) var<uniform> params: NormalParams;
+
+struct NormalParams {
+    point_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@compute @workgroup_size(64)
+fn normal_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+    let p = points_in[i].pos.xyz;
+    normals_out[i] = vec4f(normalize(sdfGradient(p)), 0.0);
+}
+`;
+
+/**
+ * Relax compute shader — O(n²) surface-aware, curvature-aware repulsion.
  *
  * One invocation per point `i`. For every other point `j`, a Euclidean
- * cutoff (`d > radius`) and a midpoint SDF line-of-sight check
- * (`|map((pi+pj)/2)| > alpha·d²`) gate the pairwise force: pairs whose
- * straight-line segment pierces empty space (narrow gaps, self-folding
- * `smin` regions, separate sheets) contribute zero, preserving the
- * Poisson-disc distribution across disconnected surface regions.
+ * cutoff and a midpoint SDF line-of-sight check gate the pairwise force.
+ * The distance used for the cutoff and the linear-decay envelope is
+ * inflated by surface-curvature divergence:
  *
- * Forces that pass the gate use linear decay `(1 - d/r)·û`. The
- * accumulated force is projected onto the tangent plane at `pi` (via the
- * SDF gradient) and integrated with a direct Euler position step
- * `x* = x + dt·F_tan`. The new position is re-projected onto the surface
- * with a few Newton steps; since per-frame drift is small,
- * `RELAX_NEWTON_ITERS = 4` with `alpha = 1` suffices.
+ *     d_infl = d_E · (1 + ½·‖n_i − n_j‖²)
  *
- * Velocity is unused (written as zero); the `Point.vel` field is retained
- * in the layout for binary stability.
+ * where `n_i` and `n_j` are both read from the shared normals buffer
+ * (written earlier in the same frame by the normal-precompute sub-pass,
+ * so they match the current positions). Pairs across narrow gaps,
+ * high-curvature regions, or self-folding `smin` geometry thus see an
+ * effectively larger separation, suppressing cross-sheet repulsion that
+ * would otherwise corrupt the Poisson-disc distribution.
+ *
+ * Distance usage:
+ *  - cutoff `d_infl > radius`        → skip (inflated)
+ *  - line-of-sight `alpha·d_E²`      → skip (Euclidean)
+ *  - decay `(1 - d_infl/radius)`     → inflated
+ *  - direction `(p_i - p_j) / d_E`   → Euclidean (unit)
+ *
+ * The accumulated force is projected onto the tangent plane at `pi` and
+ * integrated with a direct Euler position step `x* = x + dt·F_tan`. The
+ * new position is re-projected onto the surface with a few Newton steps;
+ * since per-frame drift is small, `RELAX_NEWTON_ITERS = 4` with
+ * `alpha = 1` suffices.
  */
 export const RELAX_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -304,6 +349,7 @@ struct RelaxParams {
 @group(0) @binding(0) var<storage, read> points_in: array<Point>;
 @group(0) @binding(1) var<storage, read_write> points_out: array<Point>;
 @group(0) @binding(2) var<uniform> params: RelaxParams;
+@group(0) @binding(3) var<storage, read> normals_in: array<vec4f>;
 
 const RELAX_NEWTON_ITERS: i32 = 4;
 const RELAX_ALPHA: f32 = 1.0;
@@ -315,7 +361,8 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    let pi = points_in[i].pos.xyz;
+    let p_i = points_in[i].pos.xyz;
+    let n_i = normals_in[i].xyz;
 
     var force = vec3f(0.0);
     let r = params.radius;
@@ -325,28 +372,35 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
         if (j == i) {
             continue;
         }
-        let pj = points_in[j].pos.xyz;
-        let diff = pi - pj;
-        let d = length(diff);
-        if (d == 0.0 || d > r) {
+        let p_j = points_in[j].pos.xyz;
+        let diff = p_i - p_j;
+        let d_E = length(diff);
+        if (d_E == 0.0) {
             continue;
         }
-        let m = (pi + pj) * 0.5;
-        let s = abs(map(m));
-        if (s > alpha * d * d) {
+
+        let n_j = normals_in[j].xyz;
+        let delta_n = n_i - n_j;
+        let d_infl = d_E * (1.0 + 0.5 * dot(delta_n, delta_n));
+
+        if (d_infl > r) {
             continue;
         }
-        force = force + (1.0 - d / r) * diff / d;
+
+        let m = (p_i + p_j) * 0.5;
+        if (abs(map(m)) > alpha * d_E * d_E) {
+            continue;
+        }
+
+        force = force + (1.0 - d_infl / r) * diff / d_E;
     }
 
-    let n = normalize(sdfGradient(pi));
-    force = force - dot(force, n) * n;
+    force = force - dot(force, n_i) * n_i;
 
-    let drifted = pi + params.dt * force;
+    let drifted = p_i + params.dt * force;
     let new_pos = projectToSurface(drifted, RELAX_NEWTON_ITERS, RELAX_ALPHA);
 
     points_out[i].pos = vec4f(new_pos, 0.0);
-    points_out[i].vel = vec4f(0.0, 0.0, 0.0, 0.0);
 }
 `;
 
