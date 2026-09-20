@@ -268,29 +268,37 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 /**
- * Relax compute shader — O(n²) 3D repulsion with surface re-projection.
+ * Relax compute shader — O(n²) surface-aware repulsion.
  *
- * One invocation per point `i`. Accumulates a softened 1/r repulsion from
- * every other point, integrates with semi-implicit Euler and damping, then
- * re-projects the new position onto the SDF surface via a few Newton
- * steps. Since points start on the surface, drift per frame is small, so
+ * One invocation per point `i`. For every other point `j`, a Euclidean
+ * cutoff (`d > radius`) and a midpoint SDF line-of-sight check
+ * (`|map((pi+pj)/2)| > alpha·d²`) gate the pairwise force: pairs whose
+ * straight-line segment pierces empty space (narrow gaps, self-folding
+ * `smin` regions, separate sheets) contribute zero, preserving the
+ * Poisson-disc distribution across disconnected surface regions.
+ *
+ * Forces that pass the gate use linear decay `(1 - d/r)·û`. The
+ * accumulated force is projected onto the tangent plane at `pi` (via the
+ * SDF gradient) and integrated with a direct Euler position step
+ * `x* = x + dt·F_tan`. The new position is re-projected onto the surface
+ * with a few Newton steps; since per-frame drift is small,
  * `RELAX_NEWTON_ITERS = 4` with `alpha = 1` suffices.
  *
- * There is no density texture and no inside/outside logic — every point is
- * on the surface by construction.
+ * Velocity is unused (written as zero); the `Point.vel` field is retained
+ * in the layout for binary stability.
  */
 export const RELAX_SHADER = /* wgsl */ `
 ${SDF_COMMON}
 
 struct RelaxParams {
     dt: f32,
-    k_rep: f32,
-    softening: f32,
-    damping: f32,
+    radius: f32,
+    alpha: f32,
+    _pad0: f32,
     point_count: u32,
-    _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    _pad3: u32,
 };
 
 @group(0) @binding(0) var<storage, read> points_in: array<Point>;
@@ -308,10 +316,10 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     let pi = points_in[i].pos.xyz;
-    let vi = points_in[i].vel.xyz;
 
     var force = vec3f(0.0);
-    let soft_sq = params.softening * params.softening;
+    let r = params.radius;
+    let alpha = params.alpha;
 
     for (var j: u32 = 0u; j < params.point_count; j = j + 1u) {
         if (j == i) {
@@ -319,16 +327,26 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
         }
         let pj = points_in[j].pos.xyz;
         let diff = pi - pj;
-        let r2 = dot(diff, diff) + soft_sq;
-        force = force + params.k_rep * diff / r2;
+        let d = length(diff);
+        if (d == 0.0 || d > r) {
+            continue;
+        }
+        let m = (pi + pj) * 0.5;
+        let s = abs(map(m));
+        if (s > alpha * d * d) {
+            continue;
+        }
+        force = force + (1.0 - d / r) * diff / d;
     }
 
-    let new_vel = (vi + force * params.dt) * params.damping;
-    let drifted = pi + new_vel * params.dt;
+    let n = normalize(sdfGradient(pi));
+    force = force - dot(force, n) * n;
+
+    let drifted = pi + params.dt * force;
     let new_pos = projectToSurface(drifted, RELAX_NEWTON_ITERS, RELAX_ALPHA);
 
     points_out[i].pos = vec4f(new_pos, 0.0);
-    points_out[i].vel = vec4f(new_vel, 0.0);
+    points_out[i].vel = vec4f(0.0, 0.0, 0.0, 0.0);
 }
 `;
 

@@ -1,10 +1,12 @@
 /**
- * Relax compute pipeline — 3D repulsion with surface re-projection.
+ * Relax compute pipeline — surface-aware repulsion with re-projection.
  *
  * Each frame, one compute dispatch is recorded: each invocation `i` reads
- * `p_i`, `v_i`, loops over all `j ≠ i` accumulating a softened 1/r
- * repulsion force in 3D, integrates with semi-implicit Euler and damping,
- * then Newton-projects the new position back onto the SDF surface.
+ * `p_i`, loops over all `j ≠ i` accumulating a linear-decay repulsion
+ * gated by a Euclidean cutoff and a midpoint SDF line-of-sight check,
+ * projects the accumulated force onto the tangent plane at `p_i`,
+ * integrates with a direct Euler position step, then Newton-projects the
+ * new position back onto the SDF surface.
  *
  * Ping-pong: the dispatch reads from one point buffer and writes to the
  * other. Two static bind groups cover both directions. There is no
@@ -25,22 +27,19 @@ const PARAMS_BUFFER_BYTES = 32;
 export interface RelaxParams {
     /** Time step per frame. */
     readonly dt: number;
-    /** Repulsion strength between point pairs. */
-    readonly kRep: number;
-    /** Plummer-style softening length, prevents singularities. */
-    readonly softening: number;
-    /** Per-frame velocity damping (0 = frozen, 1 = no damping). */
-    readonly damping: number;
+    /** Interaction radius — pairs farther than this are ignored. */
+    readonly radius: number;
+    /** Midpoint line-of-sight threshold; pairs with `|map(m)| > alpha·d²` are skipped. */
+    readonly alpha: number;
 }
 
 /**
  * Default relaxation parameters — initial guesses, need visual tuning.
  */
 export const DEFAULT_RELAX_PARAMS: RelaxParams = {
-    dt: 0.01,
-    kRep: 0.01,
-    softening: 0.0001,
-    damping: 0.95,
+    dt: 0.02,
+    radius: 0.25,
+    alpha: 0.2,
 };
 
 /**
@@ -113,7 +112,7 @@ export class RelaxPipeline {
     /**
      * Writes the relaxation parameters into the uniform buffer.
      *
-     * Layout (32 bytes): `dt, kRep, softening, damping` (4 × f32) followed
+     * Layout (32 bytes): `dt, radius, alpha, _pad0` (4 × f32) followed
      * by `point_count` (from the point buffer pair) and three padding
      * `u32`s.
      *
@@ -124,9 +123,8 @@ export class RelaxPipeline {
         const f32 = new Float32Array(buffer);
         const u32 = new Uint32Array(buffer);
         f32[0] = params.dt;
-        f32[1] = params.kRep;
-        f32[2] = params.softening;
-        f32[3] = params.damping;
+        f32[1] = params.radius;
+        f32[2] = params.alpha;
         u32[4] = this.points.count;
         this.device.queue.writeBuffer(this.paramsBuffer, 0, buffer);
     }
