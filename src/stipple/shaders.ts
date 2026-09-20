@@ -175,8 +175,7 @@ fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let n = calcNormal(p);
     let light_dir = normalize(vec3f(0.5, 0.8, 0.6));
     let lambert = max(dot(n, light_dir), 0.0);
-    let v = 1.0 - lambert;
-    return vec4f(v, v, v, 1.0);
+    return vec4f(lambert, lambert, lambert, 1.0);
 }
 `;
 
@@ -280,7 +279,9 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
  * There is no density texture and no inside/outside logic — every point is
  * on the surface by construction.
  */
-export const RELAX_PARAMS_DECL = /* wgsl */ `
+export const RELAX_SHADER = /* wgsl */ `
+${SDF_COMMON}
+
 struct RelaxParams {
     dt: f32,
     k_rep: f32,
@@ -291,11 +292,6 @@ struct RelaxParams {
     _pad1: u32,
     _pad2: u32,
 };
-`;
-
-export const RELAX_SHADER = /* wgsl */ `
-${SDF_COMMON}
-${RELAX_PARAMS_DECL}
 
 @group(0) @binding(0) var<storage, read> points_in: array<Point>;
 @group(0) @binding(1) var<storage, read_write> points_out: array<Point>;
