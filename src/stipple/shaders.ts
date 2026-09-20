@@ -1,44 +1,40 @@
 /**
- * WGSL shader source strings for the stippling pipeline.
+ * WGSL shader source strings for the surface-stippling pipeline.
  *
- * Kept separate from pipeline TypeScript so the shader code is readable
- * and syntax-highlightable as WGSL.
+ * Points live in 3D world space on the surface of the SDF scene. The
+ * shared {@link SDF_COMMON} block — interpolated into every shader that
+ * needs the SDF — owns the scene description (`map`), gradient/normal
+ * helpers, and a Newton-Raphson surface projection routine.
  */
 
 /**
- * Compute shader that ray-marches the SDF scene and writes a per-pixel
- * density value into an `r32float` storage texture.
+ * Shared WGSL block: SDF scene, gradient, normal, and surface projection.
  *
- * Each invocation owns one pixel (workgroup size 8×8). The density
- * encoding is:
- *   `-1.0` — ray missed the scene (background).
- *   `[0, 1]` — ray hit; value is `1 - Lambert` luminance under a fixed
- *              light direction.
+ * Interpolated into the seed, relax, and debug-render shaders. Contains
+ * only functions, structs, and compile-time constants — no bindings.
  *
- * A storage texture is used instead of a render-target color attachment
- * because `r32float` is not a renderable format in WebGPU. The same
- * texture is later bound as `texture_2d<f32>` (nearest) for reads.
+ * - `Point` — the per-point storage layout (pos + vel, 32 bytes).
+ * - `map(p)` — the scene signed distance field.
+ * - `sdfGradient(p)` — central-difference gradient (6 taps); used by
+ *   Newton projection so the magnitude is the true distance-field
+ *   gradient (tetrahedron normals only give a direction).
+ * - `calcNormal(p)` — normalized gradient; used by the debug render for
+ *   Lambert shading.
+ * - `projectToSurface(p, iters, alpha)` — Newton-Raphson steps
+ *   `p -= alpha * (f(p) / |∇f|²) * ∇f` until `|f(p)| < SURF_EPS` or the
+ *   iteration budget is exhausted. For a true distance field (`|∇f| ≈ 1`)
+ *   and `alpha = 1`, each step lands on the surface in one go; smaller
+ *   `alpha` guards against overshoot in `smin` blend regions where the
+ *   field is not a perfect distance function.
  */
-export const DENSITY_SHADER = /* wgsl */ `
-struct CameraRays {
-    eye: vec3f,
-    half_width: f32,
-    forward: vec3f,
-    half_height: f32,
-    right: vec3f,
-    _pad0: f32,
-    up: vec3f,
-    _pad1: f32,
-    resolution: vec2u,
-    _pad2: vec2u,
+export const SDF_COMMON = /* wgsl */ `
+struct Point {
+    pos: vec4f,
+    vel: vec4f,
 };
-
-@group(0) @binding(0) var<uniform> camera: CameraRays;
-@group(0) @binding(1) var density_out: texture_storage_2d<r32float, write>;
 
 const MAX_DIST: f32 = 50.0;
 const SURF_EPS: f32 = 0.001;
-const MAX_STEPS: i32 = 96;
 
 fn sdSphere(p: vec3f, r: f32) -> f32 {
     return length(p) - r;
@@ -67,14 +63,68 @@ fn map(p: vec3f) -> f32 {
     return smin(d12, d3, 0.6);
 }
 
-fn calcNormal(p: vec3f) -> vec3f {
-    let e = 0.001;
-    return normalize(vec3f(
+fn sdfGradient(p: vec3f) -> vec3f {
+    let e = 0.0005;
+    return vec3f(
         map(p + vec3f(e, 0.0, 0.0)) - map(p + vec3f(-e, 0.0, 0.0)),
         map(p + vec3f(0.0, e, 0.0)) - map(p + vec3f(0.0, -e, 0.0)),
         map(p + vec3f(0.0, 0.0, e)) - map(p + vec3f(0.0, 0.0, -e)),
-    ));
+    ) / (2.0 * e);
 }
+
+fn calcNormal(p: vec3f) -> vec3f {
+    return normalize(sdfGradient(p));
+}
+
+fn projectToSurface(p_in: vec3f, iters: i32, alpha: f32) -> vec3f {
+    var p = p_in;
+    for (var i: i32 = 0; i < iters; i = i + 1) {
+        let f = map(p);
+        if (abs(f) < SURF_EPS) {
+            break;
+        }
+        let g = sdfGradient(p);
+        let gl2 = dot(g, g);
+        if (gl2 < 1e-10) {
+            break;
+        }
+        p = p - alpha * (f / gl2) * g;
+    }
+    return p;
+}
+`;
+
+/**
+ * Debug render shader — ray-marches the SDF per fragment and writes
+ * grayscale Lambert shading directly to the canvas color attachment.
+ *
+ * Replaces the former two-stage density-compute + blit approach. With
+ * surface-space points nothing consumes a density texture, so the
+ * `r32float` storage texture and separate blit pipeline are gone; the
+ * SDF is visualized by a single full-screen fragment shader.
+ *
+ * Background (ray miss) maps to black; hit fragments map to
+ * `[0, 1]` gray via `1 - Lambert`.
+ */
+export const DEBUG_RENDER_SHADER = /* wgsl */ `
+${SDF_COMMON}
+
+struct CameraRays {
+    eye: vec3f,
+    half_width: f32,
+    forward: vec3f,
+    half_height: f32,
+    right: vec3f,
+    _pad0: f32,
+    up: vec3f,
+    _pad1: f32,
+    resolution: vec2u,
+    _pad2: vec2u,
+};
+
+@group(0) @binding(0) var<uniform> camera: CameraRays;
+
+const MAX_STEPS: i32 = 96;
 
 fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
     var t = 0.0;
@@ -92,57 +142,8 @@ fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
     return -1.0;
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn density_cs(@builtin(global_invocation_id) gid: vec3u) {
-    let res = camera.resolution;
-    if (gid.x >= res.x || gid.y >= res.y) {
-        return;
-    }
-
-    let frag_coord = vec2f(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-    let resolution_f = vec2f(res);
-    let uv = frag_coord / resolution_f;
-    let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-
-    let rd = normalize(
-        camera.forward
-        + ndc.x * camera.half_width * camera.right
-        + ndc.y * camera.half_height * camera.up
-    );
-
-    let t = rayMarch(camera.eye, rd);
-    var density: f32;
-    if (t < 0.0) {
-        density = -1.0;
-    } else {
-        let p = camera.eye + rd * t;
-        let n = calcNormal(p);
-        let light_dir = normalize(vec3f(0.5, 0.8, 0.6));
-        let lambert = max(dot(n, light_dir), 0.0);
-        density = 1.0 - lambert;
-    }
-
-    textureStore(density_out, gid.xy, vec4f(density, 0.0, 0.0, 0.0));
-}
-`;
-
-/**
- * Debug render shader that blits the density texture to the canvas as
- * grayscale.
- *
- * Background (`-1.0`) maps to black; hit values (`[0, 1]`) map to
- * `[0, 1]` gray. Uses `textureLoad` with integer texel coordinates
- * derived from `@builtin(position)`, so no sampler or UV interpolation
- * is needed — the density texture is the same size as the canvas.
- */
-export const BLIT_SHADER = /* wgsl */ `
-@group(0) @binding(0) var density_in: texture_2d<f32>;
-
 @vertex
 fn blit_vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
-    // Two triangles covering [-1, 1] in NDC:
-    //   0:(-1,-1)  1:( 1,-1)  2:(-1, 1)
-    //   3:(-1, 1)  4:( 1,-1)  5:( 1, 1)
     let pos = array<vec2f, 6>(
         vec2f(-1.0, -1.0),
         vec2f( 1.0, -1.0),
@@ -156,45 +157,64 @@ fn blit_vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
 
 @fragment
 fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
-    let texel = vec2u(frag_coord.xy);
-    let d = textureLoad(density_in, texel, 0).r;
-    let v = max(d, 0.0);
+    let res = camera.resolution;
+    let uv = frag_coord.xy / vec2f(res);
+    let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+    let rd = normalize(
+        camera.forward
+        + ndc.x * camera.half_width * camera.right
+        + ndc.y * camera.half_height * camera.up
+    );
+
+    let t = rayMarch(camera.eye, rd);
+    if (t < 0.0) {
+        return vec4f(0.0, 0.0, 0.0, 1.0);
+    }
+    let p = camera.eye + rd * t;
+    let n = calcNormal(p);
+    let light_dir = normalize(vec3f(0.5, 0.8, 0.6));
+    let lambert = max(dot(n, light_dir), 0.0);
+    let v = 1.0 - lambert;
     return vec4f(v, v, v, 1.0);
 }
 `;
 
 /**
- * Compute shader for GPU-side rejection sampling of the initial point
- * distribution.
+ * Seed compute shader — 3D rejection sampling in a bounding box.
  *
- * One invocation per point index. Uses a PCG hash to generate pseudo-random
- * `(x, y, r)` triples, where `(x, y)` is a candidate position in `[0,1]²`
- * UV space and `r` is compared against the density value at that position.
- * A point is accepted when `r < d` (i.e., with probability `d`). Up to
- * `N_ATTEMPTS` candidates are tried.
+ * One invocation per point. Generates pseudo-random candidates uniformly
+ * in `[bbox_min, bbox_max]³` via a PCG hash and accepts the first whose
+ * `|map(p)| < band`. Accepted (and fallback) points are projected onto
+ * the surface with Newton-Raphson before being written.
  *
- * If all attempts are exhausted without acceptance, the shader writes the
- * last candidate with non-negative density (if any), otherwise the first
- * candidate (even if background). This guarantees a deterministic fallback
- * — relaxation will pull stragglers inside the figure.
+ * Fallback: if no candidate lands inside the band, the candidate with the
+ * smallest `|map(p)|` is chosen (tracked via a running minimum) and
+ * projected — relaxation will pull stragglers into place.
  *
- * The integer stride per point is `N_ATTEMPTS * 3` (two floats for the
- * position, one for the comparison value per attempt), ensuring every
- * invocation draws from a disjoint region of the hash sequence.
+ * `N_ATTEMPTS` is a compile-time knob (paired with `MAX_STEPS` /
+ * `SURF_EPS`); the bbox and band are uniform-side so the scene can be
+ * re-tuned without recompiling.
  */
 export const SEED_SHADER = /* wgsl */ `
+${SDF_COMMON}
+
 struct SeedParams {
+    bbox_min: vec3f,
+    band: f32,
+    bbox_max: vec3f,
     point_count: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
 };
 
-@group(0) @binding(0) var density_in: texture_2d<f32>;
-@group(0) @binding(1) var<storage, read_write> points_out: array<vec4f>;
-@group(0) @binding(2) var<uniform> params: SeedParams;
+@group(0) @binding(0) var<storage, read_write> points_out: array<Point>;
+@group(0) @binding(1) var<uniform> params: SeedParams;
 
 const N_ATTEMPTS: u32 = 256u;
+const SEED_NEWTON_ITERS: i32 = 16;
+const SEED_ALPHA: f32 = 0.5;
 
 fn pcg_hash(seed: u32) -> u32 {
     let state = seed * 747796405u + 2891336453u;
@@ -214,68 +234,128 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     let base = i * N_ATTEMPTS * 3u;
-    let dims = textureDimensions(density_in);
-
     var accepted = false;
-    var temp = vec2f(0.5);
-    var last_hit = vec2f(0.5);
-    var last_hit_valid = false;
+    var best_p = (params.bbox_min + params.bbox_max) * 0.5;
+    var best_d = 1e9;
 
     for (var a: u32 = 0u; a < N_ATTEMPTS; a = a + 1u) {
         let s = base + a * 3u;
-        let x = pcg_rand(s + 0u);
-        let y = pcg_rand(s + 1u);
-        let r = pcg_rand(s + 2u);
+        let rx = pcg_rand(s + 0u);
+        let ry = pcg_rand(s + 1u);
+        let rz = pcg_rand(s + 2u);
+        let p = mix(params.bbox_min, params.bbox_max, vec3f(rx, ry, rz));
+        let d = abs(map(p));
 
-        let texel = min(vec2u(vec2f(x, y) * vec2f(dims)), dims - vec2u(1u));
-        let d = textureLoad(density_in, texel, 0).r;
-
-        if (a == 0u) {
-            temp = vec2f(x, y);
+        if (d < best_d) {
+            best_d = d;
+            best_p = p;
         }
 
-        if (d >= 0.0) {
-            last_hit = vec2f(x, y);
-            last_hit_valid = true;
-            if (r < d) {
-                points_out[i] = vec4f(x, y, 0.0, 0.0);
-                accepted = true;
-                break;
-            }
+        if (d < params.band) {
+            let projected = projectToSurface(p, SEED_NEWTON_ITERS, SEED_ALPHA);
+            points_out[i].pos = vec4f(projected, 0.0);
+            points_out[i].vel = vec4f(0.0, 0.0, 0.0, 0.0);
+            accepted = true;
+            break;
         }
     }
 
     if (!accepted) {
-        if (last_hit_valid) {
-            points_out[i] = vec4f(last_hit, 0.0, 0.0);
-        } else {
-            points_out[i] = vec4f(temp, 0.0, 0.0);
-        }
+        let projected = projectToSurface(best_p, SEED_NEWTON_ITERS, SEED_ALPHA);
+        points_out[i].pos = vec4f(projected, 0.0);
+        points_out[i].vel = vec4f(0.0, 0.0, 0.0, 0.0);
     }
 }
 `;
 
 /**
- * Render shader for stipple points as screen-space billboard quads.
+ * Relax compute shader — O(n²) 3D repulsion with surface re-projection.
  *
- * Each point is drawn as a two-triangle quad centered at the point's UV
- * position (mapped to NDC). The quad radius is specified in pixels and
- * converted to NDC using the canvas resolution, producing circular discs
- * regardless of aspect ratio.
+ * One invocation per point `i`. Accumulates a softened 1/r repulsion from
+ * every other point, integrates with semi-implicit Euler and damping, then
+ * re-projects the new position onto the SDF surface via a few Newton
+ * steps. Since points start on the surface, drift per frame is small, so
+ * `RELAX_NEWTON_ITERS = 4` with `alpha = 1` suffices.
  *
- * The fragment shader paints a soft red disc: fragments outside radius
- * 1.0 are discarded; alpha falls off smoothly near the edge. Uses
- * additive blending so overlapping stipples brighten the underlying
- * density visualization.
+ * There is no density texture and no inside/outside logic — every point is
+ * on the surface by construction.
+ */
+export const RELAX_PARAMS_DECL = /* wgsl */ `
+struct RelaxParams {
+    dt: f32,
+    k_rep: f32,
+    softening: f32,
+    damping: f32,
+    point_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+`;
+
+export const RELAX_SHADER = /* wgsl */ `
+${SDF_COMMON}
+${RELAX_PARAMS_DECL}
+
+@group(0) @binding(0) var<storage, read> points_in: array<Point>;
+@group(0) @binding(1) var<storage, read_write> points_out: array<Point>;
+@group(0) @binding(2) var<uniform> params: RelaxParams;
+
+const RELAX_NEWTON_ITERS: i32 = 4;
+const RELAX_ALPHA: f32 = 1.0;
+
+@compute @workgroup_size(64)
+fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let pi = points_in[i].pos.xyz;
+    let vi = points_in[i].vel.xyz;
+
+    var force = vec3f(0.0);
+    let soft_sq = params.softening * params.softening;
+
+    for (var j: u32 = 0u; j < params.point_count; j = j + 1u) {
+        if (j == i) {
+            continue;
+        }
+        let pj = points_in[j].pos.xyz;
+        let diff = pi - pj;
+        let r2 = dot(diff, diff) + soft_sq;
+        force = force + params.k_rep * diff / r2;
+    }
+
+    let new_vel = (vi + force * params.dt) * params.damping;
+    let drifted = pi + new_vel * params.dt;
+    let new_pos = projectToSurface(drifted, RELAX_NEWTON_ITERS, RELAX_ALPHA);
+
+    points_out[i].pos = vec4f(new_pos, 0.0);
+    points_out[i].vel = vec4f(new_vel, 0.0);
+}
+`;
+
+/**
+ * Point render shader — draws stipple points as screen-space billboard
+ * quads projected from 3D world space.
+ *
+ * The vertex shader projects each point's world position with
+ * `view_proj`, then offsets the quad corners in NDC scaled by `clip.w` so
+ * the disc has a constant pixel radius regardless of depth. The fragment
+ * shader paints a soft red disc with alpha blending.
  */
 export const POINT_SHADER = /* wgsl */ `
+${SDF_COMMON}
+
 struct PointUniform {
+    view_proj: mat4x4f,
     resolution: vec2u,
     point_radius_px: f32,
-    _pad: f32,
+    _pad: u32,
 };
 
-@group(0) @binding(0) var<storage, read> points: array<vec4f>;
+@group(0) @binding(0) var<storage, read> points: array<Point>;
 @group(0) @binding(1) var<uniform> u: PointUniform;
 
 struct VertexOut {
@@ -288,9 +368,6 @@ fn point_vs(
     @builtin(vertex_index) vid: u32,
     @builtin(instance_index) iid: u32,
 ) -> VertexOut {
-    // Two triangles covering [-1, 1]:
-    //   0:(-1,-1)  1:( 1,-1)  2:(-1, 1)
-    //   3:(-1, 1)  4:( 1,-1)  5:( 1, 1)
     let corner = array<vec2f, 6>(
         vec2f(-1.0, -1.0),
         vec2f( 1.0, -1.0),
@@ -300,20 +377,17 @@ fn point_vs(
         vec2f( 1.0,  1.0),
     );
 
-    let point = points[iid].xy;
-    // UV [0,1] → NDC [-1,1], Y flipped (UV y-down → NDC y-up).
-    let center = vec2f(point.x * 2.0 - 1.0, 1.0 - point.y * 2.0);
+    let world = points[iid].pos.xyz;
+    let clip = u.view_proj * vec4f(world, 1.0);
 
-    // Convert pixel radius to NDC half-size.
-    let ndc_per_pixel_x = 2.0 / f32(u.resolution.x);
-    let ndc_per_pixel_y = 2.0 / f32(u.resolution.y);
-    let offset = vec2f(
-        corner[vid].x * u.point_radius_px * ndc_per_pixel_x,
-        corner[vid].y * u.point_radius_px * ndc_per_pixel_y,
-    );
+    // NDC = clip.xy / clip.w; offset by pixel radius, then back to clip.
+    let ndc = clip.xy / clip.w;
+    let ndc_per_pixel = vec2f(2.0 / f32(u.resolution.x), 2.0 / f32(u.resolution.y));
+    let offset = corner[vid] * u.point_radius_px * ndc_per_pixel;
+    let new_ndc = ndc + offset;
 
     var out: VertexOut;
-    out.clip_pos = vec4f(center + offset, 0.0, 1.0);
+    out.clip_pos = vec4f(new_ndc * clip.w, clip.z, clip.w);
     out.uv = corner[vid];
     return out;
 }
@@ -326,134 +400,5 @@ fn point_fs(in: VertexOut) -> @location(0) vec4f {
     }
     let alpha = smoothstep(1.0, 0.75, dist);
     return vec4f(0.5, 0.1, 0.0, alpha);
-}
-`;
-
-/**
- * Shared parameter struct for the sample-densities and relax compute
- * shaders.
- *
- * Both shaders bind the same uniform buffer; the sample-densities shader
- * only reads `point_count`, the relax shader reads all fields.
- */
-export const RELAX_PARAMS_DECL = /* wgsl */ `
-struct RelaxParams {
-    dt: f32,
-    k_rep: f32,
-    k_att: f32,
-    k_push: f32,
-    alpha: f32,
-    softening: f32,
-    damping: f32,
-    point_count: u32,
-};
-`;
-
-/**
- * Sample-densities compute shader.
- *
- * One invocation per point. Samples the density texture at the point's
- * UV position (nearest filtering) and writes the result into the
- * `densities` storage buffer. This avoids O(n²) texture lookups in the
- * relax pass — the hot loop reads densities from a buffer instead.
- */
-export const SAMPLE_DENSITIES_SHADER = /* wgsl */ `
-${RELAX_PARAMS_DECL}
-
-@group(0) @binding(0) var density_in: texture_2d<f32>;
-@group(0) @binding(1) var<storage, read> points_in: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> densities: array<f32>;
-@group(0) @binding(3) var<uniform> params: RelaxParams;
-
-@compute @workgroup_size(64)
-fn sample_densities_cs(@builtin(global_invocation_id) gid: vec3u) {
-    let i = gid.x;
-    if (i >= params.point_count) {
-        return;
-    }
-
-    let uv = points_in[i].xy;
-    let dims = textureDimensions(density_in);
-    let texel = min(vec2u(uv * vec2f(dims)), dims - vec2u(1u));
-    densities[i] = textureLoad(density_in, texel, 0).r;
-}
-`;
-
-/**
- * Relax compute shader — O(n²) attraction/repulsion.
- *
- * One invocation per point `i`. Reads `p_i`, `v_i`, `d_i` from the input
- * buffers, loops over all `j ≠ i` accumulating force according to the
- * density-aware attraction/repulsion model, then integrates with
- * semi-implicit Euler and writes the result to the output buffer.
- *
- * Force model (see `stippling.md`):
- * - Both inside (`d_i ≥ 0, d_j ≥ 0`): repel, weakened by density product.
- * - `i` inside, `j` outside (`d_j < 0`): mild push.
- * - `i` outside (`d_i < 0`), `j` inside (`d_j ≥ 0`): attract.
- * - Both outside: no force.
- *
- * The direction vector uses `diff / sqrt(r² + ε²)` (softened) instead of
- * `diff / |diff|`, avoiding 0/0 when two points coincide and naturally
- * softening the direction at close range.
- */
-export const RELAX_SHADER = /* wgsl */ `
-${RELAX_PARAMS_DECL}
-
-@group(0) @binding(0) var<storage, read> points_in: array<vec4f>;
-@group(0) @binding(1) var<storage, read_write> points_out: array<vec4f>;
-@group(0) @binding(2) var<storage, read> densities: array<f32>;
-@group(0) @binding(3) var<uniform> params: RelaxParams;
-
-@compute @workgroup_size(64)
-fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
-    let i = gid.x;
-    if (i >= params.point_count) {
-        return;
-    }
-
-    let pi = points_in[i].xy;
-    let vi = points_in[i].zw;
-    let di = densities[i];
-
-    var force = vec2f(0.0);
-    let soft_sq = params.softening * params.softening;
-
-    for (var j: u32 = 0u; j < params.point_count; j = j + 1u) {
-        if (j == i) {
-            continue;
-        }
-
-        let pj = points_in[j].xy;
-        let dj = densities[j];
-
-        let diff = pi - pj;
-        let r2 = dot(diff, diff) + soft_sq;
-        let inv_r = 1.0 / sqrt(r2);
-        let inv_r2 = inv_r * inv_r;
-        let dir = diff * inv_r;
-
-        if (di >= 0.0) {
-            if (dj >= 0.0) {
-                // Both inside: repel, weaker in dense regions.
-                let rep = params.k_rep * (1.0 - params.alpha * di * dj) * inv_r2;
-                force = force + rep * dir;
-            } else {
-                // i inside, j outside: mild push.
-                force = force + params.k_push * inv_r2 * dir;
-            }
-        } else {
-            if (dj >= 0.0) {
-                // i outside, j inside: attract.
-                force = force + params.k_att * inv_r2 * (-dir);
-            }
-            // Both outside: no force.
-        }
-    }
-
-    var new_vel = (vi + force * params.dt) * params.damping;
-    var new_pos = clamp(pi + new_vel * params.dt, vec2f(0.0), vec2f(1.0));
-
-    points_out[i] = vec4f(new_pos, new_vel);
 }
 `;

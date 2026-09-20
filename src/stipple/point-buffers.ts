@@ -1,25 +1,24 @@
 /**
- * 2D point data layout and ping-pong storage buffer management for the
- * stippling pipeline.
+ * 3D point data layout and ping-pong storage buffer management for the
+ * surface-stippling pipeline.
  *
- * Each point is packed into a single `vec4f` (16 bytes):
+ * Each point is packed into two `vec4f` (32 bytes):
  *
  * ```
- * offset 0:  pos.xy  (vec2f — position in [0,1] UV space)
- * offset 8:  vel.xy  (vec2f — velocity, used by the relax pass)
+ * offset 0:  pos.xyz  (vec4f — world-space position on the SDF surface, w unused)
+ * offset 16: vel.xyz  (vec4f — velocity, used by the relax pass, w unused)
  * ```
  *
  * Two storage buffers (`bufferA`, `bufferB`) form a ping-pong pair. The
- * seed pipeline writes the initial distribution; the relax pipeline
- * (added in step 3) reads from one buffer and writes to the other each
- * frame.
+ * seed pipeline writes the initial distribution; the relax pipeline reads
+ * from one buffer and writes to the other each frame.
  *
  * No CPU readback is performed — seeding and relaxation are entirely
  * GPU-side.
  */
 
-/** Number of `f32` values per point (one `vec4f`). */
-export const POINT_FLOATS = 4;
+/** Number of `f32` values per point (two `vec4f`). */
+export const POINT_FLOATS = 8;
 
 /** Size of one point in bytes. */
 export const POINT_BYTES = POINT_FLOATS * Float32Array.BYTES_PER_ELEMENT;

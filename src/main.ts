@@ -1,6 +1,5 @@
 import { OrbitControls } from "./orbit-controls.js";
-import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
-import { type CameraConfig, DensityPipeline } from "./stipple/density-pipeline.js";
+import { type CameraConfig, DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
 import { PointRenderPipeline } from "./stipple/point-render-pipeline.js";
 import {
@@ -8,7 +7,7 @@ import {
     type RelaxParams,
     RelaxPipeline,
 } from "./stipple/relax-pipeline.js";
-import { SeedPipeline } from "./stipple/seed-pipeline.js";
+import { type SeedParams, SeedPipeline } from "./stipple/seed-pipeline.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
 /** Background clear color — black. */
@@ -26,6 +25,13 @@ const UP: readonly [number, number, number] = [0, 1, 0];
 
 /** Number of stipple points. */
 const POINT_COUNT = 4096;
+
+/** Bounding box for rejection sampling of the seed distribution. */
+const SEED_PARAMS: SeedParams = {
+    bboxMin: [-3, -2, -2],
+    bboxMax: [3, 2, 2],
+    band: 0.3,
+};
 
 /**
  * Returns the `#outputCanvas` element from the DOM.
@@ -46,70 +52,49 @@ function getCanvas(): HTMLCanvasElement {
  *
  * Each frame:
  * 1. Syncs canvas size.
- * 2. Dispatches the density compute pass (ray-march → r32float texture).
- * 3. If the canvas was resized (or this is the first frame), dispatches
- *    the seed compute pass to regenerate the initial point distribution
- *    into buffer A, and resets the ping-pong direction to read from A.
- * 4. Dispatches the relax compute pass (sample-densities + relax,
- *    ping-pong) to redistribute points according to the density field.
- * 5. Begins a render pass that blits the density texture as grayscale,
- *    then draws all stipple points as red billboard quads on top.
- * 6. Submits the command buffer.
+ * 2. Dispatches the relax compute pass (ping-pong) to redistribute points
+ *    via 3D repulsion with surface re-projection.
+ * 3. Begins a render pass that draws the SDF debug view (grayscale
+ *    Lambert) and then the stipple points as red billboard quads on top.
+ * 4. Submits the command buffer.
+ *
+ * Seeding happens once at bootstrap (before this loop starts) since
+ * points live in world space and are independent of the view.
  *
  * @param gpu - The WebGPU context.
- * @param density - The density compute pipeline.
- * @param seed - The seed compute pipeline.
  * @param relax - The relax compute pipeline.
  * @param points - The ping-pong point buffer pair.
- * @param blit - The debug blit render pipeline.
+ * @param debugRender - The debug render pipeline (SDF visualization).
  * @param pointRender - The point render pipeline.
  * @param params - Relaxation parameters.
  * @param controls - Orbit camera controls.
  */
 function startFrameLoop(
     gpu: GpuContext,
-    density: DensityPipeline,
-    seed: SeedPipeline,
     relax: RelaxPipeline,
     points: PointBuffers,
-    blit: DebugRenderPipeline,
+    debugRender: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
     params: RelaxParams,
     controls: OrbitControls,
 ): void {
     const { device } = gpu;
-    let lastCanvasWidth = 0;
-    let lastCanvasHeight = 0;
     let readFromA = true;
 
     const frame = (): void => {
         syncCanvasSize(gpu);
 
-        const resized =
-            gpu.canvas.width !== lastCanvasWidth || gpu.canvas.height !== lastCanvasHeight;
-
         const eye = controls.getEye();
 
         const encoder = device.createCommandEncoder();
 
-        // --- Compute pass: ray-march SDF → density texture ---
-        density.dispatch(encoder, eye, gpu.canvas);
-
-        // --- Compute pass (one-shot on resize): seed buffer A ---
-        if (resized) {
-            seed.dispatch(encoder, density.getTexture(), points.bufferA, points.count);
-            lastCanvasWidth = gpu.canvas.width;
-            lastCanvasHeight = gpu.canvas.height;
-            readFromA = true;
-        }
-
-        // --- Compute passes: sample densities + relax (ping-pong) ---
-        relax.dispatch(encoder, density.getTexture(), points, params, readFromA);
+        // --- Compute pass: relax (ping-pong) ---
+        relax.dispatch(encoder, params, readFromA);
 
         // Render reads the buffer that relax just wrote to.
         const renderReadsA = !readFromA;
 
-        // --- Render pass: blit density + draw points ---
+        // --- Render pass: debug SDF view + draw points ---
         const texture = gpu.context.getCurrentTexture();
         const view = texture.createView();
         const pass = encoder.beginRenderPass({
@@ -123,8 +108,8 @@ function startFrameLoop(
             ],
         });
 
-        blit.render(pass, density.getTexture());
-        pointRender.render(pass, gpu.canvas, renderReadsA, points.count);
+        debugRender.render(pass, eye, gpu.canvas);
+        pointRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
 
         pass.end();
 
@@ -148,25 +133,27 @@ async function bootstrap(): Promise<void> {
         up: UP,
     };
 
-    const density = new DensityPipeline(gpu.device, cameraConfig);
     const seed = new SeedPipeline(gpu.device);
     const points = new PointBuffers(gpu.device, POINT_COUNT);
     const relax = new RelaxPipeline(gpu.device, points);
-    const blit = new DebugRenderPipeline(gpu.device, gpu.format);
-    const pointRender = new PointRenderPipeline(gpu.device, points, gpu.format);
+    const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
+    const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const controls = new OrbitControls(canvas, {
         azimuth: 0,
         elevation: 0.15,
         radius: 12,
     });
 
+    // --- Seed buffer A once (points are world-space; no re-seed on resize) ---
+    const seedEncoder = gpu.device.createCommandEncoder();
+    seed.dispatch(seedEncoder, points.bufferA, points.count, SEED_PARAMS);
+    gpu.device.queue.submit([seedEncoder.finish()]);
+
     startFrameLoop(
         gpu,
-        density,
-        seed,
         relax,
         points,
-        blit,
+        debugRender,
         pointRender,
         DEFAULT_RELAX_PARAMS,
         controls,

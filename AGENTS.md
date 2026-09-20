@@ -6,14 +6,16 @@ This repository is a WebGPU canvas app that renders elements on the surface of o
 
 Use this section to orient before opening files. It describes module **responsibilities and ownership boundaries**, not the specific implementation details those modules currently happen to use. Add or modify a line only when a module's responsibility itself changes, when a new module appears, or when data flow between modules changes.
 
-* `src/main.ts` is the application entrypoint. It resolves the canvas, initializes WebGPU, seeds the body buffers, creates the compute/render pipelines and orbit camera, and runs the frame loop that advances the simulation and renders the bodies.
+* `src/main.ts` is the application entrypoint. It resolves the canvas, initializes WebGPU, creates the pipelines and orbit camera, submits a one-shot seed dispatch, and runs the frame loop that relaxes and renders the points.
 * `src/webgpu.ts` owns WebGPU initialization and canvas backing-store size synchronization. It exports the `GpuContext` interface bundling the device, canvas context, format, and canvas element.
 * `src/orbit-controls.ts` owns the orbit camera — a mouse-driven spherical camera (drag to rotate, wheel to zoom) that exposes the eye position for view-matrix construction.
-* `src/nbody/buffers.ts` owns the body data layout and the ping-pong storage buffer pair, provides seed functions that produce initial body distributions, and exposes a readback method for CPU-side inspection.
-* `src/nbody/compute-pipeline.ts` owns the gravity integration compute pipeline and its ping-pong bind groups, manages the simulation parameter uniform, and exposes a method to advance the simulation one step.
-* `src/nbody/render-pipeline.ts` owns the body render pipeline and its ping-pong bind groups, manages the camera uniform, and exposes a method to draw all bodies.
-* `src/nbody/shaders.ts` holds the WGSL shader source strings.
-* `src/mat4.ts` provides column-major `Float32Array(16)` matrix utilities.
+* `src/stipple` owns the surface-stippling pipeline — distributing points on the surface of an SDF scene. Data flow is one-directional: seed → relax → render.
+  * `shaders.ts` owns all WGSL source, including a shared block (the scene SDF, gradient/normal helpers, and a surface-projection routine) interpolated into the seed, relax, and debug-render shaders.
+  * `point-buffers.ts` owns the 3D point data layout and the ping-pong storage buffer pair.
+  * `seed-pipeline.ts` owns the one-shot seed compute pass: rejection sampling in a bounding box followed by surface projection. Writes buffer A at bootstrap; view-independent.
+  * `relax-pipeline.ts` owns the per-frame relax compute pass: 3D repulsion with surface re-projection. Ping-pongs between the two point buffers; view-independent.
+  * `debug-render-pipeline.ts` owns the SDF visualization — a full-screen shader that ray-marches the scene to the canvas. Owns the ray-based camera uniform and the `CameraConfig` type shared with the point renderer.
+  * `point-render-pipeline.ts` owns the stipple-point renderer — billboard quads projected from world space via a view-projection matrix uniform. Reads whichever buffer relax most recently wrote.
 * `public/index.html` is the browser shell. It defines the canvas, loads the stylesheet, and boots the bundled module.
 * `public/style.css` holds the base page and canvas presentation styles.
 * `package.json` owns the development workflow: `dev` serves `public/` while bundling the entrypoint, `build` emits the production bundle, `check` runs TypeScript plus Biome validation, and `lint` runs the same checks with Biome write-fixes enabled.
