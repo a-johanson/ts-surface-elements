@@ -216,8 +216,9 @@ export class PointRenderPipeline {
             label: "stipple-point-bind-A",
             layout,
             entries: [
-                { binding: 0, resource: { buffer: points.bufferA } },
-                { binding: 1, resource: { buffer: this.uniformBuffer } },
+                { binding: 0, resource: { buffer: this.uniformBuffer } },
+                { binding: 1, resource: { buffer: points.bufferA } },
+                { binding: 2, resource: { buffer: points.shadingBuffer } },
             ],
         });
 
@@ -225,8 +226,9 @@ export class PointRenderPipeline {
             label: "stipple-point-bind-B",
             layout,
             entries: [
-                { binding: 0, resource: { buffer: points.bufferB } },
-                { binding: 1, resource: { buffer: this.uniformBuffer } },
+                { binding: 0, resource: { buffer: this.uniformBuffer } },
+                { binding: 1, resource: { buffer: points.bufferB } },
+                { binding: 2, resource: { buffer: points.shadingBuffer } },
             ],
         });
     }

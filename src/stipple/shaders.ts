@@ -10,12 +10,14 @@
 /**
  * Shared WGSL block: SDF scene, gradient, normal, and surface projection.
  *
- * Interpolated into the seed, relax, and debug-render shaders. Contains
- * only functions, structs, and compile-time constants — no bindings.
+ * Interpolated into the seed, relax, shading, debug-render, and
+ * point-render shaders. Contains only functions, structs, and
+ * compile-time constants — no bindings.
  *
  * - `Point` — the per-point storage layout (pos only, 16 bytes). Surface
- *   normals live in a separate shared buffer, written every frame by the
- *   relax pipeline's normal-precompute sub-pass.
+ *   normals live in a separate shared buffer, written by the seed pass
+ *   (once, at bootstrap) and by the shading pass (every frame, after
+ *   relax).
  * - `map(p)` — the scene signed distance field.
  * - `sdfGradient(p)` — central-difference gradient (6 taps); used by
  *   Newton projection so the magnitude is the true distance-field
@@ -28,6 +30,11 @@
  *   and `alpha = 1`, each step lands on the surface in one go; smaller
  *   `alpha` guards against overshoot in `smin` blend regions where the
  *   field is not a perfect distance function.
+ * - `rayMarch(ro, rd)` — sphere-traces `map()` along `rd` from `ro` up to
+ *   `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance, or
+ *   `-1.0` on miss. Shared by the debug render (per-fragment SDF
+ *   visualization) and the shading pass (per-point visibility and shadow
+ *   tests).
  */
 export const SDF_COMMON = /* wgsl */ `
 struct Point {
@@ -36,6 +43,23 @@ struct Point {
 
 const MAX_DIST: f32 = 50.0;
 const SURF_EPS: f32 = 0.001;
+const MAX_STEPS: i32 = 96;
+
+fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
+    var t = 0.0;
+    for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
+        let p = ro + rd * t;
+        let d = map(p);
+        if (d < SURF_EPS) {
+            return t;
+        }
+        t = t + d;
+        if (t > MAX_DIST) {
+            break;
+        }
+    }
+    return -1.0;
+}
 
 fn sdSphere(p: vec3f, r: f32) -> f32 {
     return length(p) - r;
@@ -125,24 +149,6 @@ struct CameraRays {
 
 @group(0) @binding(0) var<uniform> camera: CameraRays;
 
-const MAX_STEPS: i32 = 96;
-
-fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
-    var t = 0.0;
-    for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
-        let p = ro + rd * t;
-        let d = map(p);
-        if (d < SURF_EPS) {
-            return t;
-        }
-        t = t + d;
-        if (t > MAX_DIST) {
-            break;
-        }
-    }
-    return -1.0;
-}
-
 @vertex
 fn blit_vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
     let pos = array<vec2f, 6>(
@@ -195,6 +201,15 @@ fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
  * `N_ATTEMPTS` is a compile-time knob (paired with `MAX_STEPS` /
  * `SURF_EPS`); the bbox and band are uniform-side so the scene can be
  * re-tuned without recompiling.
+ *
+ * In addition to positions, the seed pass writes the matching surface
+ * normal for each point into the shared `normals_out` buffer. The normals
+ * buffer is shared (not ping-ponged) and must match whichever point buffer
+ * relax reads; since seed writes bufferA, it also seeds the normals from
+ * bufferA. Subsequent frames have their normals refreshed by the shading
+ * pass, which runs after relax and writes normals from the buffer relax
+ * just produced — so the invariant "normals match the buffer relax reads"
+ * is preserved across the ping-pong swap.
  */
 export const SEED_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -209,8 +224,9 @@ struct SeedParams {
     _pad2: u32,
 };
 
-@group(0) @binding(0) var<storage, read_write> points_out: array<Point>;
-@group(0) @binding(1) var<uniform> params: SeedParams;
+@group(0) @binding(0) var<uniform> params: SeedParams;
+@group(0) @binding(1) var<storage, read_write> points_out: array<Point>;
+@group(0) @binding(2) var<storage, read_write> normals_out: array<vec4f>;
 
 const N_ATTEMPTS: u32 = 256u;
 const SEED_NEWTON_ITERS: i32 = 16;
@@ -254,6 +270,7 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
         if (d < params.band) {
             let projected = projectToSurface(p, SEED_NEWTON_ITERS, SEED_ALPHA);
             points_out[i].pos = vec4f(projected, 0.0);
+            normals_out[i] = vec4f(normalize(sdfGradient(projected)), 0.0);
             accepted = true;
             break;
         }
@@ -262,44 +279,8 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
     if (!accepted) {
         let projected = projectToSurface(best_p, SEED_NEWTON_ITERS, SEED_ALPHA);
         points_out[i].pos = vec4f(projected, 0.0);
+        normals_out[i] = vec4f(normalize(sdfGradient(projected)), 0.0);
     }
-}
-`;
-
-/**
- * Normal precompute shader — writes per-point surface normals.
- *
- * One invocation per point. Reads `points_in[i].pos` and writes
- * `normalize(sdfGradient(p))` into `normals_out`. Runs every frame as a
- * sub-pass of the relax pipeline, immediately before the repulsion pass,
- * so the normals are fresh (computed from the same positions relax reads).
- *
- * The normals buffer is shared (not ping-ponged): relax consumes it for
- * curvature-aware distance inflation, and the point renderer may later
- * consume it for back-face culling.
- */
-export const NORMAL_SHADER = /* wgsl */ `
-${SDF_COMMON}
-
-@group(0) @binding(0) var<storage, read> points_in: array<Point>;
-@group(0) @binding(1) var<storage, read_write> normals_out: array<vec4f>;
-@group(0) @binding(2) var<uniform> params: NormalParams;
-
-struct NormalParams {
-    point_count: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-};
-
-@compute @workgroup_size(64)
-fn normal_cs(@builtin(global_invocation_id) gid: vec3u) {
-    let i = gid.x;
-    if (i >= params.point_count) {
-        return;
-    }
-    let p = points_in[i].pos.xyz;
-    normals_out[i] = vec4f(normalize(sdfGradient(p)), 0.0);
 }
 `;
 
@@ -313,10 +294,11 @@ fn normal_cs(@builtin(global_invocation_id) gid: vec3u) {
  *
  *     d_infl = d_E · (1 + ½·‖n_i − n_j‖²)
  *
- * where `n_i` and `n_j` are both read from the shared normals buffer
- * (written earlier in the same frame by the normal-precompute sub-pass,
- * so they match the current positions). Pairs across narrow gaps,
- * high-curvature regions, or self-folding `smin` geometry thus see an
+ * where `n_i` and `n_j` are both read from the shared normals buffer,
+ * which is written by the shading pass (and seeded once at bootstrap) from
+ * the same buffer relax reads — so the normals match the current
+ * positions. Pairs across narrow gaps, high-curvature regions, or
+ * self-folding `smin` geometry thus see an
  * effectively larger separation, suppressing cross-sheet repulsion that
  * would otherwise corrupt the Poisson-disc distribution.
  *
@@ -346,9 +328,9 @@ struct RelaxParams {
     _pad3: u32,
 };
 
-@group(0) @binding(0) var<storage, read> points_in: array<Point>;
-@group(0) @binding(1) var<storage, read_write> points_out: array<Point>;
-@group(0) @binding(2) var<uniform> params: RelaxParams;
+@group(0) @binding(0) var<uniform> params: RelaxParams;
+@group(0) @binding(1) var<storage, read> points_in: array<Point>;
+@group(0) @binding(2) var<storage, read_write> points_out: array<Point>;
 @group(0) @binding(3) var<storage, read> normals_in: array<vec4f>;
 
 const RELAX_NEWTON_ITERS: i32 = 4;
@@ -405,13 +387,89 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 /**
+ * Shading compute shader — per-point visibility, shadow, and normal
+ * refresh.
+ *
+ * One invocation per point. Runs every frame after the relax pass, reading
+ * whichever point buffer relax most recently wrote. Computes the surface
+ * normal from the (now final) position and writes it into the shared
+ * normals buffer — so the normals buffer always matches the buffer that
+ * the *next* relax pass will read (preserving the relax invariant that
+ * normals match the read-side buffer across the ping-pong swap).
+ *
+ * Visibility: sphere-traces from `p + n·bias` toward the eye. The point
+ * is visible iff the march either misses (`t < 0`) or reaches the eye
+ * without hitting the surface (`t >= dist_to_eye`).
+ *
+ * Shadow: sphere-traces from `p + n·bias` toward the light direction. If
+ * the march hits the surface, the point is in shadow (luminance 0);
+ * otherwise Lambert shading applies.
+ *
+ * Output packing (`shading_out[i]`, `vec4f`):
+ *  - `x` — visibility (`1.0` visible, `0.0` occluded).
+ *  - `y` — luminance (`visible * lit * lambert`, in `[0, 1]`).
+ *  - `z`, `w` — unused.
+ *
+ * The point renderer reads this buffer to discard occluded points in the
+ * vertex shader and modulate the fragment color by luminance.
+ */
+export const SHADING_SHADER = /* wgsl */ `
+${SDF_COMMON}
+
+struct ShadingParams {
+    eye: vec3f,
+    point_count: u32,
+    light_dir: vec3f,
+    _pad0: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: ShadingParams;
+@group(0) @binding(1) var<storage, read> points_in: array<Point>;
+@group(0) @binding(2) var<storage, read_write> normals_out: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> shading_out: array<vec4f>;
+
+const SHADOW_BIAS: f32 = 0.004;
+
+@compute @workgroup_size(64)
+fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let p = points_in[i].pos.xyz;
+    let n = normalize(sdfGradient(p));
+    normals_out[i] = vec4f(n, 0.0);
+
+    let origin = p + n * SHADOW_BIAS;
+
+    let to_eye = params.eye - origin;
+    let dist_eye = length(to_eye);
+    let eye_dir = to_eye / dist_eye;
+    let t_eye = rayMarch(origin, eye_dir);
+    let visible = select(0.0, 1.0, t_eye < 0.0 || t_eye >= dist_eye);
+
+    let t_light = rayMarch(origin, params.light_dir);
+    let lit = select(0.0, 1.0, t_light < 0.0);
+
+    let lambert = max(dot(n, params.light_dir), 0.0);
+    let luminance = visible * lit * lambert;
+
+    shading_out[i] = vec4f(visible, luminance, 0.0, 0.0);
+}
+`;
+
+/**
  * Point render shader — draws stipple points as screen-space billboard
  * quads projected from 3D world space.
  *
  * The vertex shader projects each point's world position with
  * `view_proj`, then offsets the quad corners in NDC scaled by `clip.w` so
- * the disc has a constant pixel radius regardless of depth. The fragment
- * shader paints a soft red disc with alpha blending.
+ * the disc has a constant pixel radius regardless of depth. Points flagged
+ * as occluded in the shading buffer are pushed offscreen in the vertex
+ * shader so no fragments are rasterized for them. The fragment shader
+ * paints a soft red disc modulated by the per-point luminance from the
+ * shading buffer, with alpha blending.
  */
 export const POINT_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -423,12 +481,14 @@ struct PointUniform {
     _pad: u32,
 };
 
-@group(0) @binding(0) var<storage, read> points: array<Point>;
-@group(0) @binding(1) var<uniform> u: PointUniform;
+@group(0) @binding(0) var<uniform> u: PointUniform;
+@group(0) @binding(1) var<storage, read> points: array<Point>;
+@group(0) @binding(2) var<storage, read> shading: array<vec4f>;
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4f,
     @location(0) uv: vec2f,
+    @location(1) luminance: f32,
 };
 
 @vertex
@@ -445,18 +505,25 @@ fn point_vs(
         vec2f( 1.0,  1.0),
     );
 
+    let sh = shading[iid];
+    var out: VertexOut;
+    out.uv = corner[vid];
+    out.luminance = sh.y;
+
+    if (sh.x < 0.5) {
+        out.clip_pos = vec4f(2.0, 2.0, 2.0, 1.0);
+        return out;
+    }
+
     let world = points[iid].pos.xyz;
     let clip = u.view_proj * vec4f(world, 1.0);
 
-    // NDC = clip.xy / clip.w; offset by pixel radius, then back to clip.
     let ndc = clip.xy / clip.w;
     let ndc_per_pixel = vec2f(2.0 / f32(u.resolution.x), 2.0 / f32(u.resolution.y));
     let offset = corner[vid] * u.point_radius_px * ndc_per_pixel;
     let new_ndc = ndc + offset;
 
-    var out: VertexOut;
     out.clip_pos = vec4f(new_ndc * clip.w, clip.z, clip.w);
-    out.uv = corner[vid];
     return out;
 }
 
@@ -467,6 +534,7 @@ fn point_fs(in: VertexOut) -> @location(0) vec4f {
         discard;
     }
     let alpha = smoothstep(1.0, 0.75, dist);
-    return vec4f(0.5, 0.1, 0.0, alpha);
+    let lum = in.luminance;
+    return vec4f(0.75, 0.1, 0.0, alpha);
 }
 `;

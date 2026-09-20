@@ -13,14 +13,22 @@
  * from one buffer and writes to the other each frame.
  *
  * A separate non-ping-pong `normalsBuffer` holds the per-point surface
- * normal (`vec4f`, 16 bytes). It is a derived quantity — overwritten every
- * frame by the relax pipeline's normal-precompute sub-pass from the
- * current positions — and is shared between relax (curvature-aware
- * repulsion) and the point renderer (future back-face culling). It is not
- * ping-ponged because it has no temporal state of its own.
+ * normal (`vec4f`, 16 bytes). It is a derived quantity — written once by
+ * the seed pass at bootstrap and overwritten every frame by the shading
+ * pass (which runs after relax, from the buffer relax just wrote) — and is
+ * shared between relax (curvature-aware repulsion) and the shading pass.
+ * It is not ping-ponged because it has no temporal state of its own; the
+ * invariant "normals match whichever buffer relax reads" is preserved
+ * because the shading pass writes normals from the buffer that the *next*
+ * relax pass will read.
  *
- * No CPU readback is performed — seeding and relaxation are entirely
- * GPU-side.
+ * A second non-ping-pong `shadingBuffer` holds the per-point shading
+ * result (`vec4f`, 16 bytes: `visible`, `luminance`, unused, unused). It
+ * is written every frame by the shading pass and read by the point
+ * renderer to discard occluded points and modulate luminance.
+ *
+ * No CPU readback is performed — seeding, relaxation, and shading are
+ * entirely GPU-side.
  */
 
 /** Number of `f32` values per point (one `vec4f`). */
@@ -35,12 +43,14 @@ const POINT_BUFFER_USAGE: GPUBufferUsageFlags =
 
 /**
  * Owns the ping-pong pair of storage buffers that hold point positions,
- * plus a single shared normals buffer.
+ * plus the shared normals and shading buffers.
  *
  * Both point buffers are initialized to zero. The seed pipeline writes the
- * initial distribution into one of them; the relax pipeline ping-pongs
- * between the two. The normals buffer is zero-initialized and overwritten
- * every frame by the relax pipeline's normal-precompute sub-pass.
+ * initial distribution (and matching normals) into one of them; the relax
+ * pipeline ping-pongs between the two. The normals buffer is
+ * zero-initialized, seeded once at bootstrap, and overwritten every frame
+ * by the shading pass. The shading buffer is zero-initialized and
+ * overwritten every frame by the shading pass.
  */
 export class PointBuffers {
     /** Number of points stored in each buffer. */
@@ -55,26 +65,42 @@ export class PointBuffers {
     /**
      * Shared per-point surface normals buffer (not ping-ponged).
      *
-     * Written every frame by the relax pipeline's normal-precompute
-     * sub-pass; read by the curvature-aware relax pass and (in future) by
-     * the point renderer for back-face culling.
+     * Written once at bootstrap by the seed pass and overwritten every
+     * frame by the shading pass (which runs after relax, computing
+     * normals from the buffer relax just wrote). Read by the
+     * curvature-aware relax pass and by the shading pass itself.
      */
     public readonly normalsBuffer: GPUBuffer;
 
     /**
-     * Creates both ping-pong point buffers and the shared normals buffer,
-     * all zero-filled via `mappedAtCreation`.
+     * Shared per-point shading buffer (not ping-ponged).
+     *
+     * Written every frame by the shading pass; read by the point renderer
+     * to discard occluded points (in the vertex shader) and modulate the
+     * fragment color by luminance. Packed as `vec4f`:
+     * `x` = visibility, `y` = luminance, `z`/`w` unused.
+     */
+    public readonly shadingBuffer: GPUBuffer;
+
+    /**
+     * Creates both ping-pong point buffers plus the shared normals and
+     * shading buffers, all zero-filled via `mappedAtCreation`.
      *
      * @param device - The GPU device used to create the buffers.
      * @param count - Number of points.
      */
     public constructor(device: GPUDevice, count: number) {
         this.count = count;
+        // All four buffers use the same 16-byte-per-point stride: points
+        // are vec4f (pos + unused w), normals are vec3f + pad, shading
+        // packs two f32s into vec4f. WGSL storage arrays of vec4f require
+        // a 16-byte stride, so the coincidence is structural.
         const size = count * POINT_BYTES;
 
         this.bufferA = this.createBuffer(device, size);
         this.bufferB = this.createBuffer(device, size);
         this.normalsBuffer = this.createBuffer(device, size);
+        this.shadingBuffer = this.createBuffer(device, size);
     }
 
     /**

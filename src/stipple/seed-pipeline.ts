@@ -6,7 +6,9 @@
  * `[bbox_min, bbox_max]³`, accepts the first within `band` of the
  * surface, and Newton-projects the result onto the surface. A
  * closest-candidate fallback guarantees a deterministic point per
- * invocation.
+ * invocation. For each accepted point the matching surface normal is
+ * also written into the shared normals buffer, so the normals buffer
+ * matches the seeded point buffer before the first relax frame.
  *
  * No density texture is required — the SDF is evaluated directly via the
  * shared `map` function. The pipeline runs once at bootstrap and again
@@ -43,15 +45,16 @@ export interface SeedParams {
 /**
  * Manages the seed compute pipeline, params uniform, and bind group.
  *
- * The bind group is recreated lazily when the target point buffer changes
- * (identified by object identity).
+ * The bind group is recreated lazily when the target point buffer or
+ * normals buffer changes (identified by object identity).
  */
 export class SeedPipeline {
     private readonly device: GPUDevice;
     private readonly pipeline: GPUComputePipeline;
     private readonly paramsBuffer: GPUBuffer;
     private readonly bindGroupLayout: GPUBindGroupLayout;
-    private lastBuffer: GPUBuffer | null = null;
+    private lastPointBuffer: GPUBuffer | null = null;
+    private lastNormalsBuffer: GPUBuffer | null = null;
     private bindGroup: GPUBindGroup | null = null;
 
     /**
@@ -116,28 +119,36 @@ export class SeedPipeline {
     /**
      * Records a seed compute dispatch into the given command encoder.
      *
-     * Writes `pointCount` points into `outputBuffer` by rejection-sampling
-     * the SDF inside the bounding box.
+     * Writes `pointCount` points (and matching normals) into
+     * `outputBuffer` / `normalsBuffer` by rejection-sampling the SDF
+     * inside the bounding box.
      *
      * @param encoder - The command encoder to record into.
      * @param outputBuffer - The point storage buffer to write into.
+     * @param normalsBuffer - The shared normals buffer to write into.
      * @param pointCount - Number of points to seed.
      * @param params - Bounding box and band.
      */
     public dispatch(
         encoder: GPUCommandEncoder,
         outputBuffer: GPUBuffer,
+        normalsBuffer: GPUBuffer,
         pointCount: number,
         params: SeedParams,
     ): void {
-        if (outputBuffer !== this.lastBuffer) {
-            this.lastBuffer = outputBuffer;
+        if (
+            outputBuffer !== this.lastPointBuffer ||
+            normalsBuffer !== this.lastNormalsBuffer
+        ) {
+            this.lastPointBuffer = outputBuffer;
+            this.lastNormalsBuffer = normalsBuffer;
             this.bindGroup = this.device.createBindGroup({
                 label: "stipple-seed-bind",
                 layout: this.bindGroupLayout,
                 entries: [
-                    { binding: 0, resource: { buffer: outputBuffer } },
-                    { binding: 1, resource: { buffer: this.paramsBuffer } },
+                    { binding: 0, resource: { buffer: this.paramsBuffer } },
+                    { binding: 1, resource: { buffer: outputBuffer } },
+                    { binding: 2, resource: { buffer: normalsBuffer } },
                 ],
             });
         }

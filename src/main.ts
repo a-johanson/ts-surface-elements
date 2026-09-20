@@ -8,6 +8,7 @@ import {
     RelaxPipeline,
 } from "./stipple/relax-pipeline.js";
 import { type SeedParams, SeedPipeline } from "./stipple/seed-pipeline.js";
+import { DEFAULT_LIGHT_DIR, ShadingPipeline } from "./stipple/shading-pipeline.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
 /** Background clear color — black. */
@@ -54,15 +55,21 @@ function getCanvas(): HTMLCanvasElement {
  * 1. Syncs canvas size.
  * 2. Dispatches the relax compute pass (ping-pong) to redistribute points
  *    via 3D repulsion with surface re-projection.
- * 3. Begins a render pass that draws the SDF debug view (grayscale
- *    Lambert) and then the stipple points as red billboard quads on top.
- * 4. Submits the command buffer.
+ * 3. Dispatches the shading compute pass to refresh the normals buffer
+ *    and compute per-point visibility (occlusion by the SDF surface) and
+ *    luminance (Lambert with shadow) from the relaxed positions.
+ * 4. Begins a render pass that draws the SDF debug view (grayscale
+ *    Lambert) and then the stipple points as red billboard quads on top
+ *    (occluded points discarded in the vertex shader, color modulated by
+ *    luminance).
+ * 5. Submits the command buffer.
  *
  * Seeding happens once at bootstrap (before this loop starts) since
  * points live in world space and are independent of the view.
  *
  * @param gpu - The WebGPU context.
  * @param relax - The relax compute pipeline.
+ * @param shading - The shading compute pipeline.
  * @param points - The ping-pong point buffer pair.
  * @param debugRender - The debug render pipeline (SDF visualization).
  * @param pointRender - The point render pipeline.
@@ -72,6 +79,7 @@ function getCanvas(): HTMLCanvasElement {
 function startFrameLoop(
     gpu: GpuContext,
     relax: RelaxPipeline,
+    shading: ShadingPipeline,
     points: PointBuffers,
     debugRender: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
@@ -91,8 +99,12 @@ function startFrameLoop(
         // --- Compute pass: relax (ping-pong) ---
         relax.dispatch(encoder, params, readFromA);
 
-        // Render reads the buffer that relax just wrote to.
-        const renderReadsA = !readFromA;
+        // Shading reads the buffer that relax just wrote to.
+        const shadingReadsA = !readFromA;
+        shading.dispatch(encoder, eye, DEFAULT_LIGHT_DIR, shadingReadsA);
+
+        // Render reads the same buffer shading just read.
+        const renderReadsA = shadingReadsA;
 
         // --- Render pass: debug SDF view + draw points ---
         const texture = gpu.context.getCurrentTexture();
@@ -136,6 +148,7 @@ async function bootstrap(): Promise<void> {
     const seed = new SeedPipeline(gpu.device);
     const points = new PointBuffers(gpu.device, POINT_COUNT);
     const relax = new RelaxPipeline(gpu.device, points);
+    const shading = new ShadingPipeline(gpu.device, points);
     const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const controls = new OrbitControls(canvas, {
@@ -146,12 +159,19 @@ async function bootstrap(): Promise<void> {
 
     // --- Seed buffer A once (points are world-space; no re-seed on resize) ---
     const seedEncoder = gpu.device.createCommandEncoder();
-    seed.dispatch(seedEncoder, points.bufferA, points.count, SEED_PARAMS);
+    seed.dispatch(
+        seedEncoder,
+        points.bufferA,
+        points.normalsBuffer,
+        points.count,
+        SEED_PARAMS,
+    );
     gpu.device.queue.submit([seedEncoder.finish()]);
 
     startFrameLoop(
         gpu,
         relax,
+        shading,
         points,
         debugRender,
         pointRender,
