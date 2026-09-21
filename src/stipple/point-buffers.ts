@@ -68,7 +68,8 @@ export class PointBuffers {
      * Written once at bootstrap by the seed pass and overwritten every
      * frame by the shading pass (which runs after relax, computing
      * normals from the buffer relax just wrote). Read by the
-     * curvature-aware relax pass and by the shading pass itself.
+     * curvature-aware relax pass, by the shading pass itself, and by the
+     * point renderer (to orient tangent-plane quads).
      */
     public readonly normalsBuffer: GPUBuffer;
 

@@ -1,14 +1,16 @@
 /**
- * Point render pipeline — draws stipple points as screen-space billboard
- * quads projected from 3D world space onto the canvas.
+ * Point render pipeline — draws stipple points as tangent-plane quads
+ * oriented from the shared normals buffer and projected from 3D world
+ * space onto the canvas.
  *
- * The vertex shader projects each point's world position with a
- * view-projection matrix, then offsets the quad corners in NDC scaled by
- * `clip.w` so the disc has a constant pixel radius regardless of depth.
- * The fragment shader paints a soft red disc with alpha blending.
+ * The vertex shader builds an orthonormal tangent basis from the
+ * pre-computed surface normal at each point and offsets the quad corners
+ * in world space by `point_radius_world`, so quads lie flat on the SDF
+ * surface and foreshorten with viewing angle.
  *
  * Two bind groups support the ping-pong buffer pair so the render can
- * read from whichever buffer the relax pass most recently wrote to.
+ * read from whichever buffer the relax pass most recently wrote to. The
+ * shared normals and shading buffers are non-ping-ponged.
  */
 
 import type { CameraConfig } from "./debug-render-pipeline.js";
@@ -16,13 +18,9 @@ import type { PointBuffers } from "./point-buffers.js";
 import { POINT_SHADER } from "./shaders.js";
 
 /**
- * Size of the point uniform buffer in bytes:
- * `mat4x4f` (64) + `vec2u` (8) + `f32` (4) + `u32` pad (4) = 80.
+ * Size of the point uniform buffer in bytes: `mat4x4f` (64).
  */
-const UNIFORM_BUFFER_BYTES = 80;
-
-/** Default point radius in pixels. */
-const DEFAULT_POINT_RADIUS_PX = 2.5;
+const UNIFORM_BUFFER_BYTES = 64;
 
 /** Near plane for the perspective projection. */
 const NEAR = 0.1;
@@ -219,6 +217,7 @@ export class PointRenderPipeline {
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
                 { binding: 1, resource: { buffer: points.bufferA } },
                 { binding: 2, resource: { buffer: points.shadingBuffer } },
+                { binding: 3, resource: { buffer: points.normalsBuffer } },
             ],
         });
 
@@ -229,23 +228,21 @@ export class PointRenderPipeline {
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
                 { binding: 1, resource: { buffer: points.bufferB } },
                 { binding: 2, resource: { buffer: points.shadingBuffer } },
+                { binding: 3, resource: { buffer: points.normalsBuffer } },
             ],
         });
     }
 
     /**
-     * Writes the view-projection matrix, canvas resolution, and point
-     * radius into the uniform buffer.
+     * Writes the view-projection matrix into the uniform buffer.
      *
      * @param eye - Camera eye position [x, y, z].
      * @param canvas - The canvas whose backing-store size determines the
-     *   resolution and aspect ratio.
-     * @param pointRadiusPx - Point disc radius in pixels.
+     *   projection aspect ratio.
      */
     private writeUniform(
         eye: readonly [number, number, number],
         canvas: HTMLCanvasElement,
-        pointRadiusPx: number,
     ): void {
         const aspect = canvas.width / canvas.height;
         const view = lookAt(eye, this.config.target, this.config.up);
@@ -254,17 +251,12 @@ export class PointRenderPipeline {
 
         const buffer = new ArrayBuffer(UNIFORM_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
-        const u32 = new Uint32Array(buffer);
         f32.set(viewProj, 0);
-        u32[16] = canvas.width;
-        u32[17] = canvas.height;
-        f32[18] = pointRadiusPx;
-        u32[19] = 0;
         this.device.queue.writeBuffer(this.uniformBuffer, 0, buffer);
     }
 
     /**
-     * Draws all points as instanced billboard quads into the given
+     * Draws all points as instanced tangent-plane quads into the given
      * render pass.
      *
      * Must be called *inside* an active `GPURenderPassEncoder`, after the
@@ -273,13 +265,11 @@ export class PointRenderPipeline {
      * @param pass - The active render pass encoder.
      * @param eye - Camera eye position [x, y, z].
      * @param canvas - The canvas whose size determines the projection
-     *   aspect and NDC-to-pixel conversion.
+     * aspect.
      * @param readFromBufferA - If `true`, reads from `bufferA`; else
-     *   `bufferB`. Should match the buffer the seed/relax pass most
-     *   recently wrote.
+     * `bufferB`. Should match the buffer the seed/relax pass most
+     * recently wrote.
      * @param instanceCount - Number of points (instances) to draw.
-     * @param pointRadiusPx - Point disc radius in pixels (defaults to
-     *   {@link DEFAULT_POINT_RADIUS_PX}).
      */
     public render(
         pass: GPURenderPassEncoder,
@@ -287,9 +277,8 @@ export class PointRenderPipeline {
         canvas: HTMLCanvasElement,
         readFromBufferA: boolean,
         instanceCount: number,
-        pointRadiusPx: number = DEFAULT_POINT_RADIUS_PX,
     ): void {
-        this.writeUniform(eye, canvas, pointRadiusPx);
+        this.writeUniform(eye, canvas);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, readFromBufferA ? this.bindGroupA : this.bindGroupB);
         pass.draw(6, instanceCount);

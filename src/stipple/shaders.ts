@@ -472,30 +472,32 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 /**
- * Point render shader — draws stipple points as screen-space billboard
- * quads projected from 3D world space.
+ * Point render shader — draws stipple points as tangent-plane quads
+ * oriented from the shared normals buffer and projected via a
+ * view-projection matrix uniform.
  *
- * The vertex shader projects each point's world position with
- * `view_proj`, then offsets the quad corners in NDC scaled by `clip.w` so
- * the disc has a constant pixel radius regardless of depth. Points flagged
- * as occluded in the shading buffer are pushed offscreen in the vertex
- * shader so no fragments are rasterized for them. The fragment shader
- * paints a soft red disc modulated by the per-point luminance from the
- * shading buffer, with alpha blending.
+ * The vertex shader builds an orthonormal tangent basis (t1, t2) from
+ * the pre-computed surface normal at each point and offsets the quad
+ * corners in world space by `POINT_RADIUS_WORLD`, so quads lie flat on
+ * the SDF surface and foreshorten naturally with viewing angle. Points
+ * flagged as occluded in the shading buffer are pushed offscreen in the
+ * vertex shader so no fragments are rasterized for them. The fragment
+ * shader paints a soft red disc modulated by the per-point luminance
+ * from the shading buffer, with alpha blending.
  */
 export const POINT_SHADER = /* wgsl */ `
 ${SDF_COMMON}
 
+const POINT_RADIUS_WORLD: f32 = 0.02;
+
 struct PointUniform {
     view_proj: mat4x4f,
-    resolution: vec2u,
-    point_radius_px: f32,
-    _pad: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: PointUniform;
 @group(0) @binding(1) var<storage, read> points: array<Point>;
 @group(0) @binding(2) var<storage, read> shading: array<vec4f>;
+@group(0) @binding(3) var<storage, read> normals: array<vec4f>;
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4f,
@@ -527,15 +529,14 @@ fn point_vs(
         return out;
     }
 
-    let world = points[iid].pos.xyz;
-    let clip = u.view_proj * vec4f(world, 1.0);
-
-    let ndc = clip.xy / clip.w;
-    let ndc_per_pixel = vec2f(2.0 / f32(u.resolution.x), 2.0 / f32(u.resolution.y));
-    let offset = corner[vid] * u.point_radius_px * ndc_per_pixel;
-    let new_ndc = ndc + offset;
-
-    out.clip_pos = vec4f(new_ndc * clip.w, clip.z, clip.w);
+    let p = points[iid].pos.xyz;
+    let n = normals[iid].xyz;
+    let up = mix(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), f32(abs(n.y) > 0.99));
+    let t1 = normalize(cross(up, n));
+    let t2 = cross(n, t1);
+    let c = corner[vid];
+    let world = p + (c.x * t1 + c.y * t2) * POINT_RADIUS_WORLD;
+    out.clip_pos = u.view_proj * vec4f(world, 1.0);
     return out;
 }
 
