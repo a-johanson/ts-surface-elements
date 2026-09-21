@@ -482,13 +482,13 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
  * the SDF surface and foreshorten naturally with viewing angle. Points
  * flagged as occluded in the shading buffer are pushed offscreen in the
  * vertex shader so no fragments are rasterized for them. The fragment
- * shader paints a soft red disc modulated by the per-point luminance
- * from the shading buffer, with alpha blending.
+ * shader paints a white ring outline whose radius scales linearly with
+ * per-point luminance (collapsing to a point at zero luminance); the
+ * line width is configurable via `LINE_WIDTH` and the ring never
+ * exceeds the quad boundary.
  */
 export const POINT_SHADER = /* wgsl */ `
 ${SDF_COMMON}
-
-const POINT_RADIUS_WORLD: f32 = 0.02;
 
 struct PointUniform {
     view_proj: mat4x4f,
@@ -510,6 +510,8 @@ fn point_vs(
     @builtin(vertex_index) vid: u32,
     @builtin(instance_index) iid: u32,
 ) -> VertexOut {
+    const POINT_RADIUS_WORLD: f32 = 0.03;
+
     let corner = array<vec2f, 6>(
         vec2f(-1.0, -1.0),
         vec2f( 1.0, -1.0),
@@ -542,12 +544,18 @@ fn point_vs(
 
 @fragment
 fn point_fs(in: VertexOut) -> @location(0) vec4f {
+    const LINE_WIDTH: f32 = 0.35;
+    const HALF_W: f32 = LINE_WIDTH * 0.5;
+    const AA: f32 = LINE_WIDTH * 0.25;
+    const MIN_R: f32 = 0.75 * HALF_W;
+    const MAX_R: f32 = 1.0 - (HALF_W + AA);
+    let r = (MAX_R - MIN_R) * in.luminance + MIN_R;
     let dist = length(in.uv);
-    if (dist > 1.0) {
+    let d = abs(dist - r);
+    if (d > HALF_W + AA) {
         discard;
     }
-    let alpha = smoothstep(1.0, 0.75, dist);
-    let lum = in.luminance;
-    return vec4f(0.75 * lum, 0.1 * lum, 0.0, alpha);
+    let alpha = smoothstep(HALF_W + AA, HALF_W, d);
+    return vec4f(1.0, 1.0, 1.0, alpha);
 }
 `;

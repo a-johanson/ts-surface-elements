@@ -59,8 +59,7 @@ function getCanvas(): HTMLCanvasElement {
  *    and compute per-point visibility (occlusion by the SDF surface) and
  *    luminance (Lambert with shadow) from the relaxed positions.
  * 4. Begins a render pass that draws the SDF debug view (grayscale
- *    Lambert) and then the stipple points as tangent-plane quads on
- *    top (occluded points discarded in the vertex shader).
+ *    Lambert) and then the stipple points.
  * 5. Submits the command buffer.
  *
  * Seeding happens once at bootstrap (before this loop starts) since
