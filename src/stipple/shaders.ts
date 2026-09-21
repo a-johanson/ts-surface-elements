@@ -19,9 +19,11 @@
  *   (once, at bootstrap) and by the shading pass (every frame, after
  *   relax).
  * - `map(p)` — the scene signed distance field.
- * - `sdfGradient(p)` — central-difference gradient (6 taps); used by
+ * - `sdfGradient(p)` — tetrahedron-pattern gradient (4 taps); used by
  *   Newton projection so the magnitude is the true distance-field
- *   gradient (tetrahedron normals only give a direction).
+ *   gradient. The 4-tap sum equals `4·h·∇f(p)`, so dividing by `4h`
+ *   recovers the true gradient (unlike a bare `normalize` of the
+ *   tetrahedron sum, which would yield only a direction).
  * - `calcNormal(p)` — normalized gradient; used by the debug render for
  *   Lambert shading.
  * - `projectToSurface(p, iters, alpha)` — Newton-Raphson steps
@@ -43,7 +45,8 @@ struct Point {
 
 const MAX_DIST: f32 = 50.0;
 const SURF_EPS: f32 = 0.001;
-const MAX_STEPS: i32 = 96;
+const STEP_SCALE: f32 = 1.0;
+const MAX_STEPS: i32 = 250;
 
 fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
     var t = 0.0;
@@ -53,7 +56,7 @@ fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
         if (d < SURF_EPS) {
             return t;
         }
-        t = t + d;
+        t += STEP_SCALE * d;
         if (t > MAX_DIST) {
             break;
         }
@@ -89,12 +92,14 @@ fn map(p: vec3f) -> f32 {
 }
 
 fn sdfGradient(p: vec3f) -> vec3f {
-    let e = 0.0005;
-    return vec3f(
-        map(p + vec3f(e, 0.0, 0.0)) - map(p + vec3f(-e, 0.0, 0.0)),
-        map(p + vec3f(0.0, e, 0.0)) - map(p + vec3f(0.0, -e, 0.0)),
-        map(p + vec3f(0.0, 0.0, e)) - map(p + vec3f(0.0, 0.0, -e)),
-    ) / (2.0 * e);
+    const h: f32 = 0.0005;
+    const k = vec3f(1.0, -1.0, -1.0);
+    return (
+        k.xyy * map(p + k.xyy * h) +
+        k.yyx * map(p + k.yyx * h) +
+        k.yxy * map(p + k.yxy * h) +
+        k.xxx * map(p + k.xxx * h)
+    ) / (4.0 * h);
 }
 
 fn calcNormal(p: vec3f) -> vec3f {
@@ -446,16 +451,22 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
     let to_eye = params.eye - origin;
     let dist_eye = length(to_eye);
     let eye_dir = to_eye / dist_eye;
+
+    if (dot(n, eye_dir) <= 0.0) {
+        shading_out[i] = vec4f(0.0);
+        return;
+    }
+
     let t_eye = rayMarch(origin, eye_dir);
-    let visible = select(0.0, 1.0, t_eye < 0.0 || t_eye >= dist_eye);
+    if (t_eye >= 0.0 && t_eye < dist_eye) {
+        shading_out[i] = vec4f(0.0);
+        return;
+    }
 
     let t_light = rayMarch(origin, params.light_dir);
     let lit = select(0.0, 1.0, t_light < 0.0);
-
     let lambert = max(dot(n, params.light_dir), 0.0);
-    let luminance = visible * lit * lambert;
-
-    shading_out[i] = vec4f(visible, luminance, 0.0, 0.0);
+    shading_out[i] = vec4f(1.0, lit * lambert, 0.0, 0.0);
 }
 `;
 
@@ -535,6 +546,6 @@ fn point_fs(in: VertexOut) -> @location(0) vec4f {
     }
     let alpha = smoothstep(1.0, 0.75, dist);
     let lum = in.luminance;
-    return vec4f(0.75, 0.1, 0.0, alpha);
+    return vec4f(0.75 * lum, 0.1 * lum, 0.0, alpha);
 }
 `;
