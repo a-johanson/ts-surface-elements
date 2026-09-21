@@ -43,12 +43,13 @@ struct Point {
     pos: vec4f,
 };
 
-const MAX_DIST: f32 = 50.0;
 const SURF_EPS: f32 = 0.001;
-const STEP_SCALE: f32 = 1.0;
-const MAX_STEPS: i32 = 250;
 
 fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
+    const MAX_DIST: f32 = 50.0;
+    const STEP_SCALE: f32 = 1.0;
+    const MAX_STEPS: i32 = 250;
+
     var t = 0.0;
     for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
         let p = ro + rd * t;
