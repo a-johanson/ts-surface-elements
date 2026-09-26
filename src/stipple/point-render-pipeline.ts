@@ -15,7 +15,7 @@
 
 import type { CameraConfig } from "./debug-render-pipeline.js";
 import type { PointBuffers } from "./point-buffers.js";
-import { POINT_SHADER } from "./shaders.js";
+import { POINT_SHADER } from "./shaders/index.js";
 
 /**
  * Size of the point uniform buffer in bytes: `mat4x4f` (64).

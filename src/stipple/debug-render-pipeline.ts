@@ -10,7 +10,7 @@
  * camera's eye position.
  */
 
-import { DEBUG_RENDER_SHADER } from "./shaders.js";
+import { DEBUG_RENDER_SHADER } from "./shaders/index.js";
 
 /** Camera uniform buffer size in bytes (5 × 16-byte aligned members = 80). */
 const CAMERA_BUFFER_BYTES = 80;

@@ -17,7 +17,7 @@
  * deterministic restarts).
  */
 
-import { SEED_SHADER } from "./shaders.js";
+import { SEED_SHADER } from "./shaders/index.js";
 
 /** Workgroup size — must match `@workgroup_size(64)` in the WGSL. */
 const WORKGROUP_SIZE = 64;
