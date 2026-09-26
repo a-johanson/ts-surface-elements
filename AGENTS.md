@@ -27,6 +27,7 @@ Use this section to orient before opening files. It describes module **responsib
 * Use modern ECMAScript patterns and TypeScript-specific type utilities (target ES2024 with ESNext module structure, avoid legacy TS).
 * Prefer object-oriented design whenever it makes sense to combine data and logic into classes.
 * Always generate TSDoc comments in accordance with the Google TypeScript Style Guide.
+* Do not include implementation details in TSDoc comments that might readily change and are not important to understanding the functionality.
 * Use American English spelling.
 * After you apply edits, run `npm run lint` to check for type errors and to apply linting & formatting.
 
