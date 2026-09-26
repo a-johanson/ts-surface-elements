@@ -118,10 +118,9 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
 fn map(p: vec3f, time: f32) -> f32 {
     let r1 = 1.5 + 0.2 * sin(time);
     let r2 = 1.0 + 0.15 * cos(time * 0.7);
-    let box_y = 1.6 + 0.3 * sin(time * 0.5);
     let d1 = sdSphere(p - vec3f(-1.2, 0.0, 0.0), r1);
     let d2 = sdTorus(p - vec3f(1.2, 0.0, 0.0), vec2f(r2, 0.35));
-    let d3 = sdBox(p - vec3f(0.0, box_y, 0.0), vec3f(1.0, 0.4, 1.0));
+    let d3 = sdSphere(p - vec3f(1.0, 0.4, 1.0), 0.8 * r1);
     let d12 = smin(d1, d2, 0.6);
     return smin(d12, d3, 0.6);
 }

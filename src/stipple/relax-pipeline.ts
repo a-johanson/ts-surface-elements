@@ -46,8 +46,8 @@ export interface RelaxParams {
  * Default relaxation parameters — initial guesses, need visual tuning.
  */
 export const DEFAULT_RELAX_PARAMS: Omit<RelaxParams, "time" | "dt"> = {
-    radius: 0.2,
-    alpha: 0.6,
+    radius: 0.3,
+    alpha: 0.5,
 };
 
 /**
