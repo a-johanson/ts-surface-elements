@@ -96,17 +96,19 @@ export class DebugRenderPipeline {
      *   `eye: vec3f + half_width: f32`,
      *   `forward: vec3f + half_height: f32`,
      *   `right: vec3f + _pad0: f32`,
-     *   `up: vec3f + _pad1: f32`,
+     *   `up: vec3f + time: f32`,
      *   `resolution: vec2u + _pad2: vec2u`.
      *
      * @param eye - Camera eye position [x, y, z].
      * @param width - Canvas backing-store width.
      * @param height - Canvas backing-store height.
+     * @param time - Current animation time in seconds.
      */
     private writeCamera(
         eye: readonly [number, number, number],
         width: number,
         height: number,
+        time: number,
     ): void {
         const { target, up, fov } = this.config;
 
@@ -164,7 +166,7 @@ export class DebugRenderPipeline {
         f32[12] = ux;
         f32[13] = uy;
         f32[14] = uz;
-        f32[15] = 0;
+        f32[15] = time;
         u32[16] = width;
         u32[17] = height;
         u32[18] = 0;
@@ -183,13 +185,15 @@ export class DebugRenderPipeline {
      * @param eye - Camera eye position [x, y, z].
      * @param canvas - The canvas whose backing-store size determines the
      *   ray direction per fragment.
+     * @param time - Current animation time in seconds.
      */
     public render(
         pass: GPURenderPassEncoder,
         eye: readonly [number, number, number],
         canvas: HTMLCanvasElement,
+        time: number,
     ): void {
-        this.writeCamera(eye, canvas.width, canvas.height);
+        this.writeCamera(eye, canvas.width, canvas.height, time);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, this.bindGroup);
         pass.draw(6);

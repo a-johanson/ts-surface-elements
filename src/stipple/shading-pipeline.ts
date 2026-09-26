@@ -12,8 +12,9 @@
  *
  * Because the shading pass writes normals from the buffer relax just
  * produced, the normals buffer always matches the buffer that the
- * *next* relax pass will read — preserving the relax invariant that
- * normals match the read-side buffer across the ping-pong swap.
+ * *next* reproject + relax cycle will read — preserving the relax
+ * invariant that normals match the read-side buffer across the ping-pong
+ * swap.
  *
  * Ping-pong: the pass reads from one point buffer (depending on
  * `readFromA`) and writes to the shared normals and shading buffers
@@ -32,7 +33,7 @@ const WORKGROUP_SIZE = 64;
  *
  * WGSL struct layout (uniform):
  *   `eye: vec3f` (offset 0, align 16) + `point_count: u32` (offset 12)
- *   `light_dir: vec3f` (offset 16, align 16) + `_pad0: u32` (offset 28)
+ *   `light_dir: vec3f` (offset 16, align 16) + `time: f32` (offset 28)
  * Struct size rounds up to 32 (alignment 16).
  */
 const SHADING_PARAMS_BUFFER_BYTES = 32;
@@ -128,14 +129,16 @@ export class ShadingPipeline {
      *
      * Layout (32 bytes):
      *   `eye: vec3f + point_count: u32`,
-     *   `light_dir: vec3f + _pad0: u32`.
+     *   `light_dir: vec3f + time: f32`.
      *
      * @param eye - Camera eye position in world space.
      * @param lightDir - Normalized light direction in world space.
+     * @param time - Current animation time in seconds.
      */
     private writeParams(
         eye: readonly [number, number, number],
         lightDir: readonly [number, number, number],
+        time: number,
     ): void {
         const buffer = new ArrayBuffer(SHADING_PARAMS_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
@@ -147,7 +150,7 @@ export class ShadingPipeline {
         f32[4] = lightDir[0];
         f32[5] = lightDir[1];
         f32[6] = lightDir[2];
-        u32[7] = 0;
+        f32[7] = time;
         this.device.queue.writeBuffer(this.paramsBuffer, 0, buffer);
     }
 
@@ -163,6 +166,7 @@ export class ShadingPipeline {
      * @param encoder - The command encoder to record into.
      * @param eye - Camera eye position in world space.
      * @param lightDir - Normalized light direction in world space.
+     * @param time - Current animation time in seconds.
      * @param readFromA - If `true`, reads bufferA; else bufferB. Should
      *   match the buffer relax most recently wrote (i.e. the inverse of
      *   the relax `readFromA` argument).
@@ -171,9 +175,10 @@ export class ShadingPipeline {
         encoder: GPUCommandEncoder,
         eye: readonly [number, number, number],
         lightDir: readonly [number, number, number],
+        time: number,
         readFromA: boolean,
     ): void {
-        this.writeParams(eye, lightDir);
+        this.writeParams(eye, lightDir, time);
 
         const workgroupCount = Math.ceil(this.points.count / WORKGROUP_SIZE);
 

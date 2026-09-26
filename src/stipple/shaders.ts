@@ -1,42 +1,50 @@
 /**
  * WGSL shader source strings for the surface-stippling pipeline.
  *
- * Points live in 3D world space on the surface of the SDF scene. The
- * shared {@link SDF_COMMON} block — interpolated into every shader that
- * needs the SDF — owns the scene description (`map`), gradient/normal
- * helpers, and a Newton-Raphson surface projection routine.
+ * Points live in 3D world space on the surface of the time-animated SDF
+ * scene. The shared {@link SDF_COMMON} block — interpolated into every
+ * shader that needs the SDF — owns the scene description (`map`), a
+ * time-parameterized gradient/normal helper set, and a Newton-Raphson
+ * surface projection routine. All SDF helpers thread a `time` parameter so
+ * the surface can be re-evaluated at the correct animation phase.
  */
 
 /**
- * Shared WGSL block: SDF scene, gradient, normal, and surface projection.
+ * Shared WGSL block: time-animated SDF scene, gradient, normal, surface
+ * projection, and ray-march.
  *
- * Interpolated into the seed, relax, shading, debug-render, and
- * point-render shaders. Contains only functions, structs, and
- * compile-time constants — no bindings.
+ * Interpolated into the seed, reproject, relax, shading, debug-render, and
+ * point-render shaders. Contains only functions, structs, and compile-time
+ * constants — no bindings.
  *
  * - `Point` — the per-point storage layout (pos only, 16 bytes). Surface
  *   normals live in a separate shared buffer, written by the seed pass
- *   (once, at bootstrap) and by the shading pass (every frame, after
- *   relax).
- * - `map(p)` — the scene signed distance field.
- * - `sdfGradient(p)` — tetrahedron-pattern gradient (4 taps); used by
- *   Newton projection so the magnitude is the true distance-field
- *   gradient. The 4-tap sum equals `4·h·∇f(p)`, so dividing by `4h`
- *   recovers the true gradient (unlike a bare `normalize` of the
- *   tetrahedron sum, which would yield only a direction).
- * - `calcNormal(p)` — normalized gradient; used by the debug render for
- *   Lambert shading.
- * - `projectToSurface(p, iters, alpha)` — Newton-Raphson steps
+ *   (once, at bootstrap at t=0), by the reproject pass (every frame, before
+ *   relax), and by the shading pass (every frame, after relax).
+ * - `map(p, time)` — the scene signed distance field, parameterized by
+ *   `time` for smooth morphing.
+ * - `sdfGradient(p, time)` — tetrahedron-pattern gradient (4 taps); used by
+ *   Newton projection so the magnitude is the true distance-field gradient.
+ * - `calcNormal(p, time)` — normalized gradient; used by the debug render
+ *   for Lambert shading.
+ * - `projectToSurface(p, time, iters, alpha)` — Newton-Raphson steps
  *   `p -= alpha * (f(p) / |∇f|²) * ∇f` until `|f(p)| < SURF_EPS` or the
  *   iteration budget is exhausted. For a true distance field (`|∇f| ≈ 1`)
  *   and `alpha = 1`, each step lands on the surface in one go; smaller
  *   `alpha` guards against overshoot in `smin` blend regions where the
  *   field is not a perfect distance function.
- * - `rayMarch(ro, rd)` — sphere-traces `map()` along `rd` from `ro` up to
- *   `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance, or
- *   `-1.0` on miss. Shared by the debug render (per-fragment SDF
- *   visualization) and the shading pass (per-point visibility and shadow
- *   tests).
+ * - `rayMarch(ro, rd, time)` — sphere-traces `map()` along `rd` from `ro`
+ *   up to `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance,
+ *   or `-1.0` on miss. Shared by the debug render (per-fragment SDF
+ *   visualization) and the shading pass (per-point visibility tests).
+ * - `softShadow(ro, rd, time)` — Aaltonen penumbra estimation: sphere-
+ *   traces `map()` toward the light and returns a `[0, 1]` factor (1 =
+ *   fully lit, 0 = fully occluded). At each step it triangulates the
+ *   current and previous unbounding spheres to estimate the closest
+ *   surface approach to the ray, catching penumbras that fall between
+ *   sample positions (especially near sharp corners). Shared by the
+ *   debug render (per-fragment self-shadowing) and the shading pass
+ *   (per-point soft shadow).
  */
 export const SDF_COMMON = /* wgsl */ `
 struct Point {
@@ -45,24 +53,47 @@ struct Point {
 
 const SURF_EPS: f32 = 0.001;
 
-fn rayMarch(ro: vec3f, rd: vec3f) -> f32 {
-    const MAX_DIST: f32 = 50.0;
-    const STEP_SCALE: f32 = 1.0;
-    const MAX_STEPS: i32 = 250;
+const RAYMARCH_MAX_DIST: f32 = 50.0;
+const RAYMARCH_STEP_SCALE: f32 = 1.0;
+const RAYMARCH_MAX_STEPS: i32 = 250;
 
+const SHADOW_BIAS: f32 = 0.005;
+const SHADOW_MAX_DIST: f32 = 5.0;
+const SHADOW_W: f32 = 0.4;
+const SHADOW_MAX_STEPS: i32 = 128;
+
+fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     var t = 0.0;
-    for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
+    for (var i: i32 = 0; i < RAYMARCH_MAX_STEPS; i = i + 1) {
         let p = ro + rd * t;
-        let d = map(p);
+        let d = map(p, time);
         if (d < SURF_EPS) {
             return t;
         }
-        t += STEP_SCALE * d;
-        if (t > MAX_DIST) {
+        t += RAYMARCH_STEP_SCALE * d;
+        if (t > RAYMARCH_MAX_DIST) {
             break;
         }
     }
     return -1.0;
+}
+
+fn softShadow(ro: vec3f, rd: vec3f, time: f32) -> f32 {
+    var res = 1.0;
+    var pd = 1e20;
+    var t = SHADOW_BIAS;
+    for (var i: i32 = 0; i < SHADOW_MAX_STEPS && t < SHADOW_MAX_DIST; i = i + 1) {
+        let d = map(ro + rd * t, time);
+        if (d < SURF_EPS) {
+            return 0.0;
+        }
+        let y = d * d / (2.0 * pd);
+        let cd = sqrt(d * d - y * y);
+        res = min(res, cd / (SHADOW_W * max(0.0, t - y)));
+        pd = d;
+        t = t + d;
+    }
+    return res;
 }
 
 fn sdSphere(p: vec3f, r: f32) -> f32 {
@@ -84,37 +115,40 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
-fn map(p: vec3f) -> f32 {
-    let d1 = sdSphere(p - vec3f(-1.2, 0.0, 0.0), 1.5);
-    let d2 = sdTorus(p - vec3f(1.2, 0.0, 0.0), vec2f(1.0, 0.35));
-    let d3 = sdBox(p - vec3f(0.0, 1.6, 0.0), vec3f(1.0, 0.4, 1.0));
+fn map(p: vec3f, time: f32) -> f32 {
+    let r1 = 1.5 + 0.2 * sin(time);
+    let r2 = 1.0 + 0.15 * cos(time * 0.7);
+    let box_y = 1.6 + 0.3 * sin(time * 0.5);
+    let d1 = sdSphere(p - vec3f(-1.2, 0.0, 0.0), r1);
+    let d2 = sdTorus(p - vec3f(1.2, 0.0, 0.0), vec2f(r2, 0.35));
+    let d3 = sdBox(p - vec3f(0.0, box_y, 0.0), vec3f(1.0, 0.4, 1.0));
     let d12 = smin(d1, d2, 0.6);
     return smin(d12, d3, 0.6);
 }
 
-fn sdfGradient(p: vec3f) -> vec3f {
+fn sdfGradient(p: vec3f, time: f32) -> vec3f {
     const h: f32 = 0.0005;
     const k = vec3f(1.0, -1.0, -1.0);
     return (
-        k.xyy * map(p + k.xyy * h) +
-        k.yyx * map(p + k.yyx * h) +
-        k.yxy * map(p + k.yxy * h) +
-        k.xxx * map(p + k.xxx * h)
+        k.xyy * map(p + k.xyy * h, time) +
+        k.yyx * map(p + k.yyx * h, time) +
+        k.yxy * map(p + k.yxy * h, time) +
+        k.xxx * map(p + k.xxx * h, time)
     ) / (4.0 * h);
 }
 
-fn calcNormal(p: vec3f) -> vec3f {
-    return normalize(sdfGradient(p));
+fn calcNormal(p: vec3f, time: f32) -> vec3f {
+    return normalize(sdfGradient(p, time));
 }
 
-fn projectToSurface(p_in: vec3f, iters: i32, alpha: f32) -> vec3f {
+fn projectToSurface(p_in: vec3f, time: f32, iters: i32, alpha: f32) -> vec3f {
     var p = p_in;
     for (var i: i32 = 0; i < iters; i = i + 1) {
-        let f = map(p);
+        let f = map(p, time);
         if (abs(f) < SURF_EPS) {
             break;
         }
-        let g = sdfGradient(p);
+        let g = sdfGradient(p, time);
         let gl2 = dot(g, g);
         if (gl2 < 1e-10) {
             break;
@@ -126,16 +160,12 @@ fn projectToSurface(p_in: vec3f, iters: i32, alpha: f32) -> vec3f {
 `;
 
 /**
- * Debug render shader — ray-marches the SDF per fragment and writes
- * grayscale Lambert shading directly to the canvas color attachment.
+ * Debug render shader — ray-marches the time-animated SDF per fragment and
+ * writes grayscale Lambert shading modulated by Aaltonen soft shadows
+ * directly to the canvas color attachment.
  *
- * Replaces the former two-stage density-compute + blit approach. With
- * surface-space points nothing consumes a density texture, so the
- * `r32float` storage texture and separate blit pipeline are gone; the
- * SDF is visualized by a single full-screen fragment shader.
- *
- * Background (ray miss) maps to black; hit fragments map to
- * `[0, 1]` gray via `1 - Lambert`.
+ * Background (ray miss) maps to black; hit fragments map to `[0, 1]` gray
+ * via `1 - Lambert`, scaled by the soft-shadow penumbra factor.
  */
 export const DEBUG_RENDER_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -148,7 +178,7 @@ struct CameraRays {
     right: vec3f,
     _pad0: f32,
     up: vec3f,
-    _pad1: f32,
+    time: f32,
     resolution: vec2u,
     _pad2: vec2u,
 };
@@ -180,15 +210,17 @@ fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         + ndc.y * camera.half_height * camera.up
     );
 
-    let t = rayMarch(camera.eye, rd);
+    let t = rayMarch(camera.eye, rd, camera.time);
     if (t < 0.0) {
         return vec4f(0.0, 0.0, 0.0, 1.0);
     }
     let p = camera.eye + rd * t;
-    let n = calcNormal(p);
+    let n = calcNormal(p, camera.time);
     let light_dir = normalize(vec3f(0.5, 0.8, 0.6));
     let lambert = max(dot(n, light_dir), 0.0);
-    return vec4f(lambert, lambert, lambert, 1.0);
+    let shadow = softShadow(p + n * SHADOW_BIAS, light_dir, camera.time);
+    let lum = lambert * shadow;
+    return vec4f(lum, lum, lum, 1.0);
 }
 `;
 
@@ -197,25 +229,19 @@ fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
  *
  * One invocation per point. Generates pseudo-random candidates uniformly
  * in `[bbox_min, bbox_max]³` via a PCG hash and accepts the first whose
- * `|map(p)| < band`. Accepted (and fallback) points are projected onto
- * the surface with Newton-Raphson before being written.
+ * `|map(p, 0)| < band`. Accepted (and fallback) points are projected onto
+ * the surface at t=0 with Newton-Raphson before being written.
  *
- * Fallback: if no candidate lands inside the band, the candidate with the
- * smallest `|map(p)|` is chosen (tracked via a running minimum) and
- * projected — relaxation will pull stragglers into place.
- *
- * `N_ATTEMPTS` is a compile-time knob (paired with `MAX_STEPS` /
- * `SURF_EPS`); the bbox and band are uniform-side so the scene can be
- * re-tuned without recompiling.
+ * Seeding is a one-shot bootstrap at t=0 — the SDF is evaluated at its
+ * initial configuration. Subsequent surface motion is handled per-frame by
+ * the reproject pass.
  *
  * In addition to positions, the seed pass writes the matching surface
  * normal for each point into the shared `normals_out` buffer. The normals
  * buffer is shared (not ping-ponged) and must match whichever point buffer
  * relax reads; since seed writes bufferA, it also seeds the normals from
- * bufferA. Subsequent frames have their normals refreshed by the shading
- * pass, which runs after relax and writes normals from the buffer relax
- * just produced — so the invariant "normals match the buffer relax reads"
- * is preserved across the ping-pong swap.
+ * bufferA. Subsequent frames have their normals refreshed by the reproject
+ * pass (before relax) and the shading pass (after relax).
  */
 export const SEED_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -237,6 +263,7 @@ struct SeedParams {
 const N_ATTEMPTS: u32 = 256u;
 const SEED_NEWTON_ITERS: i32 = 16;
 const SEED_ALPHA: f32 = 0.5;
+const SEED_TIME: f32 = 0.0;
 
 fn pcg_hash(seed: u32) -> u32 {
     let state = seed * 747796405u + 2891336453u;
@@ -266,7 +293,7 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
         let ry = pcg_rand(s + 1u);
         let rz = pcg_rand(s + 2u);
         let p = mix(params.bbox_min, params.bbox_max, vec3f(rx, ry, rz));
-        let d = abs(map(p));
+        let d = abs(map(p, SEED_TIME));
 
         if (d < best_d) {
             best_d = d;
@@ -274,19 +301,70 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
         }
 
         if (d < params.band) {
-            let projected = projectToSurface(p, SEED_NEWTON_ITERS, SEED_ALPHA);
+            let projected = projectToSurface(p, SEED_TIME, SEED_NEWTON_ITERS, SEED_ALPHA);
             points_out[i].pos = vec4f(projected, 0.0);
-            normals_out[i] = vec4f(normalize(sdfGradient(projected)), 0.0);
+            normals_out[i] = vec4f(normalize(sdfGradient(projected, SEED_TIME)), 0.0);
             accepted = true;
             break;
         }
     }
 
     if (!accepted) {
-        let projected = projectToSurface(best_p, SEED_NEWTON_ITERS, SEED_ALPHA);
+        let projected = projectToSurface(best_p, SEED_TIME, SEED_NEWTON_ITERS, SEED_ALPHA);
         points_out[i].pos = vec4f(projected, 0.0);
-        normals_out[i] = vec4f(normalize(sdfGradient(projected)), 0.0);
+        normals_out[i] = vec4f(normalize(sdfGradient(projected, SEED_TIME)), 0.0);
     }
+}
+`;
+
+/**
+ * Reproject compute shader — re-projects points onto the current animated
+ * surface and refreshes the shared normals buffer.
+ *
+ * One invocation per point. Runs every frame *before* relax. Reads each
+ * point's position (from the buffer relax is about to read), Newton-
+ * projects it onto the surface at the current animation time with a
+ * generous iteration budget, writes the projected position back in-place,
+ * and writes the matching surface normal into the shared normals buffer.
+ *
+ * This ensures that relax starts with on-surface positions and matching
+ * normals even when the SDF has moved since the last frame. Without this
+ * pass, relax would read stale positions (off the new surface) and stale
+ * normals (describing the old surface), corrupting the curvature-aware
+ * repulsion kernel.
+ *
+ * In-place `read_write` on the point buffer is safe because each invocation
+ * touches only index `i`. Two bind groups (A/B) cover the ping-pong
+ * alternation.
+ */
+export const REPROJECT_SHADER = /* wgsl */ `
+${SDF_COMMON}
+
+struct ReprojectParams {
+    time: f32,
+    point_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: ReprojectParams;
+@group(0) @binding(1) var<storage, read_write> points: array<Point>;
+@group(0) @binding(2) var<storage, read_write> normals_out: array<vec4f>;
+
+const REPROJECT_NEWTON_ITERS: i32 = 16;
+const REPROJECT_ALPHA: f32 = 0.5;
+
+@compute @workgroup_size(64)
+fn reproject_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let p = points[i].pos.xyz;
+    let projected = projectToSurface(p, params.time, REPROJECT_NEWTON_ITERS, REPROJECT_ALPHA);
+    points[i].pos = vec4f(projected, 0.0);
+    normals_out[i] = vec4f(normalize(sdfGradient(projected, params.time)), 0.0);
 }
 `;
 
@@ -301,12 +379,12 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
  *     d_infl = d_E · (1 + ½·‖n_i − n_j‖²)
  *
  * where `n_i` and `n_j` are both read from the shared normals buffer,
- * which is written by the shading pass (and seeded once at bootstrap) from
- * the same buffer relax reads — so the normals match the current
- * positions. Pairs across narrow gaps, high-curvature regions, or
- * self-folding `smin` geometry thus see an
- * effectively larger separation, suppressing cross-sheet repulsion that
- * would otherwise corrupt the Poisson-disc distribution.
+ * which is written by the reproject pass (before relax) and the shading
+ * pass (after relax) from the same buffer relax reads — so the normals
+ * match the current positions. Pairs across narrow gaps, high-curvature
+ * regions, or self-folding `smin` geometry thus see an effectively larger
+ * separation, suppressing cross-sheet repulsion that would otherwise
+ * corrupt the Poisson-disc distribution.
  *
  * Distance usage:
  *  - cutoff `d_infl > radius`        → skip (inflated)
@@ -315,10 +393,11 @@ fn seed_cs(@builtin(global_invocation_id) gid: vec3u) {
  *  - direction `(p_i - p_j) / d_E`   → Euclidean (unit)
  *
  * The accumulated force is projected onto the tangent plane at `pi` and
- * integrated with a direct Euler position step `x* = x + dt·F_tan`. The
- * new position is re-projected onto the surface with a few Newton steps;
- * since per-frame drift is small, `RELAX_NEWTON_ITERS = 4` with
- * `alpha = 1` suffices.
+ * integrated with a direct Euler position step `x* = x + dt·F_tan`, where
+ * `dt` is the per-frame capped wall-clock delta threaded from the frame
+ * loop (not a constant). The new position is re-projected onto the
+ * surface with a few Newton steps; since per-frame drift is small,
+ * `RELAX_NEWTON_ITERS = 4` with `alpha = 1` suffices.
  */
 export const RELAX_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -327,7 +406,7 @@ struct RelaxParams {
     dt: f32,
     radius: f32,
     alpha: f32,
-    _pad0: f32,
+    time: f32,
     point_count: u32,
     _pad1: u32,
     _pad2: u32,
@@ -355,6 +434,7 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
     var force = vec3f(0.0);
     let r = params.radius;
     let alpha = params.alpha;
+    let time = params.time;
 
     for (var j: u32 = 0u; j < params.point_count; j = j + 1u) {
         if (j == i) {
@@ -376,7 +456,7 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
         }
 
         let m = (p_i + p_j) * 0.5;
-        if (abs(map(m)) > alpha * d_E * d_E) {
+        if (abs(map(m, time)) > alpha * d_E * d_E) {
             continue;
         }
 
@@ -386,7 +466,7 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
     force = force - dot(force, n_i) * n_i;
 
     let drifted = p_i + params.dt * force;
-    let new_pos = projectToSurface(drifted, RELAX_NEWTON_ITERS, RELAX_ALPHA);
+    let new_pos = projectToSurface(drifted, time, RELAX_NEWTON_ITERS, RELAX_ALPHA);
 
     points_out[i].pos = vec4f(new_pos, 0.0);
 }
@@ -400,16 +480,18 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
  * whichever point buffer relax most recently wrote. Computes the surface
  * normal from the (now final) position and writes it into the shared
  * normals buffer — so the normals buffer always matches the buffer that
- * the *next* relax pass will read (preserving the relax invariant that
- * normals match the read-side buffer across the ping-pong swap).
+ * the *next* reproject + relax cycle will read (preserving the relax
+ * invariant that normals match the read-side buffer across the ping-pong
+ * swap).
  *
  * Visibility: sphere-traces from `p + n·bias` toward the eye. The point
  * is visible iff the march either misses (`t < 0`) or reaches the eye
  * without hitting the surface (`t >= dist_to_eye`).
  *
- * Shadow: sphere-traces from `p + n·bias` toward the light direction. If
- * the march hits the surface, the point is in shadow (luminance 0);
- * otherwise Lambert shading applies.
+ * Shadow: Aaltonen soft-shadow penumbra estimation from `p + n·bias`
+ * toward the light direction, returning a `[0, 1]` factor that modulates
+ * the Lambert term to produce graded penumbras instead of a binary
+ * shadow cut.
  *
  * Output packing (`shading_out[i]`, `vec4f`):
  *  - `x` — visibility (`1.0` visible, `0.0` occluded).
@@ -426,15 +508,13 @@ struct ShadingParams {
     eye: vec3f,
     point_count: u32,
     light_dir: vec3f,
-    _pad0: u32,
+    time: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: ShadingParams;
 @group(0) @binding(1) var<storage, read> points_in: array<Point>;
 @group(0) @binding(2) var<storage, read_write> normals_out: array<vec4f>;
 @group(0) @binding(3) var<storage, read_write> shading_out: array<vec4f>;
-
-const SHADOW_BIAS: f32 = 0.004;
 
 @compute @workgroup_size(64)
 fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
@@ -443,8 +523,9 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
+    let time = params.time;
     let p = points_in[i].pos.xyz;
-    let n = normalize(sdfGradient(p));
+    let n = normalize(sdfGradient(p, time));
     normals_out[i] = vec4f(n, 0.0);
 
     let origin = p + n * SHADOW_BIAS;
@@ -458,14 +539,13 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    let t_eye = rayMarch(origin, eye_dir);
+    let t_eye = rayMarch(origin, eye_dir, time);
     if (t_eye >= 0.0 && t_eye < dist_eye) {
         shading_out[i] = vec4f(0.0);
         return;
     }
 
-    let t_light = rayMarch(origin, params.light_dir);
-    let lit = select(0.0, 1.0, t_light < 0.0);
+    let lit = softShadow(origin, params.light_dir, time);
     let lambert = max(dot(n, params.light_dir), 0.0);
     shading_out[i] = vec4f(1.0, lit * lambert, 0.0, 0.0);
 }

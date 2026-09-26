@@ -8,15 +8,17 @@
  * linear-decay repulsion gated by a curvature-inflated Euclidean cutoff
  * and a midpoint SDF line-of-sight check, projects the force onto the
  * tangent plane at `p_i`, integrates with a direct Euler position step,
- * then Newton-projects the new position back onto the SDF surface.
+ * then Newton-projects the new position back onto the time-animated SDF
+ * surface.
  *
  * Ping-pong: the pass reads from one point buffer and writes to the
  * other, depending on `readFromA`. Two static bind-group sets cover both
  * directions. The normals buffer is shared (not ping-ponged) and is
- * owned by the seed pass (bootstrap) and the shading pass (per-frame,
- * after relax) — it always matches whichever buffer relax reads. There
- * is no density texture — points are on the surface by construction
- * (seeded there, re-projected every frame).
+ * owned by the reproject pass (per-frame, before relax) and the shading
+ * pass (per-frame, after relax) — it always matches whichever buffer
+ * relax reads. There is no density texture — points are on the surface by
+ * construction (seeded there, re-projected every frame by reproject and
+ * relax).
  */
 
 import type { PointBuffers } from "./point-buffers.js";
@@ -30,19 +32,20 @@ const RELAX_PARAMS_BUFFER_BYTES = 32;
 
 /** Relaxation parameters passed to the compute shader via uniform. */
 export interface RelaxParams {
-    /** Time step per frame. */
+    /** Per-frame wall-clock delta in seconds (capped at `MAX_DT`), threaded from the frame loop. */
     readonly dt: number;
     /** Interaction radius — pairs with inflated distance beyond this are ignored. */
     readonly radius: number;
     /** Midpoint line-of-sight threshold; pairs with `|map(m)| > alpha·d_E²` are skipped. */
     readonly alpha: number;
+    /** Current animation time in seconds — threads into the SDF `map(p, time)`. */
+    readonly time: number;
 }
 
 /**
  * Default relaxation parameters — initial guesses, need visual tuning.
  */
-export const DEFAULT_RELAX_PARAMS: RelaxParams = {
-    dt: 0.01,
+export const DEFAULT_RELAX_PARAMS: Omit<RelaxParams, "time" | "dt"> = {
     radius: 0.2,
     alpha: 0.6,
 };
@@ -52,9 +55,10 @@ export const DEFAULT_RELAX_PARAMS: RelaxParams = {
  * ping-pong bind groups.
  *
  * The normals buffer is allocated once by {@link PointBuffers} and shared
- * between this pipeline (read for curvature-aware repulsion) and the
- * shading pipeline (written per-frame after relax, plus once at bootstrap
- * by the seed pipeline).
+ * between this pipeline (read for curvature-aware repulsion), the
+ * reproject pipeline (written per-frame before relax), and the shading
+ * pipeline (written per-frame after relax, plus once at bootstrap by the
+ * seed pipeline).
  */
 export class RelaxPipeline {
     private readonly device: GPUDevice;
@@ -125,7 +129,7 @@ export class RelaxPipeline {
      * Writes the relaxation parameters and point count into the relax
      * params uniform buffer.
      *
-     * Relax layout (32 bytes): `dt, radius, alpha, _pad0` (4 × f32)
+     * Relax layout (32 bytes): `dt, radius, alpha, time` (4 × f32)
      * followed by `point_count` and three padding `u32`s.
      *
      * @param params - The parameters to upload.
@@ -137,6 +141,7 @@ export class RelaxPipeline {
         f32[0] = params.dt;
         f32[1] = params.radius;
         f32[2] = params.alpha;
+        f32[3] = params.time;
         u32[4] = this.points.count;
         this.device.queue.writeBuffer(this.relaxParamsBuffer, 0, buffer);
     }
@@ -146,8 +151,8 @@ export class RelaxPipeline {
      *
      * Reads from one point buffer (depending on `readFromA`) and writes to
      * the other. The shared normals buffer is read (not written) by this
-     * pass; it is refreshed per-frame by the shading pass which runs after
-     * relax.
+     * pass; it is refreshed per-frame by the reproject pass (before relax)
+     * and the shading pass (after relax).
      *
      * The caller must flip `readFromA` after each dispatch to implement
      * the ping-pong swap.

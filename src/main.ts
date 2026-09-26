@@ -7,6 +7,7 @@ import {
     type RelaxParams,
     RelaxPipeline,
 } from "./stipple/relax-pipeline.js";
+import { ReprojectPipeline } from "./stipple/reproject-pipeline.js";
 import { type SeedParams, SeedPipeline } from "./stipple/seed-pipeline.js";
 import { DEFAULT_LIGHT_DIR, ShadingPipeline } from "./stipple/shading-pipeline.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
@@ -25,7 +26,7 @@ const TARGET: readonly [number, number, number] = [0, 0, 0];
 const UP: readonly [number, number, number] = [0, 1, 0];
 
 /** Number of stipple points. */
-const POINT_COUNT = 8 * 1024;
+const POINT_COUNT = 4 * 1024;
 
 /** Bounding box for rejection sampling of the seed distribution. */
 const SEED_PARAMS: SeedParams = {
@@ -33,6 +34,38 @@ const SEED_PARAMS: SeedParams = {
     bboxMax: [3, 2, 2],
     band: 0.3,
 };
+
+/**
+ * Maximum per-frame wall-clock delta, in seconds.
+ *
+ * Caps the animation time step so the per-frame surface motion stays
+ * bounded — guaranteeing the reproject pass's Newton iteration converges
+ * even after a tab-switch or frame hitch. Animation slows during heavy
+ * frame drops rather than jumping.
+ */
+const MAX_DT = 1 / 30;
+
+/**
+ * Target wall-clock time per relax substep, in seconds.
+ *
+ * The relax kernel integrates with explicit Euler (`x* = x + dt·F_tan`),
+ * which goes unstable when `dt` exceeds the kernel's stable step size.
+ * This constant is the empirically stable single-step dt (the former
+ * fixed constant); the frame loop subdivides each frame's `dt` into
+ * `ceil(dt / TARGET_SUBSTEP_DT)` sub-passes so the per-step integration
+ * size stays bounded regardless of frame rate.
+ */
+const TARGET_SUBSTEP_DT = 0.01;
+
+/**
+ * Maximum number of relax substeps per frame.
+ *
+ * Caps substep count so a severe hitch doesn't explode relax cost
+ * (relax is the O(n²) pass). At `MAX_DT = 1/30` and
+ * `TARGET_SUBSTEP_DT = 0.01`, the uncapped count is 4, so this bound
+ * only bites on pathological dt values beyond the cap.
+ */
+const MAX_SUBSTEPS = 4;
 
 /**
  * Returns the `#outputCanvas` element from the DOM.
@@ -53,53 +86,84 @@ function getCanvas(): HTMLCanvasElement {
  *
  * Each frame:
  * 1. Syncs canvas size.
- * 2. Dispatches the relax compute pass (ping-pong) to redistribute points
- *    via 3D repulsion with surface re-projection.
- * 3. Dispatches the shading compute pass to refresh the normals buffer
+ * 2. Computes the capped wall-clock delta and accumulates animation time.
+ * 3. Dispatches the reproject compute pass to re-project points onto the
+ *    current animated surface and refresh the shared normals buffer.
+ * 4. Dispatches the relax compute pass (ping-pong) one or more times to
+ *    redistribute points via 3D repulsion with surface re-projection.
+ *    The frame's `dt` is subdivided into `ceil(dt / TARGET_SUBSTEP_DT)`
+ *    sub-passes (capped at `MAX_SUBSTEPS`), each flipping the ping-pong
+ *    direction, so the per-step Euler integration size stays stable
+ *    regardless of frame rate.
+ * 5. Dispatches the shading compute pass to refresh the normals buffer
  *    and compute per-point visibility (occlusion by the SDF surface) and
  *    luminance (Lambert with shadow) from the relaxed positions.
- * 4. Begins a render pass that draws the SDF debug view (grayscale
+ * 6. Begins a render pass that draws the SDF debug view (grayscale
  *    Lambert) and then the stipple points.
- * 5. Submits the command buffer.
+ * 7. Submits the command buffer.
  *
- * Seeding happens once at bootstrap (before this loop starts) since
- * points live in world space and are independent of the view.
+ * Seeding happens once at bootstrap (before this loop starts) at t=0
+ * since points live in world space and are independent of the view.
  *
  * @param gpu - The WebGPU context.
+ * @param reproject - The reproject compute pipeline.
  * @param relax - The relax compute pipeline.
  * @param shading - The shading compute pipeline.
  * @param points - The ping-pong point buffer pair.
  * @param debugRender - The debug render pipeline (SDF visualization).
  * @param pointRender - The point render pipeline.
- * @param params - Relaxation parameters.
+ * @param params - Relaxation parameters (without `time` and `dt`, which are per-frame).
  * @param controls - Orbit camera controls.
  */
 function startFrameLoop(
     gpu: GpuContext,
+    reproject: ReprojectPipeline,
     relax: RelaxPipeline,
     shading: ShadingPipeline,
     points: PointBuffers,
     debugRender: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
-    params: RelaxParams,
+    params: Omit<RelaxParams, "time" | "dt">,
     controls: OrbitControls,
 ): void {
     const { device } = gpu;
     let readFromA = true;
+    let lastNow = performance.now() / 1000;
+    let time = 0;
 
     const frame = (): void => {
         syncCanvasSize(gpu);
+
+        const now = performance.now() / 1000;
+        const dt = Math.min(now - lastNow, MAX_DT);
+        lastNow = now;
+        time += dt;
 
         const eye = controls.getEye();
 
         const encoder = device.createCommandEncoder();
 
-        // --- Compute pass: relax (ping-pong) ---
-        relax.dispatch(encoder, params, readFromA);
+        // --- Compute pass: reproject (in-place, before relax) ---
+        reproject.dispatch(encoder, time, readFromA);
 
-        // Shading reads the buffer that relax just wrote to.
-        const shadingReadsA = !readFromA;
-        shading.dispatch(encoder, eye, DEFAULT_LIGHT_DIR, shadingReadsA);
+        // --- Compute pass: relax (ping-pong, substepped) ---
+        // Subdivide dt so the per-step Euler size stays within the kernel's
+        // stable range. Each substep flips the ping-pong direction; after
+        // the loop, readFromA points at whichever buffer relax last wrote.
+        const substeps = Math.min(
+            Math.max(Math.ceil(dt / TARGET_SUBSTEP_DT), 1),
+            MAX_SUBSTEPS,
+        );
+        const substepDt = dt / substeps;
+        const relaxParams: RelaxParams = { ...params, dt: substepDt, time };
+        for (let s = 0; s < substeps; s++) {
+            relax.dispatch(encoder, relaxParams, readFromA);
+            readFromA = !readFromA;
+        }
+
+        // Shading reads the buffer that relax most recently wrote to.
+        const shadingReadsA = readFromA;
+        shading.dispatch(encoder, eye, DEFAULT_LIGHT_DIR, time, shadingReadsA);
 
         // Render reads the same buffer shading just read.
         const renderReadsA = shadingReadsA;
@@ -118,15 +182,15 @@ function startFrameLoop(
             ],
         });
 
-        debugRender.render(pass, eye, gpu.canvas);
+        debugRender.render(pass, eye, gpu.canvas, time);
         pointRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
 
         pass.end();
 
         device.queue.submit([encoder.finish()]);
 
-        // Swap ping-pong direction for the next frame.
-        readFromA = !readFromA;
+        // The relax substep loop advanced readFromA to the buffer relax
+        // most recently wrote; next frame's reproject refreshes it in-place.
         requestAnimationFrame(frame);
     };
 
@@ -145,6 +209,7 @@ async function bootstrap(): Promise<void> {
 
     const seed = new SeedPipeline(gpu.device);
     const points = new PointBuffers(gpu.device, POINT_COUNT);
+    const reproject = new ReprojectPipeline(gpu.device, points);
     const relax = new RelaxPipeline(gpu.device, points);
     const shading = new ShadingPipeline(gpu.device, points);
     const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
@@ -168,6 +233,7 @@ async function bootstrap(): Promise<void> {
 
     startFrameLoop(
         gpu,
+        reproject,
         relax,
         shading,
         points,
