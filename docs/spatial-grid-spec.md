@@ -179,12 +179,15 @@ on over-full boundary cells.
   optional `"subgroup-size-control"` companion; not required by this spec.
 - **WGSL directive:** `enable subgroups;` at the top of every shader that uses
   subgroup builtins/ops.
-- **Subgroup builtins** (to be verified against the WGSL spec in Step 2):
-  `@builtin(subgroup_invocation_id)`, `@builtin(subgroup_size)`.
-- **Subgroup ops** (to be verified in Step 2): `subgroupExclusiveAdd`,
+- **Subgroup builtins** (verified against the WGSL CRD, 21 Sep 2026, in Step 2):
+  `@builtin(subgroup_invocation_id)`, `@builtin(subgroup_size)`,
+  `@builtin(subgroup_id)`, `@builtin(num_subgroups)`. The last two are needed
+  by the workgroup-scan merge step (identifies which subgroup a lane belongs
+  to and how many subgroups exist).
+- **Subgroup ops** (verified in Step 2): `subgroupExclusiveAdd`,
   `subgroupInclusiveAdd`, `subgroupAdd`, `subgroupBroadcast`,
   `subgroupBroadcastFirst`, `subgroupBallot`, `subgroupMin`, `subgroupMax`,
-  etc.
+  etc. All names confirmed against §17.12 of the WGSL CRD.
 
 If the feature is unavailable, `createGpuContext` logs a clear `console.error`
 and throws — the app must not attempt a fallback path.
@@ -283,16 +286,27 @@ machine supports subgroups. If it throws, stop and reconsider the approach
 
 New `src/stipple/shaders/subgroup-common.ts` exporting a WGSL string with:
 - `enable subgroups;`
-- A **subgroup-level exclusive prefix-sum** helper built on
-  `subgroupExclusiveAdd` (and `subgroupBroadcast` if a final broadcast is
-  needed).
-- A **workgroup-level exclusive scan** helper that runs the subgroup scan per
-  subgroup, stores subgroup partials in `var<workgroup>`, performs one
-  `workgroupBarrier`, computes the cross-subgroup prefix, and combines.
+- A **subgroup-level exclusive prefix-sum** helper (`subgroupExclusiveScanU32`)
+  built directly on `subgroupExclusiveAdd` — no `subgroupBroadcast` needed,
+  since `subgroupExclusiveAdd` returns the per-lane exclusive prefix directly.
+- A **workgroup-level exclusive scan** helper (`workgroupExclusiveScanU32`)
+  that runs the subgroup scan per subgroup, stores subgroup partials in
+  `var<workgroup>` (last lane of each subgroup writes), performs a
+  `workgroupBarrier`, has thread 0 sequentially scan the partials array
+  (≤64 entries) in place for the cross-subgroup exclusive prefix, barriers
+  again, and combines with each lane's subgroup-exclusive result. Two barriers
+  total (not one as originally stated) — the second ensures all lanes see the
+  scanned partials.
 
 This is the reusable foundation for the radix split (Step 4). In this step,
 also verify the exact subgroup builtin/function names against the WGSL spec
 and update this spec if any name differs from the list above.
+
+**Completed:** names verified against WGSL CRD (21 Sep 2026); all match.
+`subgroup_id` and `num_subgroups` were added to the builtins list (originally
+omitted, needed by the workgroup-scan merge). `subgroupBroadcast` was not
+needed. `WORKGROUP_SIZE` (256) and `MAX_SUBGROUPS` (64) constants are defined
+in this module.
 
 ### Step 3 — Cell-index computation
 
@@ -409,9 +423,9 @@ ping-pong bind groups.
 
 ## Risks / open questions
 
-- **Subgroup builtin/function names** — the names listed under *WebGPU subgroups
-  feature requirement* are from memory and must be verified against the WGSL
-  spec in Step 2. If names differ, update this spec.
+- **Subgroup builtin/function names** — verified against the WGSL CRD (21 Sep
+  2026) in Step 2. All names match §17.12 and §13.3.1.1.17–20; `subgroup_id`
+  and `num_subgroups` were added to the builtins list (originally omitted).
 - **Storage-buffer scatter performance** — scattering via storage buffers (not
   workgroup memory) is slower per access but unbounded by the 16 KB workgroup
   limit. Acceptable for v1; revisit if sort latency is high.
