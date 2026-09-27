@@ -1,4 +1,15 @@
 /**
+ * Workgroup size for the single-workgroup radix sort (decision 2).
+ *
+ * Single source of truth: the TS constant is interpolated into the WGSL so
+ * the dispatch math in `SpatialGridPipeline` and the `@workgroup_size`
+ * attribute in the radix-split shader cannot drift. The radix sort runs as
+ * one workgroup of this many invocations, each owning
+ * `ceil(POINT_COUNT / SUBGROUP_WORKGROUP_SIZE)` elements.
+ */
+export const SUBGROUP_WORKGROUP_SIZE = 256;
+
+/**
  * WGSL subgroup scan helpers, reused by the radix split (Step 4).
  *
  * This module is the reusable foundation for the single-workgroup radix sort's
@@ -19,11 +30,10 @@
  * in entry-point functions, so `workgroupExclusiveScanU32` receives them as
  * plain `u32` parameters — the consuming entry point passes them down.
  */
-
 export const SUBGROUP_COMMON = /* wgsl */ `
 enable subgroups;
 
-const WORKGROUP_SIZE: u32 = 256u;
+const WORKGROUP_SIZE: u32 = ${SUBGROUP_WORKGROUP_SIZE}u;
 const MAX_SUBGROUPS: u32 = 64u;
 
 var<workgroup> w_subgroup_partials: array<u32, MAX_SUBGROUPS>;

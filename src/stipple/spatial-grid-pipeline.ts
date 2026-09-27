@@ -18,10 +18,19 @@
  */
 
 import type { PointBuffers } from "./point-buffers.js";
-import { CELL_INDEX_SHADER } from "./shaders/index.js";
+import { buildRadixSplitShader, CELL_INDEX_SHADER } from "./shaders/index.js";
+import { SUBGROUP_WORKGROUP_SIZE } from "./shaders/subgroup-common.js";
 
 /** Workgroup size — must match `@workgroup_size(64)` in the WGSL. */
 const WORKGROUP_SIZE = 64;
+
+/**
+ * Size of the `RadixBitParams` uniform buffer in bytes.
+ *
+ * WGSL struct layout (uniform): `bit: u32` + three u32 pads = 16 bytes,
+ * 16-aligned.
+ */
+const RADIX_BIT_PARAMS_BUFFER_BYTES = 16;
 
 /**
  * Maximum number of grid cells.
@@ -85,8 +94,10 @@ function computeGridDims(
  *
  * All grid buffers are created upfront at construction. Step 3 binds only
  * the cell-index stage's buffers (`keysA`, `valuesA`, `gridParamsBuffer`);
- * the remaining buffers (`keysB`, `valuesB`, `cellStart`, `cellCount`) sit
- * idle until Steps 4–6 wire them up.
+ * Step 4 constructs the radix-split pipeline, its bit-params uniform, and
+ * the A→B / B→A ping-pong bind groups (left idle until Step 5 records the
+ * 32 per-bit dispatches); the remaining buffers (`cellStart`, `cellCount`)
+ * sit idle until Step 6.
  */
 export class SpatialGridPipeline {
     private readonly device: GPUDevice;
@@ -94,9 +105,7 @@ export class SpatialGridPipeline {
     private readonly gridParamsBuffer: GPUBuffer;
     private readonly keysA: GPUBuffer;
     private readonly valuesA: GPUBuffer;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: sort ping-pong, wired in Step 4
     private readonly keysB: GPUBuffer;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: sort ping-pong, wired in Step 4
     private readonly valuesB: GPUBuffer;
     // biome-ignore lint/correctness/noUnusedPrivateClassMembers: cell-range table, wired in Step 6
     private readonly cellStart: GPUBuffer;
@@ -106,6 +115,13 @@ export class SpatialGridPipeline {
     private readonly cellIndexLayout: GPUBindGroupLayout;
     private readonly cellIndexBindGroupA: GPUBindGroup;
     private readonly cellIndexBindGroupB: GPUBindGroup;
+    private readonly radixBitParamsBuffer: GPUBuffer;
+    private readonly radixSplitPipeline: GPUComputePipeline;
+    private readonly radixSplitLayout: GPUBindGroupLayout;
+    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: dispatched in Step 5
+    private readonly radixBindGroupAB: GPUBindGroup;
+    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: dispatched in Step 5
+    private readonly radixBindGroupBA: GPUBindGroup;
 
     /**
      * Creates the cell-index shader module, compute pipeline, params
@@ -216,6 +232,60 @@ export class SpatialGridPipeline {
                 { binding: 1, resource: { buffer: points.bufferB } },
                 { binding: 2, resource: { buffer: this.keysA } },
                 { binding: 3, resource: { buffer: this.valuesA } },
+            ],
+        });
+
+        this.radixBitParamsBuffer = device.createBuffer({
+            label: "spatial-grid-radix-bit-params",
+            size: RADIX_BIT_PARAMS_BUFFER_BYTES,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        const elementsPerThread = Math.ceil(this.pointCount / SUBGROUP_WORKGROUP_SIZE);
+        if (this.pointCount < SUBGROUP_WORKGROUP_SIZE) {
+            throw new Error(
+                `Spatial grid radix sort requires pointCount >= ${SUBGROUP_WORKGROUP_SIZE} ` +
+                    `(got ${this.pointCount}). The sort runs as a single workgroup; ` +
+                    `fewer points would leave threads idle with no owned elements.`,
+            );
+        }
+
+        const radixModule = device.createShaderModule({
+            label: "spatial-grid-radix-split-shader",
+            code: buildRadixSplitShader(this.pointCount, elementsPerThread),
+        });
+
+        this.radixSplitPipeline = device.createComputePipeline({
+            label: "spatial-grid-radix-split-pipeline",
+            layout: "auto",
+            compute: {
+                module: radixModule,
+                entryPoint: "radix_split_cs",
+            },
+        });
+
+        this.radixSplitLayout = this.radixSplitPipeline.getBindGroupLayout(0);
+
+        this.radixBindGroupAB = device.createBindGroup({
+            label: "spatial-grid-radix-bind-A-to-B",
+            layout: this.radixSplitLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.radixBitParamsBuffer } },
+                { binding: 1, resource: { buffer: this.keysA } },
+                { binding: 2, resource: { buffer: this.valuesA } },
+                { binding: 3, resource: { buffer: this.keysB } },
+                { binding: 4, resource: { buffer: this.valuesB } },
+            ],
+        });
+        this.radixBindGroupBA = device.createBindGroup({
+            label: "spatial-grid-radix-bind-B-to-A",
+            layout: this.radixSplitLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.radixBitParamsBuffer } },
+                { binding: 1, resource: { buffer: this.keysB } },
+                { binding: 2, resource: { buffer: this.valuesB } },
+                { binding: 3, resource: { buffer: this.keysA } },
+                { binding: 4, resource: { buffer: this.valuesA } },
             ],
         });
     }
