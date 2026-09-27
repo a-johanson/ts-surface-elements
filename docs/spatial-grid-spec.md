@@ -177,6 +177,43 @@ beyond the cutoff and correctly skipped. So no neighbor pair within
 `radius` is ever missed by the clamp; the only cost is wasted iterations
 on over-full boundary cells.
 
+### 7. Per-bit uniform supply: 32 fixed-offset bind groups
+
+Each of the 32 radix-split passes needs a different `bit` value in the
+`RadixBitParams` uniform. Within a single compute pass, uniform buffer
+contents cannot be changed between dispatches (`device.queue.writeBuffer` is
+a queue operation that takes effect at submit time, not between recorded
+dispatches). So the per-bit value must vary via the *binding*, not the
+*contents*.
+
+Three approaches were considered:
+
+1. **32 fixed-offset bind groups** (chosen). One uniform buffer with 32
+   slots (each `minUniformBufferOffsetAlignment` bytes apart, 256 by default),
+   pre-filled at construction with bit values `0..31`. Each pass's bind group
+   binds its slot at a fixed offset. Works with `layout: "auto"` — no
+   explicit bind group layout needed. 32 bind group objects, created once.
+2. **Dynamic offsets.** Two bind groups (A→B, B→A) with
+   `hasDynamicOffset: true` on binding 0; the offset is supplied at
+   `setBindGroup` time per dispatch. Requires an explicit `GPUBindGroupLayout`
+   (cannot use `layout: "auto"`). The textbook WebGPU pattern for "same
+   buffer, different view per dispatch within a pass," but heavier
+   infrastructure for 32 fixed, known-at-construction passes.
+3. **32 separate compute passes** with a `copyBufferToBuffer` between each.
+   Deviates from the "one compute pass" structure and adds 32 pass-boundary
+   barriers + 32 copy commands. Strictly slower; rejected.
+
+**Chosen: approach 1.** Approaches 1 and 2 have identical runtime GPU cost
+(32 dispatches in one pass); the difference is purely CPU-side bookkeeping.
+Approach 1 is simpler (no Step 4 layout refactor), wastes no memory beyond
+the 256-byte alignment padding (8 KB total — trivial), and each pass is a
+distinct self-contained bind group, maximally inspectable while learning.
+The "32 objects" count is inherent to a 32-pass radix sort, not a smell.
+
+**Switch condition.** If the number of passes grows significantly (e.g. a
+multi-workgroup sort with per-workgroup bit schedules), switch to dynamic
+offsets (approach 2) to avoid a bind-group explosion.
+
 ## WebGPU subgroups feature requirement
 
 - **Feature name:** `"subgroups"` (see W3C WebGPU §25.18). There is also an
@@ -239,12 +276,14 @@ The grid is reused by all substeps in the frame (see decision 1).
 ## Buffer inventory
 
 All buffers are created by `SpatialGridPipeline` upfront at construction
-(Step 3). Sizes assume `POINT_COUNT = N`, `numCells = gridDimX * gridDimY *
-gridDimZ` derived from `ceil(SCENE_BBOX extent / radius)` per axis.
+(Steps 3–5). Sizes assume `POINT_COUNT = N`, `numCells = gridDimX *
+gridDimY * gridDimZ` derived from `ceil(SCENE_BBOX extent / radius)` per
+axis.
 
 | Buffer             | Size            | Usage                              | Owner / writer          |
 |--------------------|-----------------|------------------------------------|-------------------------|
 | `gridParamsBuffer` | uniform, ~48 B  | `UNIFORM \| COPY_DST`             | spatial-grid (CPU write, once at startup) |
+| `radixBitParamsBuffer` | uniform, `32 × minUniformBufferOffsetAlignment` (8 KB default) | `UNIFORM \| COPY_DST` | spatial-grid (CPU write, once at startup) |
 | `keysA`, `keysB`   | `N × 4` B       | `STORAGE \| COPY_DST`             | spatial-grid (sort ping-pong) |
 | `valuesA`, `valuesB` | `N × 4` B     | `STORAGE \| COPY_DST`             | spatial-grid (sort ping-pong) |
 | `cellStart`        | `numCells × 4` B | `STORAGE \| COPY_DST`            | spatial-grid (cell-ranges, cleared per frame) |
@@ -342,17 +381,30 @@ in this module.
 
 `src/stipple/shaders/spatial-grid/radix-split-shader.ts` — the core primitive:
 - Bit position `b` passed via uniform.
-- Each thread owns `E = N/256` elements. Per element compute
-  `pred = ((key >> b) & 1u) == 0u ? 1u : 0u`.
-- Workgroup-wide exclusive scan of `pred` (Step 2 helper) → each element's
-  destination among the 0-bits.
-- `totalZeros` = scan total (last element's inclusive result).
+- Each thread owns `E = ceil(N/256)` elements (handles non-multiples of 256;
+  elements with `g >= POINT_COUNT` get `pred = 0` and skip the scatter). Per
+  element compute `pred = ((key >> b) & 1u) == 0u ? 1u : 0u`.
+- Two-level exclusive scan: per-thread local scan of `pred` → workgroup-wide
+  scan of per-thread totals (Step 2 helper) → each element's global
+  destination among the 0-bits. Keys/values cached in per-thread local arrays
+  during the scan so the scatter pass does not re-read the input storage
+  buffers.
+- `totalZeros` = scan total, broadcast by thread 255 via `var<workgroup>` +
+  one `workgroupBarrier` (three barriers total per pass: two inside the scan
+  helper, one for the broadcast).
 - For a 0-bit element at global index `g`: dest = `exclusiveScan(pred)[g]`.
 - For a 1-bit element at global index `g`: dest = `g - exclusiveScan(pred)[g]
   + totalZeros`.
 - Scatter `(key, value)` from the read pair into the write pair at `dest`.
 - Ping-pong bind groups A→B and B→A. Stable: 0-bits preserve order, then
   1-bits preserve order.
+
+**Completed.** The shader is built by `buildRadixSplitShader(pointCount,
+elementsPerThread)`, which interpolates `POINT_COUNT` and
+`ELEMENTS_PER_THREAD` as WGSL consts (local arrays require a compile-time
+size). `SUBGROUP_WORKGROUP_SIZE` (exported from `subgroup-common.ts`) is the
+single source of truth for the 256 workgroup size, interpolated into both
+the WGSL `@workgroup_size` and the TS `elementsPerThread` calculation.
 
 ### Step 5 — Radix sort driver (32 passes)
 
@@ -362,6 +414,14 @@ pass. 32 is even, so the final sorted `(keys, values)` lands back in the A
 pair. Explicit per-bit dispatches (rather than an in-shader loop) so each pass
 is inspectable while learning; a single dispatch with an internal loop is a
 later optimization (see *Switch points*).
+
+**Completed.** Implemented as 32 fixed-offset bind groups (decision 7), one
+per bit pass, created in a loop at construction. The `radixBitParamsBuffer`
+is pre-filled once at startup with bit values `0..31` at 256-byte strides.
+`dispatch` records two compute passes: (1) cell-index computation, (2) radix
+sort — 32 `setBindGroup` + `dispatchWorkgroups(1)` calls in a single pass.
+The implicit pass-boundary barrier between the two ensures cell-index writes
+are visible to the sort.
 
 ### Step 6 — Cell-start/count table
 

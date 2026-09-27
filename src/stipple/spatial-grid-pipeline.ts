@@ -13,8 +13,9 @@
  * make `gridDims` stale relative to the pre-sized `cellStart`/`cellCount`
  * buffers.
  *
- * Step 3 implements only the cell-index computation stage. The sort and
- * cell-range stages are added in Steps 4–6.
+ * Step 3 implements the cell-index computation stage. Step 4 constructs the
+ * radix-split pipeline and its bind groups. Step 5 wires the 32 per-bit
+ * dispatches into `dispatch`. The cell-range stage is added in Step 6.
  */
 
 import type { PointBuffers } from "./point-buffers.js";
@@ -25,12 +26,21 @@ import { SUBGROUP_WORKGROUP_SIZE } from "./shaders/subgroup-common.js";
 const WORKGROUP_SIZE = 64;
 
 /**
- * Size of the `RadixBitParams` uniform buffer in bytes.
+ * Number of radix-split passes — one per bit of the `u32` cell key.
+ *
+ * 32 is even, so alternating the A/B read-write direction per pass lands the
+ * final sorted `(keys, values)` back in the A pair regardless of starting
+ * direction.
+ */
+const RADIX_PASSES = 32;
+
+/**
+ * Size of one `RadixBitParams` uniform slot in bytes.
  *
  * WGSL struct layout (uniform): `bit: u32` + three u32 pads = 16 bytes,
  * 16-aligned.
  */
-const RADIX_BIT_PARAMS_BUFFER_BYTES = 16;
+const RADIX_BIT_PARAMS_SLOT_BYTES = 16;
 
 /**
  * Maximum number of grid cells.
@@ -118,10 +128,8 @@ export class SpatialGridPipeline {
     private readonly radixBitParamsBuffer: GPUBuffer;
     private readonly radixSplitPipeline: GPUComputePipeline;
     private readonly radixSplitLayout: GPUBindGroupLayout;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: dispatched in Step 5
-    private readonly radixBindGroupAB: GPUBindGroup;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: dispatched in Step 5
-    private readonly radixBindGroupBA: GPUBindGroup;
+    /** One bind group per bit pass; even passes read A→write B, odd passes read B→write A. */
+    private readonly radixBindGroups: readonly GPUBindGroup[];
 
     /**
      * Creates the cell-index shader module, compute pipeline, params
@@ -235,11 +243,22 @@ export class SpatialGridPipeline {
             ],
         });
 
+        // --- Radix split (Steps 4–5) -----------------------------------------
+
+        const uniformSlotStride = device.limits.minUniformBufferOffsetAlignment;
+        const radixParamsBytes = RADIX_PASSES * uniformSlotStride;
+        const radixParamsData = new ArrayBuffer(radixParamsBytes);
+        const radixParamsU32 = new Uint32Array(radixParamsData);
+        for (let b = 0; b < RADIX_PASSES; b++) {
+            radixParamsU32[(b * uniformSlotStride) / 4] = b;
+        }
+
         this.radixBitParamsBuffer = device.createBuffer({
             label: "spatial-grid-radix-bit-params",
-            size: RADIX_BIT_PARAMS_BUFFER_BYTES,
+            size: radixParamsBytes,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        device.queue.writeBuffer(this.radixBitParamsBuffer, 0, radixParamsData);
 
         const elementsPerThread = Math.ceil(this.pointCount / SUBGROUP_WORKGROUP_SIZE);
         if (this.pointCount < SUBGROUP_WORKGROUP_SIZE) {
@@ -266,28 +285,39 @@ export class SpatialGridPipeline {
 
         this.radixSplitLayout = this.radixSplitPipeline.getBindGroupLayout(0);
 
-        this.radixBindGroupAB = device.createBindGroup({
-            label: "spatial-grid-radix-bind-A-to-B",
-            layout: this.radixSplitLayout,
-            entries: [
-                { binding: 0, resource: { buffer: this.radixBitParamsBuffer } },
-                { binding: 1, resource: { buffer: this.keysA } },
-                { binding: 2, resource: { buffer: this.valuesA } },
-                { binding: 3, resource: { buffer: this.keysB } },
-                { binding: 4, resource: { buffer: this.valuesB } },
-            ],
-        });
-        this.radixBindGroupBA = device.createBindGroup({
-            label: "spatial-grid-radix-bind-B-to-A",
-            layout: this.radixSplitLayout,
-            entries: [
-                { binding: 0, resource: { buffer: this.radixBitParamsBuffer } },
-                { binding: 1, resource: { buffer: this.keysB } },
-                { binding: 2, resource: { buffer: this.valuesB } },
-                { binding: 3, resource: { buffer: this.keysA } },
-                { binding: 4, resource: { buffer: this.valuesA } },
-            ],
-        });
+        // 32 bind groups, one per bit pass. Each binds a different slot of the
+        // uniform buffer (fixed offset = b × uniformSlotStride) and alternates
+        // the read/write direction: even passes read A→write B, odd passes
+        // read B→write A. 32 is even, so the final sorted data lands in A.
+        const bindGroups: GPUBindGroup[] = [];
+        for (let b = 0; b < RADIX_PASSES; b++) {
+            const readA = b % 2 === 0;
+            const keysIn = readA ? this.keysA : this.keysB;
+            const valuesIn = readA ? this.valuesA : this.valuesB;
+            const keysOut = readA ? this.keysB : this.keysA;
+            const valuesOut = readA ? this.valuesB : this.valuesA;
+            bindGroups.push(
+                device.createBindGroup({
+                    label: `spatial-grid-radix-bind-bit-${b}`,
+                    layout: this.radixSplitLayout,
+                    entries: [
+                        {
+                            binding: 0,
+                            resource: {
+                                buffer: this.radixBitParamsBuffer,
+                                offset: b * uniformSlotStride,
+                                size: RADIX_BIT_PARAMS_SLOT_BYTES,
+                            },
+                        },
+                        { binding: 1, resource: { buffer: keysIn } },
+                        { binding: 2, resource: { buffer: valuesIn } },
+                        { binding: 3, resource: { buffer: keysOut } },
+                        { binding: 4, resource: { buffer: valuesOut } },
+                    ],
+                }),
+            );
+        }
+        this.radixBindGroups = bindGroups;
     }
 
     /**
@@ -327,23 +357,38 @@ export class SpatialGridPipeline {
     }
 
     /**
-     * Records the cell-index compute pass into the given command encoder.
+     * Records the spatial grid build into the given command encoder.
      *
-     * Reads from the point buffer indicated by `readFromA` and writes cell
-     * keys and point indices into `keysA` / `valuesA`. The sort (Step 4–5)
-     * and cell-range table (Step 6) stages are not yet implemented.
+     * Two compute passes: (1) cell-index computation — reads the point buffer
+     * indicated by `readFromA`, writes `keysA` / `valuesA`; (2) radix sort —
+     * 32 per-bit passes in a single compute pass, alternating the A/B
+     * read-write direction. The implicit pass-boundary barrier between the
+     * two passes ensures the cell-index writes are visible to the sort. After
+     * all 32 passes (even count) the sorted `(keys, values)` lands in the A
+     * pair. The cell-range table (Step 6) is not yet implemented.
      *
      * @param encoder - The command encoder to record into.
      * @param readFromA - If `true`, reads `points.bufferA`; else
      *   `points.bufferB`. Should match the buffer `relax` will read.
      */
     public dispatch(encoder: GPUCommandEncoder, readFromA: boolean): void {
-        const workgroupCount = Math.ceil(this.pointCount / WORKGROUP_SIZE);
+        const cellIndexWorkgroups = Math.ceil(this.pointCount / WORKGROUP_SIZE);
 
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(this.cellIndexPipeline);
-        pass.setBindGroup(0, readFromA ? this.cellIndexBindGroupA : this.cellIndexBindGroupB);
-        pass.dispatchWorkgroups(workgroupCount);
-        pass.end();
+        const cellIndexPass = encoder.beginComputePass();
+        cellIndexPass.setPipeline(this.cellIndexPipeline);
+        cellIndexPass.setBindGroup(
+            0,
+            readFromA ? this.cellIndexBindGroupA : this.cellIndexBindGroupB,
+        );
+        cellIndexPass.dispatchWorkgroups(cellIndexWorkgroups);
+        cellIndexPass.end();
+
+        const sortPass = encoder.beginComputePass();
+        sortPass.setPipeline(this.radixSplitPipeline);
+        for (let b = 0; b < RADIX_PASSES; b++) {
+            sortPass.setBindGroup(0, this.radixBindGroups[b]);
+            sortPass.dispatchWorkgroups(1);
+        }
+        sortPass.end();
     }
 }
