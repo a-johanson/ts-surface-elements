@@ -526,6 +526,17 @@ wires the grid into the frame loop).
   `shaders/subgroup-common.ts` lines.
 - Run `npm run lint`.
 
+**Completed.** `spatialGrid` is now constructed before `relax` in
+`bootstrap()` and passed as the `GridBuffers` arg to `RelaxPipeline`.
+`startFrameLoop` gained a `spatialGrid` parameter and calls
+`spatialGrid.dispatch(encoder, readFromA)` between `reproject.dispatch`
+and the substep loop. `AGENTS.md` structural overview updated: the
+`src/stipple` data-flow line and `src/main.ts` line mention the grid
+build; new lines for `shaders/subgroup-common.ts`,
+`shaders/spatial-grid/`, and `spatial-grid-pipeline.ts`; the
+`relax-pipeline.ts` line notes the grid-accelerated neighbor lookup.
+`npm run lint` is clean.
+
 ## Verification
 
 | Step | How to confirm |
