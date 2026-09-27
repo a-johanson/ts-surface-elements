@@ -5,4 +5,5 @@ export { REPROJECT_SHADER } from "./reproject-shader.js";
 export { SDF_COMMON } from "./sdf-common.js";
 export { SEED_SHADER } from "./seed-shader.js";
 export { SHADING_SHADER } from "./shading-shader.js";
+export { CELL_INDEX_SHADER } from "./spatial-grid/cell-index-shader.js";
 export { SUBGROUP_COMMON } from "./subgroup-common.js";

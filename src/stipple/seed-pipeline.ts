@@ -11,18 +11,17 @@
  * matches the seeded point buffer before the first relax frame.
  *
  * No density texture is required — the SDF is evaluated directly via the
- * shared `map` function. The pipeline runs once at bootstrap and again
- * whenever the canvas is resized (to re-seed after camera moves, though
- * seeding is camera-independent; the resize trigger is kept for
- * deterministic restarts).
+ * shared `map` function. The pipeline runs once at bootstrap.
  */
 
 import { SEED_SHADER } from "./shaders/index.js";
+import type { SceneBBox } from "./spatial-grid-pipeline.js";
 
 /** Workgroup size — must match `@workgroup_size(64)` in the WGSL. */
 const WORKGROUP_SIZE = 64;
 
-/** Size of the params uniform buffer in bytes.
+/**
+ * Size of the params uniform buffer in bytes.
  *
  * WGSL struct layout (uniform):
  *   `bbox_min: vec3f` (offset 0, align 16) + `band: f32` (offset 12)
@@ -32,24 +31,19 @@ const WORKGROUP_SIZE = 64;
  */
 const PARAMS_BUFFER_BYTES = 48;
 
-/** Bounding-box and band parameters uploaded to the seed shader. */
-export interface SeedParams {
-    /** Inclusive lower corner of the rejection-sampling bounding box. */
-    readonly bboxMin: readonly [number, number, number];
-    /** Inclusive upper corner of the rejection-sampling bounding box. */
-    readonly bboxMax: readonly [number, number, number];
-    /** Accept a candidate when `|map(p)| < band`. */
-    readonly band: number;
-}
-
 /**
  * Manages the seed compute pipeline, params uniform, and bind group.
  *
- * The bind group is recreated lazily when the target point buffer or
- * normals buffer changes (identified by object identity).
+ * The bounding box and band are fixed at construction (the bbox is the
+ * shared `SCENE_BBOX` constant; the band is set to the relaxation radius).
+ * Only `point_count` varies per dispatch, written into the uniform before
+ * each dispatch. The bind group is recreated lazily when the target point
+ * buffer or normals buffer changes (identified by object identity).
  */
 export class SeedPipeline {
     private readonly device: GPUDevice;
+    private readonly sceneBBox: SceneBBox;
+    private readonly band: number;
     private readonly pipeline: GPUComputePipeline;
     private readonly paramsBuffer: GPUBuffer;
     private readonly bindGroupLayout: GPUBindGroupLayout;
@@ -62,9 +56,16 @@ export class SeedPipeline {
      * buffer.
      *
      * @param device - The GPU device.
+     * @param sceneBBox - The fixed scene bounding box (shared with the
+     *   spatial grid).
+     * @param band - Acceptance band for rejection sampling (`|map(p)| < band`).
+     *   Set to the relaxation radius so seed density matches the relax
+     *   interaction scale.
      */
-    public constructor(device: GPUDevice) {
+    public constructor(device: GPUDevice, sceneBBox: SceneBBox, band: number) {
         this.device = device;
+        this.sceneBBox = sceneBBox;
+        this.band = band;
 
         const shaderModule = device.createShaderModule({
             label: "stipple-seed-shader",
@@ -93,25 +94,24 @@ export class SeedPipeline {
      * Writes the bounding box, band, and point count into the params
      * uniform buffer.
      *
-     * Layout (32 bytes):
+     * Layout (48 bytes):
      *   `bbox_min: vec3f + band: f32`,
      *   `bbox_max: vec3f + point_count: u32`,
      *   `_pad0..2: vec3u`.
      *
-     * @param params - Bounding box and band.
      * @param pointCount - Number of points to seed.
      */
-    private writeParams(params: SeedParams, pointCount: number): void {
+    private writeParams(pointCount: number): void {
         const buffer = new ArrayBuffer(PARAMS_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
         const u32 = new Uint32Array(buffer);
-        f32[0] = params.bboxMin[0];
-        f32[1] = params.bboxMin[1];
-        f32[2] = params.bboxMin[2];
-        f32[3] = params.band;
-        f32[4] = params.bboxMax[0];
-        f32[5] = params.bboxMax[1];
-        f32[6] = params.bboxMax[2];
+        f32[0] = this.sceneBBox.min[0];
+        f32[1] = this.sceneBBox.min[1];
+        f32[2] = this.sceneBBox.min[2];
+        f32[3] = this.band;
+        f32[4] = this.sceneBBox.max[0];
+        f32[5] = this.sceneBBox.max[1];
+        f32[6] = this.sceneBBox.max[2];
         u32[7] = pointCount;
         this.device.queue.writeBuffer(this.paramsBuffer, 0, buffer);
     }
@@ -127,14 +127,12 @@ export class SeedPipeline {
      * @param outputBuffer - The point storage buffer to write into.
      * @param normalsBuffer - The shared normals buffer to write into.
      * @param pointCount - Number of points to seed.
-     * @param params - Bounding box and band.
      */
     public dispatch(
         encoder: GPUCommandEncoder,
         outputBuffer: GPUBuffer,
         normalsBuffer: GPUBuffer,
         pointCount: number,
-        params: SeedParams,
     ): void {
         if (
             outputBuffer !== this.lastPointBuffer ||
@@ -153,7 +151,7 @@ export class SeedPipeline {
             });
         }
 
-        this.writeParams(params, pointCount);
+        this.writeParams(pointCount);
 
         if (this.bindGroup === null) {
             throw new Error("Seed bind group was not created.");

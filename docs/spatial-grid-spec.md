@@ -48,7 +48,8 @@ gives O(1) range lookup per cell.
 - A single explicit `SCENE_BBOX` constant, chosen once to safely contain the
   animated SDF surface across all animation phases, is shared by the seed
   pipeline (rejection sampling) and the spatial grid (origin + dims). It
-  replaces the current `SEED_PARAMS.bboxMin/bboxMax` in `main.ts`.
+  replaces the former `SEED_PARAMS.bboxMin/bboxMax` in `main.ts` (completed
+  in Step 3).
 
 ## Resolved design decisions
 
@@ -97,8 +98,11 @@ attempt before the single-workgroup version is measured.
 A new `src/stipple/spatial-grid-pipeline.ts` owns the entire grid build:
 cell-index computation, radix sort, and cell-range table. Its shaders live
 under `src/stipple/shaders/spatial-grid/`. One
-`dispatch(encoder, readFromA, radius)` entry point records the full build into
-the command encoder. High cohesion, one orchestration call site in `main.ts`.
+`dispatch(encoder, readFromA)` entry point records the full build into the
+command encoder. The `radius` (cell size) is fixed at construction — a
+per-dispatch radius would make `gridDims` stale relative to the pre-sized
+`cellStart`/`cellCount` buffers. High cohesion, one orchestration call site
+in `main.ts`.
 
 ### 4. Step 1 scope: feature gate only
 
@@ -111,7 +115,7 @@ which doubles as the compile/exec validation.
 ### 5. Grid bbox: fixed SCENE_BBOX constant (no per-frame GPU bbox)
 
 The grid uses a single fixed CPU-known `SCENE_BBOX` constant directly as its
-origin and dimensions, shared with the seed pipeline (replaces
+origin and dimensions, shared with the seed pipeline (replaces the former
 `SEED_PARAMS.bboxMin/bboxMax`). **No per-frame GPU bounding-box compute.**
 
 **Rationale.** The original request asked to "infer the bbox from the points"
@@ -225,7 +229,7 @@ After `reproject.dispatch(encoder, time, readFromA)` and before the substep
 loop:
 
 ```ts
-spatialGrid.dispatch(encoder, readFromA, params.radius);
+spatialGrid.dispatch(encoder, readFromA);
 // then the existing substep loop, unchanged
 for (let s = 0; s < substeps; s++) { relax.dispatch(...); readFromA = !readFromA; }
 ```
@@ -234,10 +238,9 @@ The grid is reused by all substeps in the frame (see decision 1).
 
 ## Buffer inventory
 
-All buffers are created by `SpatialGridPipeline` (or `PointBuffers` if a shared
-owner is more appropriate — decide during Step 8). Sizes assume
-`POINT_COUNT = N`, `numCells = gridDimX * gridDimY * gridDimZ` derived from
-`ceil(SCENE_BBOX extent / radius)` per axis.
+All buffers are created by `SpatialGridPipeline` upfront at construction
+(Step 3). Sizes assume `POINT_COUNT = N`, `numCells = gridDimX * gridDimY *
+gridDimZ` derived from `ceil(SCENE_BBOX extent / radius)` per axis.
 
 | Buffer             | Size            | Usage                              | Owner / writer          |
 |--------------------|-----------------|------------------------------------|-------------------------|
@@ -324,6 +327,16 @@ in this module.
   `SEED_PARAMS.bboxMin/bboxMax`); pass it into both `SeedPipeline` and
   `SpatialGridPipeline`. Compute `gridDims` CPU-side from
   `ceil(SCENE_BBOX extent / radius)`.
+- `SpatialGridPipeline` constructor takes `(device, points, sceneBBox, radius)`
+  and creates all grid buffers upfront (7 buffers per the inventory). The
+  `radius` is fixed at construction; `dispatch(encoder, readFromA)` takes no
+  radius param (a per-dispatch radius would make `gridDims` stale relative to
+  pre-sized buffers).
+- `SeedPipeline` constructor changes to `(device, sceneBBox, band)`. The
+  `SeedParams` TS interface is dropped; the WGSL `SeedParams` uniform keeps
+  bbox (the shader needs it for rejection sampling). `band` is set to
+  `DEFAULT_RELAX_PARAMS.radius` in `main.ts` so seed density matches the relax
+  interaction scale. `dispatch` drops the `params` argument.
 
 ### Step 4 — Stable binary split (one bit)
 
@@ -384,11 +397,11 @@ ping-pong bind groups.
 
 ### Step 8 — Wire into frame loop + update docs
 
-- `src/main.ts`: extract `SCENE_BBOX` as a shared constant; construct
-  `SpatialGridPipeline(gpu.device, points, SCENE_BBOX)`. After
-  `reproject.dispatch` and before the substep loop, call
-  `spatialGrid.dispatch(encoder, readFromA, params.radius)`. Pass the grid
-  buffers into `RelaxPipeline` (constructor or a setter).
+- `src/main.ts`: construct
+  `SpatialGridPipeline(gpu.device, points, SCENE_BBOX, DEFAULT_RELAX_PARAMS.radius)`
+  (already done in Step 3). After `reproject.dispatch` and before the
+  substep loop, call `spatialGrid.dispatch(encoder, readFromA)`. Pass the
+  grid buffers into `RelaxPipeline` (constructor or a setter).
 - Update `AGENTS.md` structural overview: add a `spatial-grid-pipeline.ts`
   line and update the data-flow description (reproject → **grid build** →
   relax → shading → render). Add `shaders/spatial-grid/` and
@@ -429,9 +442,16 @@ ping-pong bind groups.
 - **Storage-buffer scatter performance** — scattering via storage buffers (not
   workgroup memory) is slower per access but unbounded by the 16 KB workgroup
   limit. Acceptable for v1; revisit if sort latency is high.
-- **Cell-index packing width** — three ~10-bit cell coords in a `u32` is fine
-  for tens of thousands of cells. If grid resolution ever grows beyond ~2¹⁰
-  per axis, widen the packing or use a 64-bit key.
+- **Cell-index packing width / cell-count cap** — three ~10-bit cell coords
+  in a `u32` is fine for tens of thousands of cells. The `SpatialGridPipeline`
+  constructor enforces a `MAX_CELLS = 2²⁰ = 1_048_576` cap and throws if
+  exceeded, which guards both the u32 key packing width and the
+  `cellStart`/`cellCount` memory (capped at ~8 MB). The target scale is tens
+  of thousands of points; exceeding the cap means far more cells than points
+  (e.g. >1M cells for <65k points means most cells are permanently empty),
+  indicating a misconfigured radius or bounding box rather than a legitimate
+  workload. If grid resolution ever legitimately grows beyond ~2¹⁰ per axis,
+  widen the packing or use a 64-bit key and raise the cap.
 - **SCENE_BBOX correctness** — if the constant is too small for the animated
   scene, out-of-range points collapse into boundary cells (clamped, decision 6).
   The clamp is correctness-preserving (no missed neighbor pairs within

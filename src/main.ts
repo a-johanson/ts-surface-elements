@@ -8,8 +8,9 @@ import {
     RelaxPipeline,
 } from "./stipple/relax-pipeline.js";
 import { ReprojectPipeline } from "./stipple/reproject-pipeline.js";
-import { type SeedParams, SeedPipeline } from "./stipple/seed-pipeline.js";
+import { SeedPipeline } from "./stipple/seed-pipeline.js";
 import { DEFAULT_LIGHT_DIR, ShadingPipeline } from "./stipple/shading-pipeline.js";
+import { type SceneBBox, SpatialGridPipeline } from "./stipple/spatial-grid-pipeline.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
 /** Background clear color — black. */
@@ -28,12 +29,22 @@ const UP: readonly [number, number, number] = [0, 1, 0];
 /** Number of stipple points. */
 const POINT_COUNT = 4 * 1024;
 
-/** Bounding box for rejection sampling of the seed distribution. */
-const SEED_PARAMS: SeedParams = {
-    bboxMin: [-3, -2, -2],
-    bboxMax: [3, 2, 2],
-    band: 0.3,
+/**
+ * Fixed CPU-known bounding box for the animated SDF scene.
+ *
+ * Shared between the seed pipeline (rejection sampling) and the spatial
+ * grid (cell origin and dimensions). Chosen to safely contain the surface
+ * across all animation phases. If the scene geometry changes, update this
+ * constant — a too-small bbox causes only performance degradation (the
+ * cell-index clamp collapses out-of-range points into boundary cells).
+ */
+const SCENE_BBOX: SceneBBox = {
+    min: [-3, -2, -2],
+    max: [3, 2, 2],
 };
+
+/** Acceptance band for seed rejection sampling — tied to the relax radius. */
+const SEED_BAND = DEFAULT_RELAX_PARAMS.radius;
 
 /**
  * Maximum per-frame wall-clock delta, in seconds.
@@ -207,11 +218,18 @@ async function bootstrap(): Promise<void> {
         up: UP,
     };
 
-    const seed = new SeedPipeline(gpu.device);
+    const seed = new SeedPipeline(gpu.device, SCENE_BBOX, SEED_BAND);
     const points = new PointBuffers(gpu.device, POINT_COUNT);
     const reproject = new ReprojectPipeline(gpu.device, points);
     const relax = new RelaxPipeline(gpu.device, points);
     const shading = new ShadingPipeline(gpu.device, points);
+    // biome-ignore lint/correctness/noUnusedVariables: dispatched in Step 8
+    const spatialGrid = new SpatialGridPipeline(
+        gpu.device,
+        points,
+        SCENE_BBOX,
+        DEFAULT_RELAX_PARAMS.radius,
+    );
     const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const controls = new OrbitControls(canvas, {
@@ -222,13 +240,7 @@ async function bootstrap(): Promise<void> {
 
     // --- Seed buffer A once (points are world-space; no re-seed on resize) ---
     const seedEncoder = gpu.device.createCommandEncoder();
-    seed.dispatch(
-        seedEncoder,
-        points.bufferA,
-        points.normalsBuffer,
-        points.count,
-        SEED_PARAMS,
-    );
+    seed.dispatch(seedEncoder, points.bufferA, points.normalsBuffer, points.count);
     gpu.device.queue.submit([seedEncoder.finish()]);
 
     startFrameLoop(
