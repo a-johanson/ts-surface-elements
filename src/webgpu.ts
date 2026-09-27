@@ -36,7 +36,11 @@ export async function createGpuContext(canvas: HTMLCanvasElement): Promise<GpuCo
         throw new Error("No suitable GPU adapter found.");
     }
 
-    const device = await adapter.requestDevice();
+    const device = await adapter.requestDevice({ requiredFeatures: ["subgroups"] });
+    if (!device.features.has("subgroups")) {
+        console.error("Required WebGPU feature 'subgroups' is unavailable.");
+        throw new Error("Required WebGPU feature 'subgroups' is unavailable.");
+    }
     const context = canvas.getContext("webgpu");
     if (context === null) {
         throw new Error("Failed to acquire a WebGPU canvas context.");
