@@ -6,7 +6,7 @@
  * orchestration call site in `main.ts` for the grid rebuild that runs once
  * per frame after `reproject` and before `relax`.
  *
- * The grid uses a fixed CPU-known {@link SceneBBOX} constant as its origin
+ * The grid uses a fixed CPU-known {@link SceneBBox} constant as its origin
  * and dimensions, shared with the seed pipeline. `gridDims` per axis is
  * `ceil(bbox extent / radius)`, computed CPU-side at construction. The
  * `radius` (cell size) is fixed at construction — a per-dispatch radius would
@@ -14,12 +14,17 @@
  * buffers.
  *
  * Step 3 implements the cell-index computation stage. Step 4 constructs the
- * radix-split pipeline and its bind groups. Step 5 wires the 32 per-bit
- * dispatches into `dispatch`. The cell-range stage is added in Step 6.
+ * radix-split pipeline and its bind groups. Step 5 wires the per-bit
+ * dispatches into `dispatch`. Step 6 builds the `cellStart`/`cellCount`
+ * table over the sorted keys.
  */
 
 import type { PointBuffers } from "./point-buffers.js";
-import { buildRadixSplitShader, CELL_INDEX_SHADER } from "./shaders/index.js";
+import {
+    buildRadixSplitShader,
+    CELL_INDEX_SHADER,
+    CELL_RANGES_SHADER,
+} from "./shaders/index.js";
 import { SUBGROUP_WORKGROUP_SIZE } from "./shaders/subgroup-common.js";
 
 /** Workgroup size — must match `@workgroup_size(64)` in the WGSL. */
@@ -78,19 +83,19 @@ export interface SceneBBox {
  * cell-index stage's buffers; Step 4 constructs the radix-split pipeline;
  * Step 5 wires the per-bit dispatches (pass count = bit width of
  * `numCells - 1`, not a fixed 32) and exposes the sorted output pair via
- * `sortedKeys` / `sortedValues`. The cell-range stage is added in Step 6.
+ * `sortedKeys` / `sortedValues`. Step 6 builds the `cellStart`/`cellCount`
+ * table over the sorted keys.
  */
 export class SpatialGridPipeline {
     private readonly device: GPUDevice;
     private readonly pointCount: number;
+    private readonly numCells: number;
     private readonly gridParamsBuffer: GPUBuffer;
     private readonly keysA: GPUBuffer;
     private readonly valuesA: GPUBuffer;
     private readonly keysB: GPUBuffer;
     private readonly valuesB: GPUBuffer;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: cell-range table, wired in Step 6
     private readonly cellStart: GPUBuffer;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: cell-range table, wired in Step 6
     private readonly cellCount: GPUBuffer;
     private readonly cellIndexPipeline: GPUComputePipeline;
     private readonly cellIndexLayout: GPUBindGroupLayout;
@@ -109,10 +114,15 @@ export class SpatialGridPipeline {
      * radix passes. If the pass count is even, the sort lands in A; if odd,
      * in B. Steps 6 and 7 read from these instead of hardcoding the A pair.
      */
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: read in Steps 6 and 7
     private readonly sortedKeys: GPUBuffer;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: read in Steps 6 and 7
+    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: read in Step 7 (relax bind group)
     private readonly sortedValues: GPUBuffer;
+    private readonly cellClearPipeline: GPUComputePipeline;
+    private readonly cellClearLayout: GPUBindGroupLayout;
+    private readonly cellClearBindGroup: GPUBindGroup;
+    private readonly cellRangesPipeline: GPUComputePipeline;
+    private readonly cellRangesLayout: GPUBindGroupLayout;
+    private readonly cellRangesBindGroup: GPUBindGroup;
 
     /**
      * Per-axis grid dimensions from the scene bounding box and cell size
@@ -173,6 +183,7 @@ export class SpatialGridPipeline {
 
         const gridDims = SpatialGridPipeline.gridDims(sceneBBox, radius);
         const numCells = gridDims[0] * gridDims[1] * gridDims[2];
+        this.numCells = numCells;
         if (numCells > MAX_CELLS) {
             throw new Error(
                 `Spatial grid cell count ${numCells} exceeds MAX_CELLS (${MAX_CELLS}). ` +
@@ -345,6 +356,52 @@ export class SpatialGridPipeline {
         const sortedInA = passCount % 2 === 0;
         this.sortedKeys = sortedInA ? this.keysA : this.keysB;
         this.sortedValues = sortedInA ? this.valuesA : this.valuesB;
+
+        // --- Cell ranges (Step 6) -------------------------------------------
+
+        const cellRangesModule = device.createShaderModule({
+            label: "spatial-grid-cell-ranges-shader",
+            code: CELL_RANGES_SHADER,
+        });
+
+        this.cellClearPipeline = device.createComputePipeline({
+            label: "spatial-grid-cell-clear-pipeline",
+            layout: "auto",
+            compute: {
+                module: cellRangesModule,
+                entryPoint: "cell_clear_cs",
+            },
+        });
+        this.cellClearLayout = this.cellClearPipeline.getBindGroupLayout(0);
+        this.cellClearBindGroup = device.createBindGroup({
+            label: "spatial-grid-cell-clear-bind",
+            layout: this.cellClearLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.gridParamsBuffer } },
+                { binding: 2, resource: { buffer: this.cellStart } },
+                { binding: 3, resource: { buffer: this.cellCount } },
+            ],
+        });
+
+        this.cellRangesPipeline = device.createComputePipeline({
+            label: "spatial-grid-cell-ranges-pipeline",
+            layout: "auto",
+            compute: {
+                module: cellRangesModule,
+                entryPoint: "cell_ranges_cs",
+            },
+        });
+        this.cellRangesLayout = this.cellRangesPipeline.getBindGroupLayout(0);
+        this.cellRangesBindGroup = device.createBindGroup({
+            label: "spatial-grid-cell-ranges-bind",
+            layout: this.cellRangesLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.gridParamsBuffer } },
+                { binding: 1, resource: { buffer: this.sortedKeys } },
+                { binding: 2, resource: { buffer: this.cellStart } },
+                { binding: 3, resource: { buffer: this.cellCount } },
+            ],
+        });
     }
 
     /**
@@ -386,15 +443,17 @@ export class SpatialGridPipeline {
     /**
      * Records the spatial grid build into the given command encoder.
      *
-     * Two compute passes: (1) cell-index computation — reads the point buffer
-     * indicated by `readFromA`, writes `keysA` / `valuesA`; (2) radix sort —
-     * one per-bit pass per set bit in the cell key range, in a single compute
-     * pass, alternating the A/B read-write direction. The implicit
-     * pass-boundary barrier between the two passes ensures the cell-index
-     * writes are visible to the sort. After all passes the sorted
-     * `(keys, values)` lands in whichever pair `sortedKeys` / `sortedValues`
-     * points to (A if even pass count, B if odd). The cell-range table
-     * (Step 6) is not yet implemented.
+     * Three compute passes: (1) cell-index computation — reads the point
+     * buffer indicated by `readFromA`, writes `keysA` / `valuesA`; (2) radix
+     * sort — one per-bit pass per set bit in the cell key range, alternating
+     * the A/B read-write direction (skipped when `passCount == 0`, i.e.
+     * `numCells <= 1`); (3) cell ranges — clears `cellStart` / `cellCount`
+     * then scans the sorted keys to populate them. The implicit
+     * pass-boundary barriers between passes ensure each stage's writes are
+     * visible to the next. After all stages the sorted `(keys, values)` lands
+     * in whichever pair `sortedKeys` / `sortedValues` points to (A if even
+     * pass count, B if odd), and `cellStart` / `cellCount` hold per-cell
+     * `[start, start + count)` ranges into `sortedValues`.
      *
      * @param encoder - The command encoder to record into.
      * @param readFromA - If `true`, reads `points.bufferA`; else
@@ -412,16 +471,25 @@ export class SpatialGridPipeline {
         cellIndexPass.dispatchWorkgroups(cellIndexWorkgroups);
         cellIndexPass.end();
 
-        if (this.radixBindGroups.length === 0) {
-            return;
+        if (this.radixBindGroups.length > 0) {
+            const sortPass = encoder.beginComputePass();
+            sortPass.setPipeline(this.radixSplitPipeline);
+            for (const bindGroup of this.radixBindGroups) {
+                sortPass.setBindGroup(0, bindGroup);
+                sortPass.dispatchWorkgroups(1);
+            }
+            sortPass.end();
         }
 
-        const sortPass = encoder.beginComputePass();
-        sortPass.setPipeline(this.radixSplitPipeline);
-        for (const bindGroup of this.radixBindGroups) {
-            sortPass.setBindGroup(0, bindGroup);
-            sortPass.dispatchWorkgroups(1);
-        }
-        sortPass.end();
+        const cellRangesPass = encoder.beginComputePass();
+        const clearWorkgroups = Math.ceil(this.numCells / WORKGROUP_SIZE);
+        cellRangesPass.setPipeline(this.cellClearPipeline);
+        cellRangesPass.setBindGroup(0, this.cellClearBindGroup);
+        cellRangesPass.dispatchWorkgroups(clearWorkgroups);
+        const rangesWorkgroups = Math.ceil(this.pointCount / WORKGROUP_SIZE);
+        cellRangesPass.setPipeline(this.cellRangesPipeline);
+        cellRangesPass.setBindGroup(0, this.cellRangesBindGroup);
+        cellRangesPass.dispatchWorkgroups(rangesWorkgroups);
+        cellRangesPass.end();
     }
 }

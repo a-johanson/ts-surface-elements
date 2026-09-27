@@ -445,16 +445,35 @@ even, B if odd; `sortedKeys` / `sortedValues` capture which (decision 8).
 ### Step 6 — Cell-start/count table
 
 `src/stipple/shaders/spatial-grid/cell-ranges-shader.ts` over the sorted
-`keysA`:
+`sortedKeys` (the buffer pair the radix sort actually landed in — A if the
+pass count is even, B if odd; see decision 8):
 - **Clear pass** (per frame): reset `cellStart → UINT_MAX`, `cellCount → 0`
-  for all `numCells`. Implement as a small compute dispatch (one invocation
-  per cell) or via `writeBuffer` if simpler. Must run before the ranges pass.
+  for all `numCells`. Implemented as a compute dispatch (one invocation
+  per cell) in the same compute pass as the ranges pass, recorded before
+  it. Non-atomic writes — one invocation per cell, no race. A compute
+  dispatch is used rather than `writeBuffer`/`clearBuffer` because
+  `cellStart` needs `UINT_MAX` (not zero), which `clearBuffer` cannot
+  write.
 - **Ranges pass**: one invocation per point `i`. If `i == 0` or
-  `keysA[i] != keysA[i-1]`, this is the first point of cell `keysA[i]` — store
-  `cellStart[keysA[i]] = i`. For every `i`:
-  `atomicAdd(cellCount[keysA[i]], 1)`.
+  `sortedKeys[i] != sortedKeys[i-1]`, this is the first point of cell
+  `sortedKeys[i]` — store `cellStart[sortedKeys[i]] = i` (non-atomic —
+  only one invocation owns each cell's first index). For every `i`:
+  `atomicAdd(cellCount[sortedKeys[i]], 1)`.
 
 Empty cells keep `cellStart = UINT_MAX`, `cellCount = 0`; relax skips them.
+
+**Completed.** One shader module with two entry points (`cell_clear_cs`,
+`cell_ranges_cs`) sharing module-scope bindings (`params`, `sorted_keys`,
+`cell_start`, `cell_count`); the clear pipeline's auto-derived layout omits
+the unused `sorted_keys` binding. `SpatialGridPipeline` constructs two
+pipelines and two bind groups at the end of the constructor; the ranges
+bind group binds `sortedKeys` (not a hardcoded `keysA`) so an odd pass
+count is handled correctly. `dispatch` records a third compute pass after
+the sort pass containing the clear dispatch (workgroups =
+`ceil(numCells / 64)`) followed by the ranges dispatch (workgroups =
+`ceil(pointCount / 64)`). The sort pass is now guarded by
+`passCount > 0` (formerly it returned early when `passCount == 0`, which
+would have skipped the cell-range build); the cell-range build always runs.
 
 ### Step 7 — Rewrite relax shader to use the grid
 
