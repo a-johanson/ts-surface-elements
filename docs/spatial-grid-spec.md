@@ -22,7 +22,8 @@ only its own cell plus the 26 neighboring cells (27-cell 3×3×3 neighborhood) �
 O(1) neighbor lookup amortized.
 
 The grid is built with the standard GPU approach: per-point cell index as key
-and point index as value, **radix-sorted** (1 bit per pass, 32 passes) so all
+and point index as value, **radix-sorted** (1 bit per pass, pass count = bit
+width of the cell key range — see decision 8) so all
 points in the same cell are contiguous, then a **cell-start/count table**
 gives O(1) range lookup per cell.
 
@@ -177,42 +178,57 @@ beyond the cutoff and correctly skipped. So no neighbor pair within
 `radius` is ever missed by the clamp; the only cost is wasted iterations
 on over-full boundary cells.
 
-### 7. Per-bit uniform supply: 32 fixed-offset bind groups
+### 7. Per-bit uniform supply: fixed-offset bind groups
 
-Each of the 32 radix-split passes needs a different `bit` value in the
-`RadixBitParams` uniform. Within a single compute pass, uniform buffer
-contents cannot be changed between dispatches (`device.queue.writeBuffer` is
-a queue operation that takes effect at submit time, not between recorded
-dispatches). So the per-bit value must vary via the *binding*, not the
-*contents*.
+Each radix-split pass needs a different `bit` value in the `RadixBitParams`
+uniform. Within a single compute pass, uniform buffer contents cannot be
+changed between dispatches (`device.queue.writeBuffer` is a queue operation
+that takes effect at submit time, not between recorded dispatches). So the
+per-bit value must vary via the *binding*, not the *contents*.
 
 Three approaches were considered:
 
-1. **32 fixed-offset bind groups** (chosen). One uniform buffer with 32
-   slots (each `minUniformBufferOffsetAlignment` bytes apart, 256 by default),
-   pre-filled at construction with bit values `0..31`. Each pass's bind group
-   binds its slot at a fixed offset. Works with `layout: "auto"` — no
-   explicit bind group layout needed. 32 bind group objects, created once.
+1. **Fixed-offset bind groups** (chosen). One uniform buffer with one slot
+   per pass (each `minUniformBufferOffsetAlignment` bytes apart, 256 by
+   default), pre-filled at construction with bit values `0..passes-1`. Each
+   pass's bind group binds its slot at a fixed offset. Works with
+   `layout: "auto"` — no explicit bind group layout needed.
 2. **Dynamic offsets.** Two bind groups (A→B, B→A) with
    `hasDynamicOffset: true` on binding 0; the offset is supplied at
    `setBindGroup` time per dispatch. Requires an explicit `GPUBindGroupLayout`
    (cannot use `layout: "auto"`). The textbook WebGPU pattern for "same
    buffer, different view per dispatch within a pass," but heavier
-   infrastructure for 32 fixed, known-at-construction passes.
-3. **32 separate compute passes** with a `copyBufferToBuffer` between each.
-   Deviates from the "one compute pass" structure and adds 32 pass-boundary
-   barriers + 32 copy commands. Strictly slower; rejected.
+   infrastructure for a fixed, known-at-construction pass set.
+3. **Separate compute passes** with a `copyBufferToBuffer` between each.
+   Deviates from the "one compute pass" structure and adds per-pass
+   barriers + copy commands. Strictly slower; rejected.
 
 **Chosen: approach 1.** Approaches 1 and 2 have identical runtime GPU cost
-(32 dispatches in one pass); the difference is purely CPU-side bookkeeping.
+(dispatches in one pass); the difference is purely CPU-side bookkeeping.
 Approach 1 is simpler (no Step 4 layout refactor), wastes no memory beyond
-the 256-byte alignment padding (8 KB total — trivial), and each pass is a
-distinct self-contained bind group, maximally inspectable while learning.
-The "32 objects" count is inherent to a 32-pass radix sort, not a smell.
+the 256-byte alignment padding (trivial), and each pass is a distinct
+self-contained bind group, maximally inspectable while learning.
+
+### 8. Pass count: bit width of the cell key range
+
+The number of radix passes is **not** a fixed 32. Cell keys are linear
+indices in `[0, numCells-1]`, so only the bits up to the most significant
+set bit of `numCells - 1` can vary — higher bits are always 0 and sorting
+them is a no-op. The pass count is `32 - clz32(numCells - 1)` (the bit
+width of `numCells - 1`). For the default config (3920 cells) this is **12
+passes** instead of 32 — a 2.7× reduction in sort work per frame. The
+`MAX_CELLS = 2²⁰` cap bounds the worst case at 20 passes.
+
+**Sorted-output parity.** Because the A/B read-write direction alternates
+per pass, an odd pass count lands the sorted data in B, not A. Rather than
+padding with a no-op pass to force even parity (running a full scan +
+scatter that achieves nothing), the pipeline stores `sortedKeys` /
+`sortedValues` at construction — pointing to A if even, B if odd. Steps 6
+and 7 read from these instead of hardcoding the A pair.
 
 **Switch condition.** If the number of passes grows significantly (e.g. a
 multi-workgroup sort with per-workgroup bit schedules), switch to dynamic
-offsets (approach 2) to avoid a bind-group explosion.
+offsets (decision 7, approach 2) to avoid a bind-group explosion.
 
 ## WebGPU subgroups feature requirement
 
@@ -245,7 +261,7 @@ reproject (in-place on readFromA buffer, refreshes shared normals)
 spatial grid build  ◄── reads points[readFromA], writes grid buffers
    │   1. cell-index computation (SCENE_BBOX origin+dims, clamped) → keys[], values[]
    │   2. clear cellStart/cellCount
-   │   3. radix sort (32 binary splits, ping-pong A↔B)
+   │   3. radix sort (pass count = key bit width, ping-pong A↔B)
    │   4. cell-start/count table
    ▼
 relax (substepped, ping-pong)  ◄── reads points[readFromA] + grid buffers
@@ -283,7 +299,7 @@ axis.
 | Buffer             | Size            | Usage                              | Owner / writer          |
 |--------------------|-----------------|------------------------------------|-------------------------|
 | `gridParamsBuffer` | uniform, ~48 B  | `UNIFORM \| COPY_DST`             | spatial-grid (CPU write, once at startup) |
-| `radixBitParamsBuffer` | uniform, `32 × minUniformBufferOffsetAlignment` (8 KB default) | `UNIFORM \| COPY_DST` | spatial-grid (CPU write, once at startup) |
+| `radixBitParamsBuffer` | uniform, `passes × minUniformBufferOffsetAlignment` (≤8 KB; 3 KB default) | `UNIFORM \| COPY_DST` | spatial-grid (CPU write, once at startup) |
 | `keysA`, `keysB`   | `N × 4` B       | `STORAGE \| COPY_DST`             | spatial-grid (sort ping-pong) |
 | `valuesA`, `valuesB` | `N × 4` B     | `STORAGE \| COPY_DST`             | spatial-grid (sort ping-pong) |
 | `cellStart`        | `numCells × 4` B | `STORAGE \| COPY_DST`            | spatial-grid (cell-ranges, cleared per frame) |
@@ -297,13 +313,13 @@ skips them.
 ### Relax bind-group additions
 
 `RelaxPipeline`'s bind group gains (in addition to the existing params, points
-read/write, normals): `gridParamsBuffer`, sorted `keys`, sorted `values`,
-`cellStart`, `cellCount`. Because the sort result lands in buffer A (32 passes,
-even count), the relax bind group always binds the A pair as the sorted output —
-regardless of the point-buffer ping-pong direction, since the grid is rebuilt
-each frame from the current `readFromA` and its sorted output is always in A.
-The `radius` already exists in `RelaxParams` and doubles as the cell size — no
-new param needed; relax reads `bboxMin`/`bboxMax`/`gridDims` from
+read/write, normals): `gridParamsBuffer`, the sorted `keys` / `values`
+(exposed by `SpatialGridPipeline` as `sortedKeys` / `sortedValues` — A if
+the pass count is even, B if odd; see decision 8), `cellStart`, `cellCount`.
+The grid is rebuilt each frame from the current `readFromA`, so the sorted
+output is always fresh regardless of the point-buffer ping-pong direction.
+The `radius` already exists in `RelaxParams` and doubles as the cell size —
+no new param needed; relax reads `bboxMin`/`bboxMax`/`gridDims` from
 `gridParamsBuffer`.
 
 ## Implementation steps
@@ -406,22 +422,25 @@ size). `SUBGROUP_WORKGROUP_SIZE` (exported from `subgroup-common.ts`) is the
 single source of truth for the 256 workgroup size, interpolated into both
 the WGSL `@workgroup_size` and the TS `elementsPerThread` calculation.
 
-### Step 5 — Radix sort driver (32 passes)
+### Step 5 — Radix sort driver
 
-`SpatialGridPipeline.dispatch` records one compute pass with 32
-`dispatchWorkgroups` calls, bit `0..31`, alternating the A/B bind group each
-pass. 32 is even, so the final sorted `(keys, values)` lands back in the A
-pair. Explicit per-bit dispatches (rather than an in-shader loop) so each pass
-is inspectable while learning; a single dispatch with an internal loop is a
+`SpatialGridPipeline.dispatch` records one compute pass with one
+`dispatchWorkgroups` call per radix pass (bit `0..passes-1`), alternating the
+A/B bind group each pass. The pass count is the bit width of `numCells - 1`
+(decision 8), not a fixed 32 — 12 passes for the default config. Explicit
+per-bit dispatches (rather than an in-shader loop) so each pass is
+inspectable while learning; a single dispatch with an internal loop is a
 later optimization (see *Switch points*).
 
-**Completed.** Implemented as 32 fixed-offset bind groups (decision 7), one
-per bit pass, created in a loop at construction. The `radixBitParamsBuffer`
-is pre-filled once at startup with bit values `0..31` at 256-byte strides.
-`dispatch` records two compute passes: (1) cell-index computation, (2) radix
-sort — 32 `setBindGroup` + `dispatchWorkgroups(1)` calls in a single pass.
-The implicit pass-boundary barrier between the two ensures cell-index writes
-are visible to the sort.
+**Completed.** Implemented as one fixed-offset bind group per pass (decision
+7), created in a loop at construction. The `radixBitParamsBuffer` is
+pre-filled once at startup with bit values `0..passes-1` at
+`minUniformBufferOffsetAlignment`-byte strides. `dispatch` records two
+compute passes: (1) cell-index computation, (2) radix sort — one
+`setBindGroup` + `dispatchWorkgroups(1)` per pass. The implicit
+pass-boundary barrier between the two ensures cell-index writes are visible
+to the sort. The sorted `(keys, values)` lands in A if the pass count is
+even, B if odd; `sortedKeys` / `sortedValues` capture which (decision 8).
 
 ### Step 6 — Cell-start/count table
 
@@ -483,9 +502,10 @@ ping-pong bind groups.
   decision 1).
 - **Multi-workgroup radix sort** — past ~32k–65k points or when sort latency
   dominates (see decision 2).
-- **Single-dispatch in-shader sort loop** — collapse the 32 per-bit dispatches
-  into one dispatch with an internal 32-iteration loop and `workgroupBarrier`
-  between passes. Saves dispatch overhead only; do after correctness is
+- **Single-dispatch in-shader sort loop** — collapse the per-bit dispatches
+  into one dispatch with an internal `passes`-iteration loop and
+  `workgroupBarrier` between passes. Saves dispatch overhead only; do after
+  correctness is
   confirmed.
 - **Wider radix (4-bit, 8 passes)** — fewer passes once 1-bit correctness is
   proven; requires a 16-bucket histogram + scan instead of a binary split.

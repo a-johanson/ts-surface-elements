@@ -26,15 +26,6 @@ import { SUBGROUP_WORKGROUP_SIZE } from "./shaders/subgroup-common.js";
 const WORKGROUP_SIZE = 64;
 
 /**
- * Number of radix-split passes — one per bit of the `u32` cell key.
- *
- * 32 is even, so alternating the A/B read-write direction per pass lands the
- * final sorted `(keys, values)` back in the A pair regardless of starting
- * direction.
- */
-const RADIX_PASSES = 32;
-
-/**
  * Size of one `RadixBitParams` uniform slot in bytes.
  *
  * WGSL struct layout (uniform): `bit: u32` + three u32 pads = 16 bytes,
@@ -80,34 +71,14 @@ export interface SceneBBox {
 }
 
 /**
- * Computes per-axis grid dimensions from the scene bounding box and cell
- * size (relaxation radius).
- *
- * @param bbox - The scene bounding box.
- * @param cellSize - The cell size (relaxation radius).
- * @returns A 3-tuple of per-axis cell counts.
- */
-function computeGridDims(
-    bbox: SceneBBox,
-    cellSize: number,
-): readonly [number, number, number] {
-    return [
-        Math.ceil((bbox.max[0] - bbox.min[0]) / cellSize),
-        Math.ceil((bbox.max[1] - bbox.min[1]) / cellSize),
-        Math.ceil((bbox.max[2] - bbox.min[2]) / cellSize),
-    ];
-}
-
-/**
  * Manages the spatial grid build: cell-index computation, radix sort, and
  * cell-range table.
  *
- * All grid buffers are created upfront at construction. Step 3 binds only
- * the cell-index stage's buffers (`keysA`, `valuesA`, `gridParamsBuffer`);
- * Step 4 constructs the radix-split pipeline, its bit-params uniform, and
- * the A→B / B→A ping-pong bind groups (left idle until Step 5 records the
- * 32 per-bit dispatches); the remaining buffers (`cellStart`, `cellCount`)
- * sit idle until Step 6.
+ * All grid buffers are created upfront at construction. Step 3 binds the
+ * cell-index stage's buffers; Step 4 constructs the radix-split pipeline;
+ * Step 5 wires the per-bit dispatches (pass count = bit width of
+ * `numCells - 1`, not a fixed 32) and exposes the sorted output pair via
+ * `sortedKeys` / `sortedValues`. The cell-range stage is added in Step 6.
  */
 export class SpatialGridPipeline {
     private readonly device: GPUDevice;
@@ -128,8 +99,58 @@ export class SpatialGridPipeline {
     private readonly radixBitParamsBuffer: GPUBuffer;
     private readonly radixSplitPipeline: GPUComputePipeline;
     private readonly radixSplitLayout: GPUBindGroupLayout;
-    /** One bind group per bit pass; even passes read A→write B, odd passes read B→write A. */
+    /**
+     * One bind group per bit pass; even passes read A→write B, odd passes
+     * read B→write A.
+     */
     private readonly radixBindGroups: readonly GPUBindGroup[];
+    /**
+     * The buffer pair holding the final sorted `(keys, values)` after all
+     * radix passes. If the pass count is even, the sort lands in A; if odd,
+     * in B. Steps 6 and 7 read from these instead of hardcoding the A pair.
+     */
+    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: read in Steps 6 and 7
+    private readonly sortedKeys: GPUBuffer;
+    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: read in Steps 6 and 7
+    private readonly sortedValues: GPUBuffer;
+
+    /**
+     * Per-axis grid dimensions from the scene bounding box and cell size
+     * (relaxation radius).
+     *
+     * @param bbox - The scene bounding box.
+     * @param cellSize - The cell size (relaxation radius).
+     * @returns A 3-tuple of per-axis cell counts.
+     */
+    private static gridDims(
+        bbox: SceneBBox,
+        cellSize: number,
+    ): readonly [number, number, number] {
+        return [
+            Math.ceil((bbox.max[0] - bbox.min[0]) / cellSize),
+            Math.ceil((bbox.max[1] - bbox.min[1]) / cellSize),
+            Math.ceil((bbox.max[2] - bbox.min[2]) / cellSize),
+        ];
+    }
+
+    /**
+     * Number of radix-split passes needed for a given cell count.
+     *
+     * Cell keys are linear indices in `[0, numCells-1]`. Only the bits up to
+     * the most significant set bit of `numCells - 1` can vary, so higher bits
+     * are always 0 and sorting them is a no-op. Returns the exact bit width,
+     * skipping those no-op passes. For the default config (3920 cells) this
+     * is 12 passes instead of 32 — a 2.7× reduction in sort work per frame.
+     *
+     * @param numCells - The total number of grid cells.
+     * @returns The number of radix passes (0 if `numCells <= 1`).
+     */
+    private static radixPasses(numCells: number): number {
+        if (numCells <= 1) {
+            return 0;
+        }
+        return 32 - Math.clz32(numCells - 1);
+    }
 
     /**
      * Creates the cell-index shader module, compute pipeline, params
@@ -150,7 +171,7 @@ export class SpatialGridPipeline {
         this.device = device;
         this.pointCount = points.count;
 
-        const gridDims = computeGridDims(sceneBBox, radius);
+        const gridDims = SpatialGridPipeline.gridDims(sceneBBox, radius);
         const numCells = gridDims[0] * gridDims[1] * gridDims[2];
         if (numCells > MAX_CELLS) {
             throw new Error(
@@ -245,11 +266,12 @@ export class SpatialGridPipeline {
 
         // --- Radix split (Steps 4–5) -----------------------------------------
 
+        const passCount = SpatialGridPipeline.radixPasses(numCells);
         const uniformSlotStride = device.limits.minUniformBufferOffsetAlignment;
-        const radixParamsBytes = RADIX_PASSES * uniformSlotStride;
+        const radixParamsBytes = Math.max(passCount, 1) * uniformSlotStride;
         const radixParamsData = new ArrayBuffer(radixParamsBytes);
         const radixParamsU32 = new Uint32Array(radixParamsData);
-        for (let b = 0; b < RADIX_PASSES; b++) {
+        for (let b = 0; b < passCount; b++) {
             radixParamsU32[(b * uniformSlotStride) / 4] = b;
         }
 
@@ -285,12 +307,13 @@ export class SpatialGridPipeline {
 
         this.radixSplitLayout = this.radixSplitPipeline.getBindGroupLayout(0);
 
-        // 32 bind groups, one per bit pass. Each binds a different slot of the
+        // One bind group per bit pass. Each binds a different slot of the
         // uniform buffer (fixed offset = b × uniformSlotStride) and alternates
         // the read/write direction: even passes read A→write B, odd passes
-        // read B→write A. 32 is even, so the final sorted data lands in A.
+        // read B→write A. After `passCount` passes, the sorted data lands in
+        // A if even, B if odd — `sortedKeys` / `sortedValues` capture which.
         const bindGroups: GPUBindGroup[] = [];
-        for (let b = 0; b < RADIX_PASSES; b++) {
+        for (let b = 0; b < passCount; b++) {
             const readA = b % 2 === 0;
             const keysIn = readA ? this.keysA : this.keysB;
             const valuesIn = readA ? this.valuesA : this.valuesB;
@@ -318,6 +341,10 @@ export class SpatialGridPipeline {
             );
         }
         this.radixBindGroups = bindGroups;
+
+        const sortedInA = passCount % 2 === 0;
+        this.sortedKeys = sortedInA ? this.keysA : this.keysB;
+        this.sortedValues = sortedInA ? this.valuesA : this.valuesB;
     }
 
     /**
@@ -361,11 +388,13 @@ export class SpatialGridPipeline {
      *
      * Two compute passes: (1) cell-index computation — reads the point buffer
      * indicated by `readFromA`, writes `keysA` / `valuesA`; (2) radix sort —
-     * 32 per-bit passes in a single compute pass, alternating the A/B
-     * read-write direction. The implicit pass-boundary barrier between the
-     * two passes ensures the cell-index writes are visible to the sort. After
-     * all 32 passes (even count) the sorted `(keys, values)` lands in the A
-     * pair. The cell-range table (Step 6) is not yet implemented.
+     * one per-bit pass per set bit in the cell key range, in a single compute
+     * pass, alternating the A/B read-write direction. The implicit
+     * pass-boundary barrier between the two passes ensures the cell-index
+     * writes are visible to the sort. After all passes the sorted
+     * `(keys, values)` lands in whichever pair `sortedKeys` / `sortedValues`
+     * points to (A if even pass count, B if odd). The cell-range table
+     * (Step 6) is not yet implemented.
      *
      * @param encoder - The command encoder to record into.
      * @param readFromA - If `true`, reads `points.bufferA`; else
@@ -383,10 +412,14 @@ export class SpatialGridPipeline {
         cellIndexPass.dispatchWorkgroups(cellIndexWorkgroups);
         cellIndexPass.end();
 
+        if (this.radixBindGroups.length === 0) {
+            return;
+        }
+
         const sortPass = encoder.beginComputePass();
         sortPass.setPipeline(this.radixSplitPipeline);
-        for (let b = 0; b < RADIX_PASSES; b++) {
-            sortPass.setBindGroup(0, this.radixBindGroups[b]);
+        for (const bindGroup of this.radixBindGroups) {
+            sortPass.setBindGroup(0, bindGroup);
             sortPass.dispatchWorkgroups(1);
         }
         sortPass.end();
