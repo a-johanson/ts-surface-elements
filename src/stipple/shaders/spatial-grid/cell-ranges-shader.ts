@@ -5,8 +5,10 @@
  * Two entry points share one module and one set of module-scope bindings:
  *
  *   • `cell_clear_cs` — one invocation per cell. Resets `cell_start[c]` to
- *     `UINT_MAX` and `cell_count[c]` to `0`. Non-atomic writes: exactly one
- *     invocation owns each cell, so there is no race. `UINT_MAX` is the
+ *     `UINT_MAX` and `cell_count[c]` to `0` (via `atomicStore` —
+ *     `cell_count` is `array<atomic<u32>>` because the ranges pass tallies
+ *     it concurrently with `atomicAdd`; `cell_start` is plain `u32` since
+ *     only one invocation ever writes each cell's start). `UINT_MAX` is the
  *     sentinel relax (Step 7) tests to skip empty cells. References only
  *     `params`, `cell_start`, `cell_count` (binding 1 — `sorted_keys` — is
  *     unused, so the clear pipeline's auto-derived layout omits it).
@@ -47,7 +49,7 @@ const UINT_MAX: u32 = 0xFFFFFFFFu;
 @group(0) @binding(0) var<uniform> params: GridParams;
 @group(0) @binding(1) var<storage, read> sorted_keys: array<u32>;
 @group(0) @binding(2) var<storage, read_write> cell_start: array<u32>;
-@group(0) @binding(3) var<storage, read_write> cell_count: array<u32>;
+@group(0) @binding(3) var<storage, read_write> cell_count: array<atomic<u32>>;
 
 @compute @workgroup_size(64)
 fn cell_clear_cs(@builtin(global_invocation_id) gid: vec3u) {
@@ -57,7 +59,7 @@ fn cell_clear_cs(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
     cell_start[c] = UINT_MAX;
-    cell_count[c] = 0u;
+    atomicStore(&cell_count[c], 0u);
 }
 
 @compute @workgroup_size(64)

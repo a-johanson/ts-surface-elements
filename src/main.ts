@@ -129,6 +129,7 @@ function getCanvas(): HTMLCanvasElement {
 function startFrameLoop(
     gpu: GpuContext,
     reproject: ReprojectPipeline,
+    spatialGrid: SpatialGridPipeline,
     relax: RelaxPipeline,
     shading: ShadingPipeline,
     points: PointBuffers,
@@ -156,6 +157,11 @@ function startFrameLoop(
 
         // --- Compute pass: reproject (in-place, before relax) ---
         reproject.dispatch(encoder, time, readFromA);
+
+        // --- Compute pass: spatial grid build (before relax, reused across
+        // all substeps — see decision 1). Built from the same buffer relax
+        // is about to read, so cell assignments match the iterated positions.
+        spatialGrid.dispatch(encoder, readFromA);
 
         // --- Compute pass: relax (ping-pong, substepped) ---
         // Subdivide dt so the per-step Euler size stays within the kernel's
@@ -221,15 +227,14 @@ async function bootstrap(): Promise<void> {
     const seed = new SeedPipeline(gpu.device, SCENE_BBOX, SEED_BAND);
     const points = new PointBuffers(gpu.device, POINT_COUNT);
     const reproject = new ReprojectPipeline(gpu.device, points);
-    const relax = new RelaxPipeline(gpu.device, points);
-    const shading = new ShadingPipeline(gpu.device, points);
-    // biome-ignore lint/correctness/noUnusedVariables: dispatched in Step 8
     const spatialGrid = new SpatialGridPipeline(
         gpu.device,
         points,
         SCENE_BBOX,
         DEFAULT_RELAX_PARAMS.radius,
     );
+    const relax = new RelaxPipeline(gpu.device, points, spatialGrid);
+    const shading = new ShadingPipeline(gpu.device, points);
     const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const controls = new OrbitControls(canvas, {
@@ -246,6 +251,7 @@ async function bootstrap(): Promise<void> {
     startFrameLoop(
         gpu,
         reproject,
+        spatialGrid,
         relax,
         shading,
         points,

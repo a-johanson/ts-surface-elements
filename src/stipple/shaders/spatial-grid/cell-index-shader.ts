@@ -43,7 +43,7 @@ fn cell_index_cs(@builtin(global_invocation_id) gid: vec3u) {
 
     let p = points_in[i].pos.xyz;
     let cf = floor((p - params.bbox_min) / params.cell_size);
-    let cf_clamped = clamp(cf, vec3f(0.0), vec3f(f32(params.grid_dims) - 1.0));
+    let cf_clamped = clamp(cf, vec3f(0.0), vec3f(params.grid_dims) - vec3f(1.0));
     let c = vec3u(cf_clamped);
     let key = c.x + params.grid_dims.x * (c.y + params.grid_dims.y * c.z);
 

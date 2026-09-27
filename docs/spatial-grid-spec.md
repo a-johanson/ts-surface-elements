@@ -313,14 +313,16 @@ skips them.
 ### Relax bind-group additions
 
 `RelaxPipeline`'s bind group gains (in addition to the existing params, points
-read/write, normals): `gridParamsBuffer`, the sorted `keys` / `values`
-(exposed by `SpatialGridPipeline` as `sortedKeys` / `sortedValues` — A if
-the pass count is even, B if odd; see decision 8), `cellStart`, `cellCount`.
-The grid is rebuilt each frame from the current `readFromA`, so the sorted
-output is always fresh regardless of the point-buffer ping-pong direction.
-The `radius` already exists in `RelaxParams` and doubles as the cell size —
-no new param needed; relax reads `bboxMin`/`bboxMax`/`gridDims` from
-`gridParamsBuffer`.
+read/write, normals): `gridParamsBuffer`, `sortedValues` (exposed by
+`SpatialGridPipeline` — A if the pass count is even, B if odd; see decision 8),
+`cellStart`, `cellCount`. `sortedKeys` is not bound: the cell ranges already
+encode which index ranges belong to which cell, so relax only needs
+`sortedValues` (point indices) to fetch neighbors. The grid is rebuilt each
+frame from the current `readFromA`, so the sorted output is always fresh
+regardless of the point-buffer ping-pong direction. The grid buffers are not
+ping-ponged — both A→B and B→A relax bind groups bind the same set. The
+`radius` already exists in `RelaxParams` and doubles as the cell size — no new
+param needed; relax reads `bboxMin`/`gridDims` from `gridParamsBuffer`.
 
 ## Implementation steps
 
@@ -477,29 +479,47 @@ would have skipped the cell-range build); the cell-range build always runs.
 
 ### Step 7 — Rewrite relax shader to use the grid
 
-Edit `src/stipple/shaders/relax-shader.ts:71` — replace the O(n²) `for j`
+Edit `src/stipple/shaders/relax-shader.ts` — replace the O(n²) `for j`
 loop:
 - Recompute point `i`'s cell (same formula as Step 3, with the same clamp)
   from its position + `gridParamsBuffer`.
-- Loop the 27 neighbor cells (3×3×3 offset). For each neighbor cell, read
-  `cellStart`/`cellCount`; if `cellStart == UINT_MAX` skip; else iterate
-  `[start, start + count)` in the sorted arrays, fetch
-  `j = valuesA[sortedIdx]`, read `points_in[j]` and `normals_in[j]`.
+- Loop the 27 neighbor cells (3×3×3 offset). For each neighbor cell,
+  bounds-check the cell coord against `[0, gridDims)`, compute its linear
+  key, and read `cellStart`/`cellCount`; if `cellStart == UINT_MAX` skip;
+  else iterate `s ∈ [0, count)`, fetch `j = sortedValues[start + s]`, read
+  `points_in[j]` and `normals_in[j]`.
 - Run the **unchanged** pairwise force logic: curvature-inflated distance
   cutoff, midpoint SDF line-of-sight, linear-decay envelope, tangent-plane
   projection, Euler step, Newton re-projection.
 
-Extend the relax bind group with: `gridParamsBuffer`, `keysA`, `valuesA`,
-`cellStart`, `cellCount`. Update `RelaxPipeline` constructor and both
-ping-pong bind groups.
+Extend the relax bind group with: `gridParamsBuffer`, `sortedValues`,
+`cellStart`, `cellCount` (bindings 4–7). `sortedKeys` is **not** bound:
+the cell ranges already encode which index ranges belong to which cell,
+so relax only needs `sortedValues` (point indices) to fetch neighbors.
+Update `RelaxPipeline` constructor to accept a `GridBuffers` interface
+(the 4 exposed buffers) and add the grid bindings to both ping-pong bind
+groups. The grid buffers are not ping-ponged — they are rebuilt once per
+frame from whichever buffer relax reads (Step 6), so both A→B and B→A
+bind groups bind the same grid buffer set. `SpatialGridPipeline` exposes
+the 4 buffers as public readonly fields (structurally assignable to
+`GridBuffers`); `sortedKeys` stays private (no external consumer).
+
+**Completed.** The shader recomputes `c_i` via the same clamped floor
+formula as the cell-index shader, then scans `dz/dy/dx ∈ {-1,0,1}` with
+a `vec3i` bounds check against `grid_dims`. `RelaxPipeline`'s constructor
+signature changed to `(device, points, grid: GridBuffers)`; `main.ts`
+construction-site update is deferred to Step 8 (Step 7 alone does not
+compile end-to-end — `npm run lint` fails on `main.ts` until Step 8
+wires the grid into the frame loop).
 
 ### Step 8 — Wire into frame loop + update docs
 
 - `src/main.ts`: construct
   `SpatialGridPipeline(gpu.device, points, SCENE_BBOX, DEFAULT_RELAX_PARAMS.radius)`
-  (already done in Step 3). After `reproject.dispatch` and before the
-  substep loop, call `spatialGrid.dispatch(encoder, readFromA)`. Pass the
-  grid buffers into `RelaxPipeline` (constructor or a setter).
+  (already done in Step 3) **before** `RelaxPipeline`, and pass the grid
+  pipeline (which satisfies `GridBuffers`) as the third constructor
+  argument to `RelaxPipeline`. After `reproject.dispatch` and before the
+  substep loop, call `spatialGrid.dispatch(encoder, readFromA)`.
 - Update `AGENTS.md` structural overview: add a `spatial-grid-pipeline.ts`
   line and update the data-flow description (reproject → **grid build** →
   relax → shading → render). Add `shaders/spatial-grid/` and

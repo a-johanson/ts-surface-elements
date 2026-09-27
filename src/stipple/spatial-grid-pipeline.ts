@@ -76,6 +76,29 @@ export interface SceneBBox {
 }
 
 /**
+ * Read-only view of the spatial grid buffers consumed by the relax
+ * pipeline (Step 7).
+ *
+ * The grid is rebuilt once per frame by {@link SpatialGridPipeline} from
+ * whichever point buffer relax is about to read, so these buffers always
+ * match the current positions regardless of the relax ping-pong
+ * direction. They are not ping-ponged — both A→B and B→A relax bind
+ * groups bind the same set. `sortedKeys` is intentionally absent: the
+ * cell ranges already encode which index ranges belong to which cell,
+ * so relax only needs `sortedValues` (point indices) to fetch neighbors.
+ */
+export interface GridBuffers {
+    /** Grid params uniform (`bboxMin`, `cellSize`, `gridDims`, etc.). */
+    readonly gridParamsBuffer: GPUBuffer;
+    /** Sorted point indices — `sortedValues[start + s]` yields a point `j`. */
+    readonly sortedValues: GPUBuffer;
+    /** Per-cell start index into `sortedValues`; `UINT_MAX` = empty cell. */
+    readonly cellStart: GPUBuffer;
+    /** Per-cell point count. */
+    readonly cellCount: GPUBuffer;
+}
+
+/**
  * Manages the spatial grid build: cell-index computation, radix sort, and
  * cell-range table.
  *
@@ -90,13 +113,13 @@ export class SpatialGridPipeline {
     private readonly device: GPUDevice;
     private readonly pointCount: number;
     private readonly numCells: number;
-    private readonly gridParamsBuffer: GPUBuffer;
+    public readonly gridParamsBuffer: GPUBuffer;
     private readonly keysA: GPUBuffer;
     private readonly valuesA: GPUBuffer;
     private readonly keysB: GPUBuffer;
     private readonly valuesB: GPUBuffer;
-    private readonly cellStart: GPUBuffer;
-    private readonly cellCount: GPUBuffer;
+    public readonly cellStart: GPUBuffer;
+    public readonly cellCount: GPUBuffer;
     private readonly cellIndexPipeline: GPUComputePipeline;
     private readonly cellIndexLayout: GPUBindGroupLayout;
     private readonly cellIndexBindGroupA: GPUBindGroup;
@@ -115,8 +138,7 @@ export class SpatialGridPipeline {
      * in B. Steps 6 and 7 read from these instead of hardcoding the A pair.
      */
     private readonly sortedKeys: GPUBuffer;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: read in Step 7 (relax bind group)
-    private readonly sortedValues: GPUBuffer;
+    public readonly sortedValues: GPUBuffer;
     private readonly cellClearPipeline: GPUComputePipeline;
     private readonly cellClearLayout: GPUBindGroupLayout;
     private readonly cellClearBindGroup: GPUBindGroup;
