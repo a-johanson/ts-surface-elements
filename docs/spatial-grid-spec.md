@@ -155,11 +155,23 @@ The cell-index shader (Step 3) clamps each axis of the computed cell coord to
 `[0, gridDim-1]` before packing to the linear key. This prevents out-of-bounds
 storage writes if `SCENE_BBOX` is too small.
 
-**Failure mode if SCENE_BBOX is too small.** Out-of-range points collapse into
-the boundary cells of the clamped axis. Visible symptom: localized
-overcrowded clustering at the grid boundary in the region that poked outside
-`SCENE_BBOX`. This is a *visible* artifact (not a silent OOB drop), so it's
-debuggable. No corruption, no crash, no validation error.
+**Failure mode if SCENE_BBOX is too small.** The clamp itself prevents
+crashes/corruption/validation errors; its only job is OOB-write prevention.
+The sole consequence of a too-small SCENE_BBOX is **performance
+degradation**: boundary cells become over-full because out-of-range points
+collapse into them, so the relax inner loop iterates more points per
+boundary cell (most skipped by the distance cutoff, `d_infl > r`). No
+visible artifact, just slower.
+
+The clamp is *correctness-preserving*. A clamped point Q (beyond the
+boundary, in cell `gridDim-1`) can only be within `radius` of an in-range
+point P if P is within `radius` of the boundary — which places P in cell
+`gridDim-1` or `gridDim-2`. Both cells' 27-neighborhoods include cell
+`gridDim-1` (where Q lives), so the pair is always tested. If P is further
+in (cell `gridDim-3` or beyond), Q is at least `radius + cellSize` away —
+beyond the cutoff and correctly skipped. So no neighbor pair within
+`radius` is ever missed by the clamp; the only cost is wasted iterations
+on over-full boundary cells.
 
 ## WebGPU subgroups feature requirement
 
@@ -375,7 +387,7 @@ ping-pong bind groups.
 |------|----------------|
 | 1    | Page boots without the subgroups error. |
 | 5    | (Optional) CPU readback of `keysA` is non-decreasing. |
-| 7    | Visual: points still relax to an even Poisson-disc distribution, no clustering or holes; relax dispatch GPU time drops vs. the O(n²) version. If SCENE_BBOX is too small, expect localized overcrowded clustering at the grid boundary. |
+| 7    | Visual: points still relax to an even Poisson-disc distribution, no clustering or holes; relax dispatch GPU time drops vs. the O(n²) version. If SCENE_BBOX is too small, expect only performance degradation (over-full boundary cells); correctness is preserved by the clamp. |
 | 8    | `npm run lint` clean; full frame loop runs without errors. |
 
 ## Switch points / future work
@@ -407,9 +419,11 @@ ping-pong bind groups.
   for tens of thousands of cells. If grid resolution ever grows beyond ~2¹⁰
   per axis, widen the packing or use a 64-bit key.
 - **SCENE_BBOX correctness** — if the constant is too small for the animated
-  scene, out-of-range points collapse into boundary cells (clamped, decision 6),
-  producing localized overcrowded clustering at the grid boundary. Visible but
-  not crashing; update the constant if the scene geometry changes.
+  scene, out-of-range points collapse into boundary cells (clamped, decision 6).
+  The clamp is correctness-preserving (no missed neighbor pairs within
+  `radius`), so the only cost is performance degradation from over-full
+  boundary cells. Not a crash or corruption; update the constant if the
+  scene geometry changes.
 
 ## AGENTS.md update (part of Step 8)
 
