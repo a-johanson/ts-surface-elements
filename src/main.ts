@@ -45,6 +45,9 @@ const RELAX_RADIUS = 0.3;
 /** Acceptance band for seed rejection sampling — tied to the relax radius. */
 const SEED_BAND = RELAX_RADIUS;
 
+/** Whether to draw the SDF debug view behind the stipple points. */
+const DRAW_DEBUG = false;
+
 /**
  * Maximum per-frame wall-clock delta, in seconds.
  *
@@ -195,7 +198,9 @@ function startFrameLoop(
             ],
         });
 
-        debugRender.render(pass, eye, gpu.canvas, time);
+        if (DRAW_DEBUG) {
+            debugRender.render(pass, eye, gpu.canvas, time);
+        }
         pointRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
 
         pass.end();
@@ -229,9 +234,9 @@ async function bootstrap(): Promise<void> {
     const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const controls = new OrbitControls(canvas, {
-        azimuth: 0,
-        elevation: 0.15,
-        radius: 12,
+        azimuth: 1.9,
+        elevation: 0.5,
+        radius: 8,
     });
 
     // --- Seed buffer A once (points are world-space; no re-seed on resize) ---
