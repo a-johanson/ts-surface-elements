@@ -1,16 +1,15 @@
 /**
- * Relax compute pipeline — curvature-aware surface repulsion with
- * re-projection, accelerated by the spatial grid.
+ * Relax compute pipeline — surface repulsion with re-projection,
+ * accelerated by the spatial grid.
  *
  * Each frame, {@link dispatch} records a single compute pass: each
  * invocation `i` reads `p_i` and `n_i` (inline), recomputes its grid cell,
  * scans the 27-cell neighborhood via `cellStart` / `cellCount` /
- * `sortedValues`, and for each neighbor `j` reads `n_j` from the shared
- * normals buffer, accumulates a linear-decay repulsion gated by a
- * curvature-inflated Euclidean cutoff and a midpoint SDF line-of-sight
- * check, projects the force onto the tangent plane at `p_i`, integrates
- * with a direct Euler position step, then Newton-projects the new position
- * back onto the time-animated SDF surface.
+ * `sortedValues`, and for each neighbor `j` accumulates a linear-decay
+ * repulsion gated by a Euclidean distance cutoff, projects the force onto
+ * the tangent plane at `p_i`, integrates with a direct Euler position
+ * step, then Newton-projects the new position back onto the time-animated
+ * SDF surface.
  *
  * Ping-pong: the pass reads from one point buffer and writes to the
  * other, depending on `readFromA`. Two static bind-group sets cover both
@@ -32,42 +31,23 @@ import type { GridBuffers } from "./spatial-grid-pipeline.js";
 /** Workgroup size — must match `@workgroup_size(64)` in the WGSL. */
 const WORKGROUP_SIZE = 64;
 
-/** Size of the relax params uniform buffer in bytes (4 × f32 + 4 × u32 = 32). */
-const RELAX_PARAMS_BUFFER_BYTES = 32;
-
-/** Relaxation parameters passed to the compute shader via uniform. */
-export interface RelaxParams {
-    /** Per-frame wall-clock delta in seconds (capped at `MAX_DT`), threaded from the frame loop. */
-    readonly dt: number;
-    /** Interaction radius — pairs with inflated distance beyond this are ignored. */
-    readonly radius: number;
-    /** Midpoint line-of-sight threshold; pairs with `|map(m)| > alpha·d_E²` are skipped. */
-    readonly alpha: number;
-    /** Current animation time in seconds — threads into the SDF `map(p, time)`. */
-    readonly time: number;
-}
-
-/**
- * Default relaxation parameters — initial guesses, need visual tuning.
- */
-export const DEFAULT_RELAX_PARAMS: Omit<RelaxParams, "time" | "dt"> = {
-    radius: 0.3,
-    alpha: 0.5,
-};
+/** Size of the relax params uniform buffer in bytes (3 × f32 + 1 × u32 = 16). */
+const RELAX_PARAMS_BUFFER_BYTES = 16;
 
 /**
  * Manages the relax compute pipeline, its params uniform, and the
  * ping-pong bind groups.
  *
  * The normals buffer is allocated once by {@link PointBuffers} and shared
- * between this pipeline (read for curvature-aware repulsion), the
+ * between this pipeline (read for tangent-plane projection), the
  * reproject pipeline (written per-frame before relax), and the shading
- * pipeline (written per-frame after relax, plus once at bootstrap by the
- * seed pipeline).
+ * pipeline (written per-frame after relax, plus once at bootstrap by
+ * the seed pipeline).
  */
 export class RelaxPipeline {
     private readonly device: GPUDevice;
     private readonly points: PointBuffers;
+    private readonly radius: number;
     private readonly relaxPipeline: GPUComputePipeline;
     private readonly relaxLayout: GPUBindGroupLayout;
     private readonly relaxParamsBuffer: GPUBuffer;
@@ -84,10 +64,19 @@ export class RelaxPipeline {
      * @param grid - The spatial grid buffers (params, sorted values, cell
      *   start/count). Rebuilt once per frame by `SpatialGridPipeline` from
      *   whichever buffer relax reads; not ping-ponged.
+     * @param radius - The interaction radius (also the spatial grid cell
+     *   size). Fixed at construction; changing it requires recreating the
+     *   pipeline.
      */
-    public constructor(device: GPUDevice, points: PointBuffers, grid: GridBuffers) {
+    public constructor(
+        device: GPUDevice,
+        points: PointBuffers,
+        grid: GridBuffers,
+        radius: number,
+    ) {
         this.device = device;
         this.points = points;
+        this.radius = radius;
 
         const relaxModule = device.createShaderModule({
             label: "stipple-relax-shader",
@@ -142,23 +131,23 @@ export class RelaxPipeline {
     }
 
     /**
-     * Writes the relaxation parameters and point count into the relax
-     * params uniform buffer.
+     * Writes the per-frame dt, the fixed radius, the animation time, and
+     * the point count into the relax params uniform buffer.
      *
-     * Relax layout (32 bytes): `dt, radius, alpha, time` (4 × f32)
-     * followed by `point_count` and three padding `u32`s.
+     * Relax layout (16 bytes): `dt, radius, time` (3 × f32) followed by
+     * `point_count` (u32).
      *
-     * @param params - The parameters to upload.
+     * @param dt - The per-substep delta time in seconds.
+     * @param time - The current animation time in seconds.
      */
-    private writeParams(params: RelaxParams): void {
+    private writeParams(dt: number, time: number): void {
         const buffer = new ArrayBuffer(RELAX_PARAMS_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
         const u32 = new Uint32Array(buffer);
-        f32[0] = params.dt;
-        f32[1] = params.radius;
-        f32[2] = params.alpha;
-        f32[3] = params.time;
-        u32[4] = this.points.count;
+        f32[0] = dt;
+        f32[1] = this.radius;
+        f32[2] = time;
+        u32[3] = this.points.count;
         this.device.queue.writeBuffer(this.relaxParamsBuffer, 0, buffer);
     }
 
@@ -174,16 +163,18 @@ export class RelaxPipeline {
      * the ping-pong swap.
      *
      * @param encoder - The command encoder to record into.
-     * @param params - Relaxation parameters.
+     * @param dt - The per-substep delta time in seconds.
+     * @param time - The current animation time in seconds.
      * @param readFromA - If `true`, reads bufferA → writes bufferB;
      *   if `false`, reads bufferB → writes bufferA.
      */
     public dispatch(
         encoder: GPUCommandEncoder,
-        params: RelaxParams,
+        dt: number,
+        time: number,
         readFromA: boolean,
     ): void {
-        this.writeParams(params);
+        this.writeParams(dt, time);
 
         const workgroupCount = Math.ceil(this.points.count / WORKGROUP_SIZE);
 

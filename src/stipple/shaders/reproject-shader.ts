@@ -11,8 +11,8 @@
  * This ensures that relax starts with on-surface positions and matching
  * normals even when the SDF has moved since the last frame. Without this
  * pass, relax would read stale positions (off the new surface) and stale
- * normals (describing the old surface), corrupting the curvature-aware
- * repulsion kernel.
+ * normals (describing the old surface), corrupting the repulsion
+ * kernel.
  *
  * In-place `read_write` on the point buffer is safe because each invocation
  * touches only index `i`. Two bind groups (A/B) cover the ping-pong

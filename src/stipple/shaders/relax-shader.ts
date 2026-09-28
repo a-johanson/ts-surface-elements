@@ -1,6 +1,5 @@
 /**
- * Relax compute shader — grid-accelerated surface-aware, curvature-aware
- * repulsion.
+ * Relax compute shader — grid-accelerated surface repulsion.
  *
  * One invocation per point `i`. The O(n²) neighbor scan is replaced by a
  * 27-cell uniform-grid neighborhood lookup (Step 7): point `i`'s cell is
@@ -10,26 +9,20 @@
  * `sortedValues`; empty cells (`cellStart == UINT_MAX`) are skipped. This
  * reduces the inner loop from O(n) to O(1) neighbor cells × O(points/cell).
  *
- * The pairwise force logic is **unchanged** from the O(n²) version: a
- * curvature-inflated Euclidean cutoff and a midpoint SDF line-of-sight
- * check gate the force. The distance used for the cutoff and the
- * linear-decay envelope is inflated by surface-curvature divergence:
+ * Pairwise force model: a Euclidean distance cutoff gates the force, and a
+ * linear-decay envelope modulates its magnitude:
  *
- *     d_infl = d_E · (1 + ½·‖n_i − n_j‖²)
+ *  - d_E == 0 (bit-identical) → sign-based kick along a tangent basis vector
+ *  - d_E > radius             → skip
+ *  - decay  (1 - d_E / radius)
+ *  - direction (p_i - p_j) / d_E
  *
- * where `n_i` and `n_j` are both read from the shared normals buffer,
- * which is written by the reproject pass (before relax) and the shading
- * pass (after relax) from the same buffer relax reads — so the normals
- * match the current positions. Pairs across narrow gaps, high-curvature
- * regions, or self-folding `smin` geometry thus see an effectively larger
- * separation, suppressing cross-sheet repulsion that would otherwise
- * corrupt the Poisson-disc distribution.
- *
- * Distance usage:
- *  - cutoff `d_infl > radius`        → skip (inflated)
- *  - line-of-sight `alpha·d_E²`      → skip (Euclidean)
- *  - decay `(1 - d_infl/radius)`     → inflated
- *  - direction `(p_i - p_j) / d_E`   → Euclidean (unit)
+ * Coincident pairs (d_E < COINCIDENT_EPS, including the bit-identical case
+ * d_E == 0.0) receive a deterministic sign-based kick along a tangent
+ * basis vector instead of the normal repulsion (diff/d_E is undefined at
+ * d_E == 0). The kick is antisymmetric under i↔j swap (sign(i - j)
+ * flips), so the two points separate on the tangent plane; projectToSurface
+ * then re-projects, and the next substep's normal repulsion resumes.
  *
  * The accumulated force is projected onto the tangent plane at `p_i` and
  * integrated with a direct Euler position step `x* = x + dt·F_tan`, where
@@ -59,12 +52,8 @@ ${SDF_COMMON}
 struct RelaxParams {
     dt: f32,
     radius: f32,
-    alpha: f32,
     time: f32,
     point_count: u32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
 };
 
 struct GridParams {
@@ -90,6 +79,15 @@ const UINT_MAX: u32 = 0xFFFFFFFFu;
 const RELAX_NEWTON_ITERS: i32 = 4;
 const RELAX_ALPHA: f32 = 1.0;
 
+/**
+ * Below this separation two points are considered bit-identical and a
+ * deterministic sign-based kick is applied instead of the normal
+ * repulsion (diff/d_E is undefined at d_E == 0). One substep at
+ * dt ≈ 0.01 separates the pair by ~0.01, clearing this epsilon so the
+ * next substep resumes normal repulsion.
+ */
+const COINCIDENT_EPS: f32 = 1e-7;
+
 @compute @workgroup_size(64)
 fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
@@ -108,7 +106,6 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
 
     var force = vec3f(0.0);
     let r = params.radius;
-    let alpha = params.alpha;
     let time = params.time;
 
     // 27-cell neighborhood (3×3×3). The own cell is included via (0,0,0);
@@ -135,24 +132,25 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
                     let p_j = points_in[j].pos.xyz;
                     let diff = p_i - p_j;
                     let d_E = length(diff);
-                    if (d_E == 0.0) {
+                    if (d_E > r) {
                         continue;
                     }
 
-                    let n_j = normals_in[j].xyz;
-                    let delta_n = n_i - n_j;
-                    let d_infl = d_E * (1.0 + 0.5 * dot(delta_n, delta_n));
-
-                    if (d_infl > r) {
+                    if (d_E < COINCIDENT_EPS) {
+                        // Bit-identical pair: diff/d_E is undefined. Apply
+                        // a deterministic sign-based kick along a tangent
+                        // basis vector. sign(i - j) is antisymmetric under
+                        // i↔j swap, so the two points separate on the
+                        // tangent plane; projectToSurface then re-projects.
+                        let up = mix(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0),
+                                     f32(abs(n_i.y) > 0.99));
+                        let t1 = normalize(cross(up, n_i));
+                        let s = select(-1.0, 1.0, i > j);
+                        force = force + s * t1;
                         continue;
                     }
 
-                    let m = (p_i + p_j) * 0.5;
-                    if (abs(map(m, time)) > alpha * d_E * d_E) {
-                        continue;
-                    }
-
-                    force = force + (1.0 - d_infl / r) * diff / d_E;
+                    force = force + (1.0 - d_E / r) * diff / d_E;
                 }
             }
         }

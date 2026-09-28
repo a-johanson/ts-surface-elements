@@ -9,10 +9,11 @@ resolved design decision changes or a step is completed.
 
 The relax compute shader (`src/stipple/shaders/relax-shader.ts:71`) currently
 runs an O(n²) inner loop: every point iterates all other points to accumulate
-a curvature-aware repulsion force gated by an inflated-distance cutoff and a
-midpoint SDF line-of-sight check. At `POINT_COUNT = 4 * 1024` this is
+a repulsion force gated by a distance cutoff. At `POINT_COUNT = 4 * 1024` this is
 affordable, but it blocks scaling the stipple density to tens of thousands of
-points.
+points. (The original force model also included a curvature-inflated distance
+and a midpoint SDF line-of-sight check; both were removed after the grid
+shipped — see decision 9.)
 
 ## Goal
 
@@ -65,8 +66,8 @@ vs. cell size `radius = 0.3` — ~3% of a cell per substep, ~12% across a full
 4-substep frame. A neighbor pair can only be *missed* if both points move
 toward each other by a combined amount exceeding one cell width, which does
 not occur within a single frame. Moreover, the pairs most at risk of straddling
-a cell boundary sit near `d_infl ≈ radius`, where the linear-decay envelope
-`(1 − d_infl/radius) → 0`, so the missed force contribution is near-zero.
+a cell boundary sit near `d_E ≈ radius`, where the linear-decay envelope
+`(1 − d_E/radius) → 0`, so the missed force contribution is near-zero.
 
 **Switch condition.** If visual clustering artifacts appear near fast-moving
 `smin` blend folds (where per-substep drift is largest), move rebuild to
@@ -165,7 +166,7 @@ crashes/corruption/validation errors; its only job is OOB-write prevention.
 The sole consequence of a too-small SCENE_BBOX is **performance
 degradation**: boundary cells become over-full because out-of-range points
 collapse into them, so the relax inner loop iterates more points per
-boundary cell (most skipped by the distance cutoff, `d_infl > r`). No
+boundary cell (most skipped by the distance cutoff, `d_E > r`). No
 visible artifact, just slower.
 
 The clamp is *correctness-preserving*. A clamped point Q (beyond the
@@ -229,6 +230,63 @@ and 7 read from these instead of hardcoding the A pair.
 **Switch condition.** If the number of passes grows significantly (e.g. a
 multi-workgroup sort with per-workgroup bit schedules), switch to dynamic
 offsets (decision 7, approach 2) to avoid a bind-group explosion.
+
+### 9. Force model simplification: drop curvature inflation and LOS check
+
+After the spatial grid shipped at 8k points, two gating checks inherited
+from the O(n²) relax shader were found to cause point-coincidence
+artifacts and were removed:
+
+1. **Midpoint SDF line-of-sight check** (`abs(map(m, time)) > alpha·d_E²`).
+   The threshold `alpha·d_E²` collapses quadratically as `d_E → 0`, but
+   `map(m)` has constant floating-point noise (~1e-5 from the tetrahedron
+   finite-difference gradient). Below `d_E ≈ sqrt(noise/alpha) ≈ 0.0045`,
+   the check is noise-dominated and effectively always skips the pair.
+   Close pairs stop repelling, surrounding points push them together,
+   and `projectToSurface` (Newton) funnels them to bit-identical
+   positions — an absorbing state under the former `d_E == 0` early-out.
+   In high-curvature regions (torus minor radius 0.35) the false
+   rejection extends to all distances because the midpoint deviation
+   `≈ curvature·d_E²/8` exceeds the threshold `alpha·d_E²` whenever the
+   curvature radius is below `1/(8·alpha) = 0.25`. The check was
+   fundamentally broken there, not just at close range. A hard bypass
+   threshold (`LOS_DEGENERATE_D_E = 0.02`) was attempted first but
+   created a visible "stuck-at-threshold" equilibrium in high-curvature
+   regions. Removing the check entirely resolved both issues with no
+   visible cross-sheet repulsion artifacts (the `smin` blend geometry
+   does not produce parallel opposing sheets close enough to interact).
+
+2. **Curvature-inflated distance cutoff** (`d_infl = d_E·(1 + ½·‖Δn‖²)`).
+   The `0.5` coefficient is an amplified heuristic — the geometrically
+   derived coefficient for a sphere is `~1/24` (12× smaller). The
+   formula conflates cross-sheet pairs (large `‖Δn‖²`, should suppress)
+   with same-sheet high-curvature pairs (moderate `‖Δn‖²`, should
+   repel). On the torus at the cutoff distance, same-sheet pairs have
+   `‖Δn‖² ≈ 0.72`, giving 36% inflation — suppressing repulsion exactly
+   where even spacing is hardest to maintain. With the LOS check removed,
+   the inflation was the sole remaining cross-sheet suppression, but
+   empirical testing showed no visible difference with or without it.
+   A binary normal-alignment gate (`dot(n_i, n_j) < 0 → skip`) was also
+   tried and showed no visible benefit. Both were removed; the Euclidean
+   cutoff alone produces correct results.
+
+**Coincident-pair safety net.** With both gating checks removed, close
+pairs always repel — but two points can still arrive at a substep
+bit-identical (e.g. carried in from a prior transient). The former
+`d_E == 0.0` early-out (which prevented NaN from `diff/d_E`) was an
+absorbing state. It was replaced with a deterministic sign-based kick
+along a tangent basis vector: `sign(i - j) * t1`, antisymmetric under
+`i↔j` swap so the two points separate. One substep at `dt ≈ 0.01`
+separates the pair by ~0.01, after which normal repulsion resumes.
+
+**Param cleanup.** The `alpha` uniform field (`RelaxParams.alpha`) was
+solely the LOS threshold; with the check removed it is deleted from the
+WGSL `RelaxParams` struct and the TS `RelaxParams` interface. The
+uniform buffer shrinks from 32 to 16 bytes
+(`dt, radius, time, point_count`). `DEFAULT_RELAX_PARAMS.alpha` is
+dropped. The `normals_in` buffer binding is retained — `n_i` is still
+needed for tangent-plane force projection and the coincident-pair kick's
+tangent basis.
 
 ## WebGPU subgroups feature requirement
 
@@ -488,9 +546,12 @@ loop:
   key, and read `cellStart`/`cellCount`; if `cellStart == UINT_MAX` skip;
   else iterate `s ∈ [0, count)`, fetch `j = sortedValues[start + s]`, read
   `points_in[j]` and `normals_in[j]`.
-- Run the **unchanged** pairwise force logic: curvature-inflated distance
-  cutoff, midpoint SDF line-of-sight, linear-decay envelope, tangent-plane
-  projection, Euler step, Newton re-projection.
+- Run the **unchanged** pairwise force logic (as it stood at
+  implementation time): curvature-inflated distance cutoff, midpoint SDF
+  line-of-sight, linear-decay envelope, tangent-plane projection, Euler
+  step, Newton re-projection. Both gating checks were later removed —
+  see decision 9 for the rationale and the current simplified force
+  model.
 
 Extend the relax bind group with: `gridParamsBuffer`, `sortedValues`,
 `cellStart`, `cellCount` (bindings 4–7). `sortedKeys` is **not** bound:

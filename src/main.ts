@@ -2,11 +2,7 @@ import { OrbitControls } from "./orbit-controls.js";
 import { type CameraConfig, DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
 import { PointRenderPipeline } from "./stipple/point-render-pipeline.js";
-import {
-    DEFAULT_RELAX_PARAMS,
-    type RelaxParams,
-    RelaxPipeline,
-} from "./stipple/relax-pipeline.js";
+import { RelaxPipeline } from "./stipple/relax-pipeline.js";
 import { ReprojectPipeline } from "./stipple/reproject-pipeline.js";
 import { SeedPipeline } from "./stipple/seed-pipeline.js";
 import { DEFAULT_LIGHT_DIR, ShadingPipeline } from "./stipple/shading-pipeline.js";
@@ -27,7 +23,7 @@ const TARGET: readonly [number, number, number] = [0, 0, 0];
 const UP: readonly [number, number, number] = [0, 1, 0];
 
 /** Number of stipple points. */
-const POINT_COUNT = 4 * 1024;
+const POINT_COUNT = 8 * 1024;
 
 /**
  * Fixed CPU-known bounding box for the animated SDF scene.
@@ -43,8 +39,11 @@ const SCENE_BBOX: SceneBBox = {
     max: [3, 2, 2],
 };
 
+/** Relaxation interaction radius (also the spatial grid cell size and seed band). */
+const RELAX_RADIUS = 0.3;
+
 /** Acceptance band for seed rejection sampling — tied to the relax radius. */
-const SEED_BAND = DEFAULT_RELAX_PARAMS.radius;
+const SEED_BAND = RELAX_RADIUS;
 
 /**
  * Maximum per-frame wall-clock delta, in seconds.
@@ -123,7 +122,6 @@ function getCanvas(): HTMLCanvasElement {
  * @param points - The ping-pong point buffer pair.
  * @param debugRender - The debug render pipeline (SDF visualization).
  * @param pointRender - The point render pipeline.
- * @param params - Relaxation parameters (without `time` and `dt`, which are per-frame).
  * @param controls - Orbit camera controls.
  */
 function startFrameLoop(
@@ -135,7 +133,6 @@ function startFrameLoop(
     points: PointBuffers,
     debugRender: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
-    params: Omit<RelaxParams, "time" | "dt">,
     controls: OrbitControls,
 ): void {
     const { device } = gpu;
@@ -172,9 +169,8 @@ function startFrameLoop(
             MAX_SUBSTEPS,
         );
         const substepDt = dt / substeps;
-        const relaxParams: RelaxParams = { ...params, dt: substepDt, time };
         for (let s = 0; s < substeps; s++) {
-            relax.dispatch(encoder, relaxParams, readFromA);
+            relax.dispatch(encoder, substepDt, time, readFromA);
             readFromA = !readFromA;
         }
 
@@ -227,13 +223,8 @@ async function bootstrap(): Promise<void> {
     const seed = new SeedPipeline(gpu.device, SCENE_BBOX, SEED_BAND);
     const points = new PointBuffers(gpu.device, POINT_COUNT);
     const reproject = new ReprojectPipeline(gpu.device, points);
-    const spatialGrid = new SpatialGridPipeline(
-        gpu.device,
-        points,
-        SCENE_BBOX,
-        DEFAULT_RELAX_PARAMS.radius,
-    );
-    const relax = new RelaxPipeline(gpu.device, points, spatialGrid);
+    const spatialGrid = new SpatialGridPipeline(gpu.device, points, SCENE_BBOX, RELAX_RADIUS);
+    const relax = new RelaxPipeline(gpu.device, points, spatialGrid, RELAX_RADIUS);
     const shading = new ShadingPipeline(gpu.device, points);
     const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
@@ -257,7 +248,6 @@ async function bootstrap(): Promise<void> {
         points,
         debugRender,
         pointRender,
-        DEFAULT_RELAX_PARAMS,
         controls,
     );
 }

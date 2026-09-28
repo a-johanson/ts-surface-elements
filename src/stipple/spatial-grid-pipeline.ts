@@ -222,7 +222,7 @@ export class SpatialGridPipeline {
             size: GRID_PARAMS_BUFFER_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.writeGridParams(sceneBBox, radius, gridDims, numCells);
+        this.writeGridParams(sceneBBox, radius, gridDims, this.pointCount);
 
         const keysUsage: GPUBufferUsageFlags =
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
@@ -437,7 +437,10 @@ export class SpatialGridPipeline {
      * @param bbox - The scene bounding box.
      * @param cellSize - The cell size (relaxation radius).
      * @param gridDims - Per-axis cell counts.
-     * @param pointCount - Number of points.
+     * @param pointCount - Number of points (NOT numCells — both are
+     *   CPU-known integers, which has caused a past bug where the cell
+     *   count was passed in place of the point count, truncating the
+     *   cell-index and cell-ranges passes to only `numCells` entries).
      */
     private writeGridParams(
         bbox: SceneBBox,

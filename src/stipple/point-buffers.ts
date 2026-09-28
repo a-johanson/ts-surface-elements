@@ -16,7 +16,7 @@
  * normal (`vec4f`, 16 bytes). It is a derived quantity — written once by
  * the seed pass at bootstrap and overwritten every frame by the shading
  * pass (which runs after relax, from the buffer relax just wrote) — and is
- * shared between relax (curvature-aware repulsion) and the shading pass.
+ * shared between relax (tangent-plane projection) and the shading pass.
  * It is not ping-ponged because it has no temporal state of its own; the
  * invariant "normals match whichever buffer relax reads" is preserved
  * because the shading pass writes normals from the buffer that the *next*
@@ -68,7 +68,7 @@ export class PointBuffers {
      * Written once at bootstrap by the seed pass and overwritten every
      * frame by the shading pass (which runs after relax, computing
      * normals from the buffer relax just wrote). Read by the
-     * curvature-aware relax pass, by the shading pass itself, and by the
+     * relax pass, by the shading pass itself, and by the
      * point renderer (to orient tangent-plane quads).
      */
     public readonly normalsBuffer: GPUBuffer;
