@@ -12,7 +12,8 @@
  * shader paints a white ring outline whose radius scales linearly with
  * per-point luminance (collapsing to a point at zero luminance); the
  * line width is configurable via `LINE_WIDTH` and the ring never
- * exceeds the quad boundary.
+ * exceeds the quad boundary. Anti-aliasing uses `fwidth` so the soft
+ * band spans ~1 pixel regardless of viewport size or camera distance.
  */
 import { SDF_COMMON } from "./sdf-common.js";
 
@@ -73,18 +74,19 @@ fn point_vs(
 
 @fragment
 fn point_fs(in: VertexOut) -> @location(0) vec4f {
-    const LINE_WIDTH: f32 = 0.35;
+    const LINE_WIDTH: f32 = 0.25;
     const HALF_W: f32 = LINE_WIDTH * 0.5;
-    const AA: f32 = LINE_WIDTH * 0.25;
     const MIN_R: f32 = 0.75 * HALF_W;
-    const MAX_R: f32 = 1.0 - (HALF_W + AA);
-    let r = (MAX_R - MIN_R) * in.luminance + MIN_R;
+    const MAX_R: f32 = 1.0 - HALF_W;
     let dist = length(in.uv);
+    let aa = fwidth(dist);
+    let half_band = aa * 0.5;
+    let r = (MAX_R - MIN_R) * in.luminance + MIN_R;
     let d = abs(dist - r);
-    if (d > HALF_W + AA) {
+    if (d > HALF_W + half_band) {
         discard;
     }
-    let alpha = smoothstep(HALF_W + AA, HALF_W, d);
+    let alpha = smoothstep(HALF_W + half_band, HALF_W - half_band, d);
     return vec4f(1.0, 1.0, 1.0, alpha);
 }
 `;
