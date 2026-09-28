@@ -1,6 +1,8 @@
 # ts-surface-elements
 
-Render textures on the surface of organic shapes using WebGPU
+Render textures on the surface of organic shapes using WebGPU.
+
+View a live version [on GitHub Pages](https://a-johanson.github.io/ts-surface-elements/).
 
 ## Getting Started
 
