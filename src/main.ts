@@ -147,11 +147,10 @@ function startFrameLoop(
     const frame = (): void => {
         syncCanvasSize(gpu);
 
-        // const now = performance.now() / 1000;
-        // const dt = Math.min(now - lastNow, MAX_DT);
-        // lastNow = now;
-        // time += dt;
-        const dt = TARGET_SUBSTEP_DT;
+        const now = performance.now() / 1000;
+        const dt = Math.min(now - lastNow, MAX_DT);
+        lastNow = now;
+        time += dt;
 
         const eye = controls.getEye();
 
