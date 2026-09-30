@@ -107,8 +107,8 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
 
     let clearance_min = min(min(clearance.x, clearance.y), min(clearance.z, clearance.w));
     if (clearance_min > 0.0) {
-        clearance = vec4f(1.0);
-    } else { // TODO: does this early way out really make sense???
+        clearance = vec4f(2.0 * CLEARANCE_THRESHOLD);
+    } else {
         let clearance_max = max(max(clearance.x, clearance.y), max(clearance.z, clearance.w));
         if (clearance_max <= 0.0) {
             shading_out[i] = ShadingSample(vec4f(0.0), vec4f(0.0));
