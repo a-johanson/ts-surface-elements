@@ -22,9 +22,10 @@
  *   (once, at bootstrap at t=0), by the reproject pass (every frame, before
  *   relax), and by the shading pass (every frame, after relax).
  * - `ShadingSample` — the per-point shading output layout (32 bytes):
- *   `lum` carries the point's luminance in `x`; `clearance` carries one
- *   occlusion clearance value per quad corner (see `rayClearance`). Written
- *   by the shading pass every frame and read by the point renderer.
+ *   `luminance` carries the point's luminance in `x`; `clearance` carries
+ *   one occlusion clearance value per quad corner (see `rayClearance`).
+ *   Written by the shading pass every frame and read by the point
+ *   renderer.
  * - `POINT_RADIUS_WORLD` / `tangentFrame(n)` — the canonical splat radius
  *   and tangent-basis construction shared by the shading pass (which
  *   samples occlusion clearance at the quad corners) and the point
@@ -46,7 +47,19 @@
  *   up to `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance,
  *   or `-1.0` on miss. Shared by the debug render (per-fragment SDF
  *   visualization) and the shading pass (per-point visibility tests).
- * - `rayClearance(ro, rd, time)` — TODO: describe here.
+ * - `rayClearance(ro, rd, max_dist, time)` — sphere-traces `map()` along
+ *   `rd` from `ro` over `[0, max_dist]` and returns the minimum signed
+ *   clearance between the ray and the SDF surface. Negative values are
+ *   penetrations (the ray crossed into the surface); small positive
+ *   values are grazes (the ray passed close without hitting). Combines a
+ *   signed `map()` sample with a `softShadow`-style triangulated
+ *   closest-approach estimate between consecutive unbounding spheres, so
+ *   the minimum is tracked accurately even when the surface passes
+ *   closest to the ray between sample positions. The origin's own
+ *   surface is excluded by gating recording on travel distance:
+ *   samples within the splat radius (`CLEARANCE_THRESHOLD`) of the
+ *   origin are not recorded, since within that band the only surface is
+ *   the one the point sits on.
  * - `softShadow(ro, rd, time)` — penumbra estimation: sphere-
  *   traces `map()` toward the light and returns a `[0, 1]` factor (1 =
  *   fully lit, 0 = fully occluded). At each step it triangulates the
@@ -62,7 +75,7 @@ struct Point {
 };
 
 struct ShadingSample {
-    lum: vec4f,
+    luminance: vec4f,
     clearance: vec4f,
 };
 
@@ -88,7 +101,7 @@ const CLEARANCE_THRESHOLD: f32 = POINT_RADIUS_WORLD;
 
 fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     var t = 0.0;
-        for (var i: u32 = 0u; i < RAYMARCH_MAX_STEPS && t <= RAYMARCH_MAX_DIST; i += 1u) {
+    for (var i: u32 = 0u; i < RAYMARCH_MAX_STEPS && t <= RAYMARCH_MAX_DIST; i += 1u) {
         let p = ro + rd * t;
         let d = map(p, time);
         if (d < SURF_EPS) {
@@ -99,33 +112,49 @@ fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     return -1.0;
 }
 
-fn rayClearance(ro: vec3f, dest: vec3f, time: f32) -> f32 {
-    let ray_vector = dest - ro;
-    let ray_length = length(ray_vector);
-
-    if ray_length <= SURF_EPS {
+fn rayClearance(ro: vec3f, rd: vec3f, max_dist: f32, time: f32) -> f32 {
+    if max_dist <= SURF_EPS {
         return CLEARANCE_THRESHOLD;
     }
 
-    let direction = ray_vector / ray_length;
-
-    var t = min(PROBE_STEP, ray_length);
+    var t = min(PROBE_STEP, max_dist);
     var min_dist = CLEARANCE_THRESHOLD;
 
     // Ignore the initial positive threshold band until the ray has
-    // traveled at least the desired clearance.
+    // traveled at least the desired clearance — within the splat radius
+    // of the origin, the only surface is the origin's own.
     var tracking = t >= CLEARANCE_THRESHOLD;
 
-    for (var i = 0u; i < RAYMARCH_MAX_STEPS && t < ray_length; i += 1u) {
-        let dist = map(ro + direction * t, time);
+    // Previous sample's signed distance, for the softShadow-style
+    // triangulated closest-approach estimate between samples.
+    var prev_dist = 1e20;
+
+    for (var i = 0u; i < RAYMARCH_MAX_STEPS && t < max_dist; i += 1u) {
+        let dist = map(ro + rd * t, time);
 
         if dist < 0.0 {
             // Penetration always counts, including near the origin.
             min_dist = min(min_dist, dist);
             tracking = true;
+            // Reset so the next positive sample's triangulation degenerates
+            // (cd ≈ dist) instead of triangulating against a stale
+            // pre-penetration sphere.
+            prev_dist = 1e20;
         } else if tracking {
             min_dist = min(min_dist, dist);
-        } else if dist >= CLEARANCE_THRESHOLD {
+
+            // Triangulate the closest surface approach to the ray in the
+            // interval between the previous and current unbounding
+            // spheres — the surface can graze the ray between sample
+            // positions, which a plain min(dist) would miss. Mirrors the
+            // penumbra estimate in softShadow, but tracks the minimum
+            // clearance itself instead of a shadow factor.
+            let apex_offset = dist * dist / (2.0 * prev_dist);
+            let closest_approach = sqrt(max(0.0, dist * dist - apex_offset * apex_offset));
+            min_dist = min(min_dist, closest_approach);
+
+            prev_dist = dist;
+        } else if t >= CLEARANCE_THRESHOLD {
             // The ray has escaped the initial surface neighborhood.
             tracking = true;
         }
@@ -136,27 +165,16 @@ fn rayClearance(ro: vec3f, dest: vec3f, time: f32) -> f32 {
             // Move through the numerically ambiguous surface region.
             step = PROBE_STEP;
         } else if !tracking {
-            // Safely approach the clearance threshold.
-            // TODO: does this really make sense?
-            step = max(
-                (CLEARANCE_THRESHOLD - dist) * RAYMARCH_STEP_SCALE,
-                PROBE_STEP,
-            );
+            step = max(dist * RAYMARCH_STEP_SCALE, PROBE_STEP);
         } else {
             // Continue in either direction using the unsigned distance.
             step = abs(dist) * RAYMARCH_STEP_SCALE;
         }
 
-        step = min(step, ray_length - t);
+        step = min(step, max(max_dist - t, PROBE_STEP));
 
         t += step;
     }
-
-    // Include the target point.
-    // TODO: is this necessary?
-    // if dist < 0.0 || tracking {
-    //     min_dist = min(min_dist, dist);
-    // }
 
     return min_dist;
 }

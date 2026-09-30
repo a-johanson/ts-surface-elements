@@ -28,7 +28,7 @@
  * shadow cut.
  *
  * Output packing (`shading_out[i]`, `ShadingSample`):
- *  - `lum.x` — luminance (`lit * lambert`, in `[0, 1]`; `0` when no
+ *  - `luminance.x` — luminance (`lit * lambert`, in `[0, 1]`; `0` when no
  *    corner is visible).
  *  - `clearance` — occlusion clearance per quad corner (in the vertex
  *    shader's corner order), in world units.
@@ -64,7 +64,10 @@ fn cornerClearance(
     time: f32,
 ) -> f32 {
     let ro = origin + (offset.x * frame.t1 + offset.y * frame.t2) * POINT_RADIUS_WORLD;
-    return rayClearance(ro, eye, time);
+    let to_eye = eye - ro;
+    let dist_eye = length(to_eye);
+    let eye_dir = to_eye / dist_eye;
+    return rayClearance(ro, eye_dir, dist_eye, time);
 }
 
 @compute @workgroup_size(64)
@@ -91,7 +94,7 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     let frame = tangentFrame(n);
-    let clearance_center = rayClearance(origin, params.eye, time);
+    let clearance_center = rayClearance(origin, eye_dir, dist_eye, time);
     var clearance = vec4f(clearance_center);
     if (clearance_center < CORNER_TRACE_SKIP * POINT_RADIUS_WORLD) {
         clearance = vec4f(

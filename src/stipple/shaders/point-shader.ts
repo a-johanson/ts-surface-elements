@@ -54,11 +54,11 @@ fn point_vs(
     let sh = shading[iid];
     var out: VertexOut;
     out.uv = corner[vid];
-    out.luminance = sh.lum.x;
+    out.luminance = sh.luminance.x;
     out.clearance = sh.clearance[corner_ids[vid]];
 
     let clearance_max = max(max(sh.clearance.x, sh.clearance.y), max(sh.clearance.z, sh.clearance.w));
-    if (clearance_max == 0.0) {
+    if (clearance_max <= 0.0) {
         out.clip_pos = vec4f(2.0, 2.0, 2.0, 1.0);
         return out;
     }
