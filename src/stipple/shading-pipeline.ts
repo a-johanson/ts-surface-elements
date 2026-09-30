@@ -7,8 +7,9 @@
  * reads the buffer relax most recently wrote, computes the surface
  * normal from the (final) position, writes it into the shared
  * {@link PointBuffers.normalsBuffer}, then sphere-traces toward the eye
- * (visibility) and toward the light (shadow) and writes the packed
- * result into the shared {@link PointBuffers.shadingBuffer}.
+ * to sample per-corner occlusion clearances and toward the light (soft
+ * shadow) and writes the result into the shared
+ * {@link PointBuffers.shadingBuffer}.
  *
  * Because the shading pass writes normals from the buffer relax just
  * produced, the normals buffer always matches the buffer that the

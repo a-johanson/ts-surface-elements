@@ -142,8 +142,8 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
                         // basis vector. sign(i - j) is antisymmetric under
                         // i↔j swap, so the two points separate on the
                         // tangent plane; projectToSurface then re-projects.
-                        let up = mix(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0),
-                                     f32(abs(n_i.y) > 0.99));
+                        let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0),
+                                        abs(n_i.y) > 0.99);
                         let t1 = normalize(cross(up, n_i));
                         let s = select(-1.0, 1.0, i > j);
                         force = force + s * t1;

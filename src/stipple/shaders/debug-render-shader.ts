@@ -1,6 +1,6 @@
 /**
  * Debug render shader — ray-marches the time-animated SDF per fragment and
- * writes grayscale Lambert shading modulated by Aaltonen soft shadows
+ * writes grayscale Lambert shading modulated by soft shadows
  * directly to the canvas color attachment.
  *
  * Background (ray miss) maps to black; hit fragments map to `[0, 1]` gray

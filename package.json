@@ -9,7 +9,7 @@
         "install-hook": "sh ./scripts/install-hook.sh",
         "clean": "rm -rf ./public/js/*",
         "build": "npm run clean && npx esbuild ./src/main.ts --bundle --format=esm --minify --target=es2024 --entry-names=[name] --outdir=./public/js",
-        "dev": "npx esbuild ./src/main.ts --bundle --sourcemap --format=esm --target=es2024 --entry-names=[name] --outdir=./public/js --servedir=./public"
+        "dev": "npx esbuild ./src/main.ts --bundle --sourcemap --format=esm --target=es2024 --entry-names=[name] --outdir=./public/js --servedir=./public --serve=127.0.0.1:8000"
     },
     "keywords": [
         "typescript",

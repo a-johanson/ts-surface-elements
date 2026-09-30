@@ -23,9 +23,12 @@
  * relax pass will read.
  *
  * A second non-ping-pong `shadingBuffer` holds the per-point shading
- * result (`vec4f`, 16 bytes: `visible`, `luminance`, unused, unused). It
- * is written every frame by the shading pass and read by the point
- * renderer to discard occluded points and modulate luminance.
+ * result (32 bytes: a `lum` `vec4f` with the luminance in `x`, and a
+ * `clearance` `vec4f` with one occlusion clearance value per quad corner).
+ * It is written every frame by the shading pass and read by the point
+ * renderer, which pushes fully occluded points offscreen in the vertex
+ * shader, clips each ring fragment against the interpolated clearance,
+ * and modulates the color by luminance.
  *
  * No CPU readback is performed — seeding, relaxation, and shading are
  * entirely GPU-side.
@@ -36,6 +39,12 @@ export const POINT_FLOATS = 4;
 
 /** Size of one point in bytes. */
 export const POINT_BYTES = POINT_FLOATS * Float32Array.BYTES_PER_ELEMENT;
+
+/** Number of `f32` values per shading sample (two `vec4f`s). */
+export const SHADING_SAMPLE_FLOATS = 8;
+
+/** Size of one shading sample in bytes. */
+export const SHADING_SAMPLE_BYTES = SHADING_SAMPLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 
 /** Buffer usage flags for point and normals storage buffers. */
 const POINT_BUFFER_USAGE: GPUBufferUsageFlags =
@@ -77,9 +86,11 @@ export class PointBuffers {
      * Shared per-point shading buffer (not ping-ponged).
      *
      * Written every frame by the shading pass; read by the point renderer
-     * to discard occluded points (in the vertex shader) and modulate the
-     * fragment color by luminance. Packed as `vec4f`:
-     * `x` = visibility, `y` = luminance, `z`/`w` unused.
+     * to push fully occluded points offscreen (in the vertex shader),
+     * clip the ring per fragment against the interpolated corner
+     * clearance, and modulate the fragment color by luminance. Packed as
+     * `ShadingSample` (32 bytes): `lum.x` = luminance, `clearance` = one
+     * occlusion clearance per quad corner.
      */
     public readonly shadingBuffer: GPUBuffer;
 
@@ -92,16 +103,18 @@ export class PointBuffers {
      */
     public constructor(device: GPUDevice, count: number) {
         this.count = count;
-        // All four buffers use the same 16-byte-per-point stride: points
-        // are vec4f (pos + unused w), normals are vec3f + pad, shading
-        // packs two f32s into vec4f. WGSL storage arrays of vec4f require
-        // a 16-byte stride, so the coincidence is structural.
+        // Point, normals, and shading samples are vec4f-structured: points
+        // are pos + unused w, normals are vec3f + pad, shading samples pack
+        // luminance and four corner clearances into two vec4f. WGSL storage
+        // arrays of vec4f / 32-byte structs require 16-byte alignment, which
+        // is satisfied here.
         const size = count * POINT_BYTES;
+        const shadingSize = count * SHADING_SAMPLE_BYTES;
 
         this.bufferA = this.createBuffer(device, size);
         this.bufferB = this.createBuffer(device, size);
         this.normalsBuffer = this.createBuffer(device, size);
-        this.shadingBuffer = this.createBuffer(device, size);
+        this.shadingBuffer = this.createBuffer(device, shadingSize);
     }
 
     /**

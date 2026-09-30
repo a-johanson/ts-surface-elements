@@ -109,8 +109,9 @@ function getCanvas(): HTMLCanvasElement {
  *    direction, so the per-step Euler integration size stays stable
  *    regardless of frame rate.
  * 5. Dispatches the shading compute pass to refresh the normals buffer
- *    and compute per-point visibility (occlusion by the SDF surface) and
- *    luminance (Lambert with shadow) from the relaxed positions.
+ *    and compute per-point corner occlusion clearances (sphere-traced
+ *    toward the eye) and luminance (Lambert with shadow) from the relaxed
+ *    positions.
  * 6. Begins a render pass that draws the SDF debug view (grayscale
  *    Lambert) and then the stipple points.
  * 7. Submits the command buffer.
@@ -146,10 +147,11 @@ function startFrameLoop(
     const frame = (): void => {
         syncCanvasSize(gpu);
 
-        const now = performance.now() / 1000;
-        const dt = Math.min(now - lastNow, MAX_DT);
-        lastNow = now;
-        time += dt;
+        // const now = performance.now() / 1000;
+        // const dt = Math.min(now - lastNow, MAX_DT);
+        // lastNow = now;
+        // time += dt;
+        const dt = TARGET_SUBSTEP_DT;
 
         const eye = controls.getEye();
 

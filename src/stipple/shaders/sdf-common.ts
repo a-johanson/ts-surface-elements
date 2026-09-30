@@ -21,6 +21,15 @@
  *   normals live in a separate shared buffer, written by the seed pass
  *   (once, at bootstrap at t=0), by the reproject pass (every frame, before
  *   relax), and by the shading pass (every frame, after relax).
+ * - `ShadingSample` — the per-point shading output layout (32 bytes):
+ *   `lum` carries the point's luminance in `x`; `clearance` carries one
+ *   occlusion clearance value per quad corner (see `rayClearance`). Written
+ *   by the shading pass every frame and read by the point renderer.
+ * - `POINT_RADIUS_WORLD` / `tangentFrame(n)` — the canonical splat radius
+ *   and tangent-basis construction shared by the shading pass (which
+ *   samples occlusion clearance at the quad corners) and the point
+ *   renderer (which builds the same quad corners), so corner rays and
+ *   rasterized corners always coincide.
  * - `map(p, time)` — the scene signed distance field, parameterized by
  *   `time` for smooth morphing.
  * - `sdfGradient(p, time)` — tetrahedron-pattern gradient (4 taps); used by
@@ -37,6 +46,7 @@
  *   up to `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance,
  *   or `-1.0` on miss. Shared by the debug render (per-fragment SDF
  *   visualization) and the shading pass (per-point visibility tests).
+ * - `rayClearance(ro, rd, time)` — TODO: describe here.
  * - `softShadow(ro, rd, time)` — penumbra estimation: sphere-
  *   traces `map()` toward the light and returns a `[0, 1]` factor (1 =
  *   fully lit, 0 = fully occluded). At each step it triangulates the
@@ -51,38 +61,117 @@ struct Point {
     pos: vec4f,
 };
 
+struct ShadingSample {
+    lum: vec4f,
+    clearance: vec4f,
+};
+
+struct TangentFrame {
+    t1: vec3f,
+    t2: vec3f,
+};
+
 const SURF_EPS: f32 = 0.001;
+const PROBE_STEP: f32 = 5.0 * SURF_EPS;
 
 const RAYMARCH_MAX_DIST: f32 = 50.0;
 const RAYMARCH_STEP_SCALE: f32 = 1.0;
-const RAYMARCH_MAX_STEPS: i32 = 250;
+const RAYMARCH_MAX_STEPS: u32 = 250;
 
 const SHADOW_BIAS: f32 = 0.005;
 const SHADOW_MAX_DIST: f32 = 5.0;
 const SHADOW_W: f32 = 0.4;
-const SHADOW_MAX_STEPS: i32 = 128;
+const SHADOW_MAX_STEPS: u32 = 128;
+
+const POINT_RADIUS_WORLD: f32 = 0.03;
+const CLEARANCE_THRESHOLD: f32 = POINT_RADIUS_WORLD;
 
 fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     var t = 0.0;
-    for (var i: i32 = 0; i < RAYMARCH_MAX_STEPS; i = i + 1) {
+        for (var i: u32 = 0u; i < RAYMARCH_MAX_STEPS && t <= RAYMARCH_MAX_DIST; i += 1u) {
         let p = ro + rd * t;
         let d = map(p, time);
         if (d < SURF_EPS) {
             return t;
         }
         t += RAYMARCH_STEP_SCALE * d;
-        if (t > RAYMARCH_MAX_DIST) {
-            break;
-        }
     }
     return -1.0;
+}
+
+fn rayClearance(ro: vec3f, dest: vec3f, time: f32) -> f32 {
+    let ray_vector = dest - ro;
+    let ray_length = length(ray_vector);
+
+    if ray_length <= SURF_EPS {
+        return CLEARANCE_THRESHOLD;
+    }
+
+    let direction = ray_vector / ray_length;
+
+    var t = min(PROBE_STEP, ray_length);
+    var min_dist = CLEARANCE_THRESHOLD;
+
+    // Ignore the initial positive threshold band until the ray has
+    // traveled at least the desired clearance.
+    var tracking = t >= CLEARANCE_THRESHOLD;
+
+    for (var i = 0u; i < RAYMARCH_MAX_STEPS && t < ray_length; i += 1u) {
+        let dist = map(ro + direction * t, time);
+
+        if dist < 0.0 {
+            // Penetration always counts, including near the origin.
+            min_dist = min(min_dist, dist);
+            tracking = true;
+        } else if tracking {
+            min_dist = min(min_dist, dist);
+        } else if dist >= CLEARANCE_THRESHOLD {
+            // The ray has escaped the initial surface neighborhood.
+            tracking = true;
+        }
+
+        var step: f32;
+
+        if abs(dist) <= SURF_EPS {
+            // Move through the numerically ambiguous surface region.
+            step = PROBE_STEP;
+        } else if !tracking {
+            // Safely approach the clearance threshold.
+            // TODO: does this really make sense?
+            step = max(
+                (CLEARANCE_THRESHOLD - dist) * RAYMARCH_STEP_SCALE,
+                PROBE_STEP,
+            );
+        } else {
+            // Continue in either direction using the unsigned distance.
+            step = abs(dist) * RAYMARCH_STEP_SCALE;
+        }
+
+        step = min(step, ray_length - t);
+
+        t += step;
+    }
+
+    // Include the target point.
+    // TODO: is this necessary?
+    // if dist < 0.0 || tracking {
+    //     min_dist = min(min_dist, dist);
+    // }
+
+    return min_dist;
+}
+
+fn tangentFrame(n: vec3f) -> TangentFrame {
+    let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.99);
+    let t1 = normalize(cross(up, n));
+    return TangentFrame(t1, cross(n, t1));
 }
 
 fn softShadow(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     var res = 1.0;
     var pd = 1e20;
     var t = SHADOW_BIAS;
-    for (var i: i32 = 0; i < SHADOW_MAX_STEPS && t < SHADOW_MAX_DIST; i = i + 1) {
+    for (var i: u32 = 0u; i < SHADOW_MAX_STEPS && t < SHADOW_MAX_DIST; i +=1u) {
         let d = map(ro + rd * t, time);
         if (d < SURF_EPS) {
             return 0.0;
@@ -91,7 +180,7 @@ fn softShadow(ro: vec3f, rd: vec3f, time: f32) -> f32 {
         let cd = sqrt(d * d - y * y);
         res = min(res, cd / (SHADOW_W * max(0.0, t - y)));
         pd = d;
-        t = t + d;
+        t = t + RAYMARCH_STEP_SCALE * d;
     }
     return res;
 }
