@@ -91,13 +91,13 @@ const RAYMARCH_MAX_DIST: f32 = 50.0;
 const RAYMARCH_STEP_SCALE: f32 = 1.0;
 const RAYMARCH_MAX_STEPS: u32 = 250;
 
-const SHADOW_BIAS: f32 = 0.005;
+const SHADOW_BIAS: f32 = 5.0 * SURF_EPS;
 const SHADOW_MAX_DIST: f32 = 5.0;
 const SHADOW_W: f32 = 0.4;
 const SHADOW_MAX_STEPS: u32 = 128;
 
 const POINT_RADIUS_WORLD: f32 = 0.03;
-const CLEARANCE_THRESHOLD: f32 = POINT_RADIUS_WORLD;
+const CLEARANCE_THRESHOLD: f32 = 1.5 * POINT_RADIUS_WORLD;
 
 fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     var t = 0.0;
@@ -123,7 +123,7 @@ fn rayClearance(ro: vec3f, rd: vec3f, max_dist: f32, time: f32) -> f32 {
     // Ignore the initial positive threshold band until the ray has
     // traveled at least the desired clearance — within the splat radius
     // of the origin, the only surface is the origin's own.
-    var tracking = t >= CLEARANCE_THRESHOLD;
+    var tracking = false;
 
     // Previous sample's signed distance, for the softShadow-style
     // triangulated closest-approach estimate between samples.
