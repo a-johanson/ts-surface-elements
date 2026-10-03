@@ -84,11 +84,14 @@ struct TangentFrame {
     t2: vec3f,
 };
 
+const PI = radians(180.0);
+const TAU = radians(360.0);
+
 const SURF_EPS: f32 = 0.001;
 const PROBE_STEP: f32 = 5.0 * SURF_EPS;
 
 const RAYMARCH_MAX_DIST: f32 = 50.0;
-const RAYMARCH_STEP_SCALE: f32 = 1.0;
+const RAYMARCH_STEP_SCALE: f32 = 0.8;
 const RAYMARCH_MAX_STEPS: u32 = 250;
 
 const SHADOW_BIAS: f32 = 5.0 * SURF_EPS;
@@ -203,33 +206,69 @@ fn softShadow(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     return res;
 }
 
-fn sdSphere(p: vec3f, r: f32) -> f32 {
-    return length(p) - r;
-}
-
-fn sdTorus(p: vec3f, t: vec2f) -> f32 {
-    let q = vec2f(length(p.xz) - t.x, p.y);
-    return length(q) - t.y;
-}
-
-fn sdBox(p: vec3f, b: vec3f) -> f32 {
-    let q = abs(p) - b;
-    return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
-}
-
 fn smin(a: f32, b: f32, k: f32) -> f32 {
     let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
-fn map(p: vec3f, time: f32) -> f32 {
-    let r1 = 1.5 + 0.2 * sin(time);
-    let r2 = 1.0 + 0.15 * cos(time * 0.7);
-    let d1 = sdSphere(p - vec3f(-1.2, 0.0, 0.0), r1);
-    let d2 = sdTorus(p - vec3f(1.2, 0.0, 0.0), vec2f(r2, 0.35));
-    let d3 = sdSphere(p - vec3f(1.0, 0.4, 1.0), 0.8 * r1);
-    let d12 = smin(d1, d2, 0.6);
-    return smin(d12, d3, 0.6);
+// fn sdCapsule(p: vec3f, a: vec3f, b: vec3f, r: f32) -> f32 {
+//     let ab = b - a;
+//     let ap = p - a;
+//     let t = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
+//     return length(ap - ab * t) - r;
+// }
+
+fn sdSegment2D(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    let t = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
+    return length(ap - ab * t);
+}
+
+fn sdTube(
+    p: vec3f,
+    a: vec3f,
+    b: vec3f,
+    r_a: f32,
+    r_b: f32,
+    w_a: f32,
+    w_b: f32,
+) -> f32 {
+    let ab = b - a;
+    let len = length(ab);
+    let dir = ab / len;
+    let ap = p - a;
+    let t = dot(ap, dir);
+    let rho = length(ap - dir * t);
+    let d_medial = sdSegment2D(vec2f(rho, t), vec2f(r_a, 0.0), vec2f(r_b, len));
+    let w = (w_b - w_a) * t / len + w_a;
+    return d_medial - w;
+}
+
+fn opTwist(p: vec3f, freq: f32, offset: f32) -> vec3f {
+    let c = cos(freq * p.y + offset);
+    let s = sin(freq * p.y + offset);
+    return vec3f(c*p.x - s*p.z, p.y, s*p.x + c*p.z);
+}
+
+fn map(p_in: vec3f, time: f32) -> f32 {
+    const CAPS_COUNT: f32 = 3.0;
+    const R: f32 = 0.6;
+    const R_CAPS: f32 = 0.25;
+    var min_dist = 1.0e20;
+
+    let p = opTwist(p_in, 0.2 * sin(1.6 * time), 0.0);
+
+    for (var i: f32 = 0.0; i < CAPS_COUNT; i += 1.0) {
+        let c = R * cos(i * TAU / CAPS_COUNT);
+        let s = R * sin(i * TAU / CAPS_COUNT);
+        let a = vec3f(0.1 * c, -2.0, 0.1 * s);//vec3f(c, -1.0, s);
+        let s_b = 0.75 * (sin(time + i) + 2.0);
+        let h_b = 0.2 * cos(1.2 * time + i);
+        let b = vec3f(s_b * c, 1.0 + h_b, s_b * s);
+        min_dist = smin(min_dist, sdTube(p, a, b, 3.0 * R_CAPS, (sin(time) + 1.5) * R_CAPS, 1.5 * R_CAPS, 0.08), 0.2);
+    }
+    return min_dist;
 }
 
 fn sdfGradient(p: vec3f, time: f32) -> vec3f {

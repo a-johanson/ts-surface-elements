@@ -23,7 +23,7 @@ const TARGET: readonly [number, number, number] = [0, 0, 0];
 const UP: readonly [number, number, number] = [0, 1, 0];
 
 /** Number of stipple points. */
-const POINT_COUNT = 8 * 1024;
+const POINT_COUNT = 4 * 1024;
 
 /**
  * Fixed CPU-known bounding box for the animated SDF scene.
@@ -35,8 +35,8 @@ const POINT_COUNT = 8 * 1024;
  * cell-index clamp collapses out-of-range points into boundary cells).
  */
 const SCENE_BBOX: SceneBBox = {
-    min: [-3, -2, -2],
-    max: [3, 2, 2],
+    min: [-1.5, -3.0, -1.5],
+    max: [1.5, 2.0, 1.5],
 };
 
 /** Relaxation interaction radius (also the spatial grid cell size and seed band). */
