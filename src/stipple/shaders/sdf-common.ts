@@ -91,7 +91,7 @@ const SURF_EPS: f32 = 0.001;
 const PROBE_STEP: f32 = 5.0 * SURF_EPS;
 
 const RAYMARCH_MAX_DIST: f32 = 50.0;
-const RAYMARCH_STEP_SCALE: f32 = 0.8;
+const RAYMARCH_STEP_SCALE: f32 = 0.7;
 const RAYMARCH_MAX_STEPS: u32 = 250;
 
 const SHADOW_BIAS: f32 = 5.0 * SURF_EPS;
