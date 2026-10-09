@@ -48,7 +48,6 @@ ${SDF_COMMON}
 struct ShadingParams {
     eye: vec3f,
     point_count: u32,
-    light_dir: vec3f,
     time: f32,
 };
 
@@ -119,8 +118,9 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
         }
     }
 
-    let lit = softShadow(p_biased, params.light_dir, time);
-    let lambert = max(dot(n, params.light_dir), 0.0);
+    let light = lightDir(time);
+    let lit = softShadow(p_biased, light, time);
+    let lambert = max(dot(n, light), 0.0);
     shading_out[i] = ShadingSample(vec4f(lit * lambert, 0.0, 0.0, 0.0), clearance);
 }
 `;

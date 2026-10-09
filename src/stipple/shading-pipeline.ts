@@ -34,22 +34,10 @@ const WORKGROUP_SIZE = 64;
  *
  * WGSL struct layout (uniform):
  *   `eye: vec3f` (offset 0, align 16) + `point_count: u32` (offset 12)
- *   `light_dir: vec3f` (offset 16, align 16) + `time: f32` (offset 28)
+ *   `time: f32` (offset 16)
  * Struct size rounds up to 32 (alignment 16).
  */
 const SHADING_PARAMS_BUFFER_BYTES = 32;
-
-/**
- * Default light direction — matches the value previously hardcoded in
- * the debug render shader (`normalize(vec3f(0.5, 0.8, 0.6))`).
- */
-export const DEFAULT_LIGHT_DIR: readonly [number, number, number] = (() => {
-    const x = 0.5;
-    const y = 0.8;
-    const z = 0.6;
-    const len = Math.hypot(x, y, z);
-    return [x / len, y / len, z / len];
-})();
 
 /**
  * Manages the shading compute pipeline, its params uniform, and the
@@ -125,22 +113,17 @@ export class ShadingPipeline {
     }
 
     /**
-     * Writes the eye position, light direction, and point count into the
+     * Writes the eye position, point count, and animation time into the
      * params uniform buffer.
      *
      * Layout (32 bytes):
      *   `eye: vec3f + point_count: u32`,
-     *   `light_dir: vec3f + time: f32`.
+     *   `time: f32`.
      *
      * @param eye - Camera eye position in world space.
-     * @param lightDir - Normalized light direction in world space.
      * @param time - Current animation time in seconds.
      */
-    private writeParams(
-        eye: readonly [number, number, number],
-        lightDir: readonly [number, number, number],
-        time: number,
-    ): void {
+    private writeParams(eye: readonly [number, number, number], time: number): void {
         const buffer = new ArrayBuffer(SHADING_PARAMS_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
         const u32 = new Uint32Array(buffer);
@@ -148,10 +131,7 @@ export class ShadingPipeline {
         f32[1] = eye[1];
         f32[2] = eye[2];
         u32[3] = this.points.count;
-        f32[4] = lightDir[0];
-        f32[5] = lightDir[1];
-        f32[6] = lightDir[2];
-        f32[7] = time;
+        f32[4] = time;
         this.device.queue.writeBuffer(this.paramsBuffer, 0, buffer);
     }
 
@@ -166,7 +146,6 @@ export class ShadingPipeline {
      *
      * @param encoder - The command encoder to record into.
      * @param eye - Camera eye position in world space.
-     * @param lightDir - Normalized light direction in world space.
      * @param time - Current animation time in seconds.
      * @param readFromA - If `true`, reads bufferA; else bufferB. Should
      *   match the buffer relax most recently wrote (i.e. the inverse of
@@ -175,11 +154,10 @@ export class ShadingPipeline {
     public dispatch(
         encoder: GPUCommandEncoder,
         eye: readonly [number, number, number],
-        lightDir: readonly [number, number, number],
         time: number,
         readFromA: boolean,
     ): void {
-        this.writeParams(eye, lightDir, time);
+        this.writeParams(eye, time);
 
         const workgroupCount = Math.ceil(this.points.count / WORKGROUP_SIZE);
 

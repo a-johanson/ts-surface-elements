@@ -61,11 +61,11 @@ export class DebugRenderPipeline {
             layout: "auto",
             vertex: {
                 module: shaderModule,
-                entryPoint: "blit_vs",
+                entryPoint: "debug_vs",
             },
             fragment: {
                 module: shaderModule,
-                entryPoint: "blit_fs",
+                entryPoint: "debug_fs",
                 targets: [{ format }],
             },
             primitive: {

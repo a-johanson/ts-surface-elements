@@ -5,7 +5,7 @@ import { PointRenderPipeline } from "./stipple/point-render-pipeline.js";
 import { RelaxPipeline } from "./stipple/relax-pipeline.js";
 import { ReprojectPipeline } from "./stipple/reproject-pipeline.js";
 import { SeedPipeline } from "./stipple/seed-pipeline.js";
-import { DEFAULT_LIGHT_DIR, ShadingPipeline } from "./stipple/shading-pipeline.js";
+import { ShadingPipeline } from "./stipple/shading-pipeline.js";
 import { type SceneBBox, SpatialGridPipeline } from "./stipple/spatial-grid-pipeline.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
@@ -180,7 +180,7 @@ function startFrameLoop(
 
         // Shading reads the buffer that relax most recently wrote to.
         const shadingReadsA = readFromA;
-        shading.dispatch(encoder, eye, DEFAULT_LIGHT_DIR, time, shadingReadsA);
+        shading.dispatch(encoder, eye, time, shadingReadsA);
 
         // Render reads the same buffer shading just read.
         const renderReadsA = shadingReadsA;
@@ -235,7 +235,7 @@ async function bootstrap(): Promise<void> {
     const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const controls = new OrbitControls(canvas, {
-        azimuth: 1.9,
+        azimuth: 0.0,
         elevation: 0.5,
         radius: 8,
     });

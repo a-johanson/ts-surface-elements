@@ -27,7 +27,7 @@ struct CameraRays {
 @group(0) @binding(0) var<uniform> camera: CameraRays;
 
 @vertex
-fn blit_vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
+fn debug_vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
     let pos = array<vec2f, 6>(
         vec2f(-1.0, -1.0),
         vec2f( 1.0, -1.0),
@@ -40,7 +40,7 @@ fn blit_vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
 }
 
 @fragment
-fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
+fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let res = camera.resolution;
     let uv = frag_coord.xy / vec2f(res);
     let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -57,7 +57,7 @@ fn blit_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     }
     let p = camera.eye + rd * t;
     let n = calcNormal(p, camera.time);
-    let light_dir = normalize(vec3f(0.5, 0.8, 0.6));
+    let light_dir = lightDir(camera.time);
     let lambert = max(dot(n, light_dir), 0.0);
     let shadow = softShadow(p + n * SHADOW_BIAS, light_dir, camera.time);
     let lum = lambert * shadow;

@@ -3,9 +3,9 @@
  *
  * Points live in 3D world space on the surface of the time-animated SDF
  * scene. The shared {@link SDF_COMMON} block — interpolated into every
- * shader that needs the SDF — owns the scene description (`map`), a
- * time-parameterized gradient/normal helper set, and a Newton-Raphson
- * surface projection routine. All SDF helpers thread a `time` parameter so
+ * shader that needs the SDF — owns the scene description (`map`), an animated
+ * light direction (`lightDir`), a time-parameterized gradient/normal
+ * helper set, and a Newton-Raphson surface projection routine. All SDF helpers thread a `time` parameter so
  * the surface can be re-evaluated at the correct animation phase.
  */
 
@@ -33,6 +33,7 @@
  *   rasterized corners always coincide.
  * - `map(p, time)` — the scene signed distance field, parameterized by
  *   `time` for smooth morphing.
+ * - `lightDir(time)` — the animated light direction.
  * - `sdfGradient(p, time)` — tetrahedron-pattern gradient (4 taps); used by
  *   Newton projection so the magnitude is the true distance-field gradient.
  * - `calcNormal(p, time)` — normalized gradient; used by the debug render
@@ -250,6 +251,14 @@ fn opTwist(p: vec3f, freq: f32, offset: f32) -> vec3f {
     let c = cos(freq * p.y + offset);
     let s = sin(freq * p.y + offset);
     return vec3f(c*p.x - s*p.z, p.y, s*p.x + c*p.z);
+}
+
+fn lightDir(time: f32) -> vec3f {
+    const SWAY_AMPLITUDE: f32 = 0.3 * PI;
+    const SWAY_FREQ: f32 = 0.5;
+    const SWAY_OFFSET: f32 = 0.25 * PI;
+    let theta = SWAY_AMPLITUDE * sin(SWAY_FREQ * time) + SWAY_OFFSET;
+    return normalize(vec3f(sin(theta), 0.5, cos(theta)));
 }
 
 fn map(p_in: vec3f, time: f32) -> f32 {
