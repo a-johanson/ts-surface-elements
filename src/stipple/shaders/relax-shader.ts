@@ -75,7 +75,7 @@ const UINT_MAX: u32 = 0xFFFFFFFFu;
 @group(0) @binding(6) var<storage, read> cell_start: array<u32>;
 @group(0) @binding(7) var<storage, read> cell_count: array<u32>;
 
-const RELAX_NEWTON_ITERS: i32 = 4;
+const RELAX_NEWTON_ITERS: i32 = 1;
 const RELAX_ALPHA: f32 = 1.0;
 
 /**

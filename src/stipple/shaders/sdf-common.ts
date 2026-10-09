@@ -193,7 +193,7 @@ fn softShadow(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     var res = 1.0;
     var pd = 1e20;
     var t = SHADOW_BIAS;
-    for (var i: u32 = 0u; i < SHADOW_MAX_STEPS && t < SHADOW_MAX_DIST; i +=1u) {
+    for (var i: u32 = 0u; i < SHADOW_MAX_STEPS && t < SHADOW_MAX_DIST; i += 1u) {
         let d = map(ro + rd * t, time);
         if (d < SURF_EPS) {
             return 0.0;
@@ -267,7 +267,7 @@ fn map(p_in: vec3f, time: f32) -> f32 {
     const R_TUBE: f32 = 0.75;
     const F_TWIST = 0.9;
     const F_SWAY = 1.0;
-    const F_CONTRACT = 1.0;
+    const F_CONTRACT = F_SWAY;
 
     var min_dist = 1.0e20;
 
@@ -305,7 +305,7 @@ fn calcNormal(p: vec3f, time: f32) -> vec3f {
 
 fn projectToSurface(p_in: vec3f, time: f32, iters: i32, alpha: f32) -> vec3f {
     var p = p_in;
-    for (var i: i32 = 0; i < iters; i = i + 1) {
+    for (var i: i32 = 0; i < iters; i += 1) {
         let f = map(p, time);
         if (abs(f) < SURF_EPS) {
             break;
