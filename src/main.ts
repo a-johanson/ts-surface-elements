@@ -23,7 +23,7 @@ const TARGET: readonly [number, number, number] = [0, 0, 0];
 const UP: readonly [number, number, number] = [0, 1, 0];
 
 /** Number of stipple points. */
-const POINT_COUNT = 4 * 1024;
+const POINT_COUNT = 6 * 1024;
 
 /**
  * Fixed CPU-known bounding box for the animated SDF scene.

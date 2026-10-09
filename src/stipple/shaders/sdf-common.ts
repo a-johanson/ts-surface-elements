@@ -240,7 +240,8 @@ fn sdTube(
     let ap = p - a;
     let t = dot(ap, dir);
     let rho = length(ap - dir * t);
-    let d_medial = sdSegment2D(vec2f(rho, t), vec2f(r_a, 0.0), vec2f(r_b, len));
+    let p2d = vec2f(rho, t);
+    let d_medial = sdSegment2D(p2d, vec2f(r_a, 0.0), vec2f(r_b, len));
     let w = (w_b - w_a) * t / len + w_a;
     return d_medial - w;
 }
@@ -252,21 +253,28 @@ fn opTwist(p: vec3f, freq: f32, offset: f32) -> vec3f {
 }
 
 fn map(p_in: vec3f, time: f32) -> f32 {
-    const CAPS_COUNT: f32 = 3.0;
-    const R: f32 = 0.6;
-    const R_CAPS: f32 = 0.25;
+    const TUBE_COUNT: f32 = 3.0;
+    const R_BASE: f32 = 0.6;
+    const R_TUBE: f32 = 0.75;
+    const F_TWIST = 0.9;
+    const F_SWAY = 1.0;
+    const F_CONTRACT = 1.0;
+
     var min_dist = 1.0e20;
 
-    let p = opTwist(p_in, 0.2 * sin(1.6 * time), 0.0);
+    let p = opTwist(p_in, 0.2 * sin(F_TWIST * time), 0.0);
 
-    for (var i: f32 = 0.0; i < CAPS_COUNT; i += 1.0) {
-        let c = R * cos(i * TAU / CAPS_COUNT);
-        let s = R * sin(i * TAU / CAPS_COUNT);
-        let a = vec3f(0.1 * c, -2.0, 0.1 * s);//vec3f(c, -1.0, s);
-        let s_b = 0.75 * (sin(time + i) + 2.0);
-        let h_b = 0.2 * cos(1.2 * time + i);
+    for (var i: f32 = 0.0; i < TUBE_COUNT; i += 1.0) {
+        let alpha = i * TAU / TUBE_COUNT;
+        let c = R_BASE * cos(alpha);
+        let s = R_BASE * sin(alpha);
+        let a = vec3f(0.1 * c, -2.0, 0.1 * s);
+        let theta = 0.3 * i;
+        let s_b = 0.85 * sin(theta + F_SWAY * time) + 1.9;
+        let h_b = 0.8 * sin(theta + PI + F_CONTRACT * time);
         let b = vec3f(s_b * c, 1.0 + h_b, s_b * s);
-        min_dist = smin(min_dist, sdTube(p, a, b, 3.0 * R_CAPS, (sin(time) + 1.5) * R_CAPS, 1.5 * R_CAPS, 0.08), 0.2);
+        let r_b = (0.3 * sin(theta + F_CONTRACT * time) + 0.6) * R_TUBE;
+        min_dist = smin(min_dist, sdTube(p, a, b, R_TUBE, r_b, 1.1 * R_TUBE, 0.15), 0.2);
     }
     return min_dist;
 }

@@ -9,20 +9,19 @@
  * `sortedValues`; empty cells (`cellStart == UINT_MAX`) are skipped. This
  * reduces the inner loop from O(n) to O(1) neighbor cells × O(points/cell).
  *
- * Pairwise force model: a Euclidean distance cutoff gates the force, and a
- * linear-decay envelope modulates its magnitude:
+ * Pairwise force model: a Euclidean distance d_E cutoff gates the force,
+ * and a linear-decay envelope modulates its magnitude:
  *
- *  - d_E == 0 (bit-identical) → sign-based kick along a tangent basis vector
- *  - d_E > radius             → skip
+ *  - d_E > radius → skip
+ *  - d_E < COINCIDENT_EPS (including bit-identical d_E == 0) → sign-based
+ *    kick along a tangent basis vector instead of the normal repulsion
+ *    (diff/d_E is undefined at d_E == 0); antisymmetric under i↔j swap, so
+ *    the two points separate on the tangent plane, projectToSurface
+ *    re-projects, and the next substep's normal repulsion resumes
+ *  - pair midpoint deep inside the surface with opposing normals → skip
+ *    (the points likely sit on opposite sides of a thin wall)
  *  - decay  (1 - d_E / radius)
  *  - direction (p_i - p_j) / d_E
- *
- * Coincident pairs (d_E < COINCIDENT_EPS, including the bit-identical case
- * d_E == 0.0) receive a deterministic sign-based kick along a tangent
- * basis vector instead of the normal repulsion (diff/d_E is undefined at
- * d_E == 0). The kick is antisymmetric under i↔j swap (sign(i - j)
- * flips), so the two points separate on the tangent plane; projectToSurface
- * then re-projects, and the next substep's normal repulsion resumes.
  *
  * The accumulated force is projected onto the tangent plane at `p_i` and
  * integrated with a direct Euler position step `x* = x + dt·F_tan`, where
@@ -150,7 +149,27 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
                         continue;
                     }
 
-                    force = force + (1.0 - d_E / r) * diff / d_E;
+                    let p_m = 0.5 * (p_i + p_j);
+                    let dist_m = map(p_m, params.time);
+                    let n_j = normals_in[j].xyz;
+                    if dist_m < -0.05 * r && dot(n_i, n_j) < -0.2 {
+                        // points likely on opposite sides of a thin wall
+                        continue;
+                    }
+
+                    // This mid-point projection can help with points not accumulating too much in creases.
+                    // However, it does have quite a significant impact on performance.
+                    // let p_m_proj = projectToSurface(p_m, params.time, 2, 0.7);
+                    // let diff_1 = p_i - p_m_proj;
+                    // let d_1 = length(diff_1);
+                    // let d_2 = length(p_m_proj - p_j);
+                    // let d_path = d_1 + d_2;
+                    // if (d_path > r) {
+                    //     continue;
+                    // }
+                    // force = force + (1.0 - d_path / r) * diff_1 / d_1;
+
+                    force += (1.0 - d_E / r) * diff / d_E;
                 }
             }
         }
