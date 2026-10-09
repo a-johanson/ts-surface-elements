@@ -1,3 +1,4 @@
+export { BBOX_WIREFRAME_SHADER } from "./bbox-wireframe-shader.js";
 export { DEBUG_RENDER_SHADER } from "./debug-render-shader.js";
 export { POINT_SHADER } from "./point-shader.js";
 export { RELAX_SHADER } from "./relax-shader.js";

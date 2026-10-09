@@ -1,7 +1,7 @@
 import { OrbitControls } from "./orbit-controls.js";
-import { type CameraConfig, DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
+import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
-import { PointRenderPipeline } from "./stipple/point-render-pipeline.js";
+import { type CameraConfig, PointRenderPipeline } from "./stipple/point-render-pipeline.js";
 import { RelaxPipeline } from "./stipple/relax-pipeline.js";
 import { ReprojectPipeline } from "./stipple/reproject-pipeline.js";
 import { SeedPipeline } from "./stipple/seed-pipeline.js";
@@ -35,8 +35,8 @@ const POINT_COUNT = 6 * 1024;
  * cell-index clamp collapses out-of-range points into boundary cells).
  */
 const SCENE_BBOX: SceneBBox = {
-    min: [-1.5, -3.0, -1.5],
-    max: [1.5, 2.0, 1.5],
+    min: [-2.5, -3.6, -2.5],
+    max: [2.5, 2.2, 2.5],
 };
 
 /** Relaxation interaction radius (also the spatial grid cell size and seed band). */
@@ -232,7 +232,12 @@ async function bootstrap(): Promise<void> {
     const spatialGrid = new SpatialGridPipeline(gpu.device, points, SCENE_BBOX, RELAX_RADIUS);
     const relax = new RelaxPipeline(gpu.device, points, spatialGrid, RELAX_RADIUS);
     const shading = new ShadingPipeline(gpu.device, points);
-    const debugRender = new DebugRenderPipeline(gpu.device, cameraConfig, gpu.format);
+    const debugRender = new DebugRenderPipeline(
+        gpu.device,
+        cameraConfig,
+        gpu.format,
+        SCENE_BBOX,
+    );
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const controls = new OrbitControls(canvas, {
         azimuth: 0.0,
