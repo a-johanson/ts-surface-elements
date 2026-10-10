@@ -1,3 +1,4 @@
+import { FrameCapture } from "./frame-capture.js";
 import { OrbitControls } from "./orbit-controls.js";
 import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
@@ -7,6 +8,7 @@ import { ReprojectPipeline } from "./stipple/reproject-pipeline.js";
 import { SeedPipeline } from "./stipple/seed-pipeline.js";
 import { ShadingPipeline } from "./stipple/shading-pipeline.js";
 import { type SceneBBox, SpatialGridPipeline } from "./stipple/spatial-grid-pipeline.js";
+import { TimeControls } from "./time-controls.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
 /** Background clear color — black. */
@@ -47,6 +49,27 @@ const SEED_BAND = RELAX_RADIUS;
 
 /** Whether to draw the SDF debug view behind the stipple points. */
 const DRAW_DEBUG = false;
+
+/**
+ * Whether the canvas has a fixed size, applied once at bootstrap to both
+ * the rendering attachment and the HTML element. When disabled, the
+ * canvas tracks the viewport and its backing store is re-synced to the
+ * CSS size (with `devicePixelRatio`) every frame.
+ */
+const FIXED_CANVAS_SIZE = false;
+
+/**
+ * Fixed canvas height in pixels — the long side of the portrait canvas.
+ * Only used when {@link FIXED_CANVAS_SIZE} is enabled.
+ */
+const CANVAS_HEIGHT = 2000;
+
+/**
+ * Fixed canvas width in pixels, derived from {@link CANVAS_HEIGHT} for
+ * DIN A4 portrait aspect ratio (210:297). Only used when
+ * {@link FIXED_CANVAS_SIZE} is enabled.
+ */
+const CANVAS_WIDTH = Math.round(CANVAS_HEIGHT * (210 / 297));
 
 /**
  * Maximum per-frame wall-clock delta, in seconds.
@@ -98,23 +121,31 @@ function getCanvas(): HTMLCanvasElement {
  * Starts the per-frame loop.
  *
  * Each frame:
- * 1. Syncs canvas size.
- * 2. Computes the capped wall-clock delta and accumulates animation time.
- * 3. Dispatches the reproject compute pass to re-project points onto the
- *    current animated surface and refresh the shared normals buffer.
- * 4. Dispatches the relax compute pass (ping-pong) one or more times to
- *    redistribute points via 3D repulsion with surface re-projection.
- *    The frame's `dt` is subdivided into `ceil(dt / TARGET_SUBSTEP_DT)`
- *    sub-passes (capped at `MAX_SUBSTEPS`), each flipping the ping-pong
- *    direction, so the per-step Euler integration size stays stable
- *    regardless of frame rate.
- * 5. Dispatches the shading compute pass to refresh the normals buffer
+ * 1. Syncs the canvas size unless the canvas has a fixed size.
+ * 2. Computes the capped wall-clock delta.
+ * 3. While time is playing, accumulates animation time, dispatches the
+ *    reproject compute pass to re-project points onto the current
+ *    animated surface and refresh the shared normals buffer, builds the
+ *    spatial grid, and dispatches the relax compute pass (ping-pong) one
+ *    or more times to redistribute points via 3D repulsion with surface
+ *    re-projection. The frame's `dt` is subdivided into
+ *    `ceil(dt / TARGET_SUBSTEP_DT)` sub-passes (capped at
+ *    `MAX_SUBSTEPS`), each flipping the ping-pong direction, so the
+ *    per-step Euler integration size stays stable regardless of frame
+ *    rate. While time is paused, these simulation passes are skipped and
+ *    their state is left untouched, so they resume exactly where they
+ *    left off.
+ * 4. Dispatches the shading compute pass to refresh the normals buffer
  *    and compute per-point corner occlusion clearances (sphere-traced
  *    toward the eye) and luminance (Lambert with shadow) from the relaxed
- *    positions.
- * 6. Begins a render pass that draws the SDF debug view (grayscale
+ *    positions. Always runs since it is view-dependent — the camera stays
+ *    interactive while time is paused.
+ * 5. Begins a render pass that draws the SDF debug view (grayscale
  *    Lambert) and then the stipple points.
- * 7. Submits the command buffer.
+ * 6. Submits the command buffer.
+ * 7. If a still-image export was requested, serializes the canvas's last
+ *    presented frame to a downloadable PNG tagged with the current
+ *    animation time.
  *
  * Seeding happens once at bootstrap (before this loop starts) at t=0
  * since points live in world space and are independent of the view.
@@ -127,6 +158,8 @@ function getCanvas(): HTMLCanvasElement {
  * @param debugRender - The debug render pipeline (SDF visualization).
  * @param pointRender - The point render pipeline.
  * @param controls - Orbit camera controls.
+ * @param timeControls - Animation-time playback controls.
+ * @param frameCapture - Still-image export controls.
  */
 function startFrameLoop(
     gpu: GpuContext,
@@ -138,6 +171,8 @@ function startFrameLoop(
     debugRender: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
     controls: OrbitControls,
+    timeControls: TimeControls,
+    frameCapture: FrameCapture,
 ): void {
     const { device } = gpu;
     let readFromA = true;
@@ -145,37 +180,46 @@ function startFrameLoop(
     let time = 0;
 
     const frame = (): void => {
-        syncCanvasSize(gpu);
+        if (!FIXED_CANVAS_SIZE) {
+            syncCanvasSize(gpu);
+        }
 
         const now = performance.now() / 1000;
         const dt = Math.min(now - lastNow, MAX_DT);
         lastNow = now;
-        time += dt;
 
         const eye = controls.getEye();
 
         const encoder = device.createCommandEncoder();
 
-        // --- Compute pass: reproject (in-place, before relax) ---
-        reproject.dispatch(encoder, time, readFromA);
+        // While time is paused the surface is static, so the simulation
+        // passes are skipped entirely: points, the spatial grid, and the
+        // ping-pong direction are left untouched and everything resumes
+        // exactly where it left off when playback restarts.
+        if (timeControls.isPlaying) {
+            time += dt;
 
-        // --- Compute pass: spatial grid build (before relax, reused across
-        // all substeps — see decision 1). Built from the same buffer relax
-        // is about to read, so cell assignments match the iterated positions.
-        spatialGrid.dispatch(encoder, readFromA);
+            // --- Compute pass: reproject (in-place, before relax) ---
+            reproject.dispatch(encoder, time, readFromA);
 
-        // --- Compute pass: relax (ping-pong, substepped) ---
-        // Subdivide dt so the per-step Euler size stays within the kernel's
-        // stable range. Each substep flips the ping-pong direction; after
-        // the loop, readFromA points at whichever buffer relax last wrote.
-        const substeps = Math.min(
-            Math.max(Math.ceil(dt / TARGET_SUBSTEP_DT), 1),
-            MAX_SUBSTEPS,
-        );
-        const substepDt = dt / substeps;
-        for (let s = 0; s < substeps; s++) {
-            relax.dispatch(encoder, substepDt, time, readFromA);
-            readFromA = !readFromA;
+            // --- Compute pass: spatial grid build (before relax, reused across
+            // all substeps — see decision 1). Built from the same buffer relax
+            // is about to read, so cell assignments match the iterated positions.
+            spatialGrid.dispatch(encoder, readFromA);
+
+            // --- Compute pass: relax (ping-pong, substepped) ---
+            // Subdivide dt so the per-step Euler size stays within the kernel's
+            // stable range. Each substep flips the ping-pong direction; after
+            // the loop, readFromA points at whichever buffer relax last wrote.
+            const substeps = Math.min(
+                Math.max(Math.ceil(dt / TARGET_SUBSTEP_DT), 1),
+                MAX_SUBSTEPS,
+            );
+            const substepDt = dt / substeps;
+            for (let s = 0; s < substeps; s++) {
+                relax.dispatch(encoder, substepDt, time, readFromA);
+                readFromA = !readFromA;
+            }
         }
 
         // Shading reads the buffer that relax most recently wrote to.
@@ -208,6 +252,11 @@ function startFrameLoop(
 
         device.queue.submit([encoder.finish()]);
 
+        // Serialize pending exports right after presenting, so the image
+        // matches the frame just rendered and the filename's time tag
+        // matches the animation time of that frame.
+        frameCapture.save(time);
+
         // The relax substep loop advanced readFromA to the buffer relax
         // most recently wrote; next frame's reproject refreshes it in-place.
         requestAnimationFrame(frame);
@@ -218,7 +267,10 @@ function startFrameLoop(
 
 async function bootstrap(): Promise<void> {
     const canvas = getCanvas();
-    const gpu = await createGpuContext(canvas);
+    const gpu = await createGpuContext(
+        canvas,
+        FIXED_CANVAS_SIZE ? { width: CANVAS_WIDTH, height: CANVAS_HEIGHT } : undefined,
+    );
 
     const cameraConfig: CameraConfig = {
         fov: FIELD_OF_VIEW,
@@ -244,6 +296,8 @@ async function bootstrap(): Promise<void> {
         elevation: 0.5,
         radius: 8,
     });
+    const timeControls = new TimeControls();
+    const frameCapture = new FrameCapture(canvas);
 
     // --- Seed buffer A once (points are world-space; no re-seed on resize) ---
     const seedEncoder = gpu.device.createCommandEncoder();
@@ -260,6 +314,8 @@ async function bootstrap(): Promise<void> {
         debugRender,
         pointRender,
         controls,
+        timeControls,
+        frameCapture,
     );
 }
 

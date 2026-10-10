@@ -22,16 +22,16 @@ export interface OrbitState {
 }
 
 /** Radians of rotation per pixel of drag. */
-const ROTATE_SENSITIVITY = 0.005;
+const ROTATE_SENSITIVITY = 0.0015;
 
 /** Radius delta per pixel of wheel scroll. */
-const ZOOM_SENSITIVITY = 0.05;
+const ZOOM_SENSITIVITY = 0.005;
 
 /** Minimum orbit radius — prevents clipping into the scene. */
 const MIN_RADIUS = 3;
 
 /** Maximum orbit radius — prevents zooming out too far. */
-const MAX_RADIUS = 50;
+const MAX_RADIUS = 30;
 
 /** Clamp elevation to just under ±π/2 to avoid gimbal lock. */
 const MAX_ELEVATION = Math.PI / 2 - 0.01;
