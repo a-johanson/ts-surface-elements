@@ -9,9 +9,18 @@ body {
     overflow: hidden;
 }
 
+body {
+    display: flex;
+}
+
+body.canvas-fixed {
+    overflow: auto;
+}
+
 canvas {
     border: none;
     display: block;
+    margin: auto;
     width: 100vw;
     height: 100vh;
 }

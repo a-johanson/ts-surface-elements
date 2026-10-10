@@ -18,15 +18,31 @@ export interface GpuContext {
     readonly canvas: HTMLCanvasElement;
 }
 
+/** Canvas dimensions in pixels. */
+export interface CanvasSize {
+    /** Width in pixels. */
+    readonly width: number;
+    /** Height in pixels. */
+    readonly height: number;
+}
+
 /**
  * Acquires a GPU adapter and device, then configures the given canvas for
  * WebGPU rendering using the browser's preferred texture format.
  *
  * @param canvas - The canvas element to render into.
+ * @param fixedSize - Optional fixed dimensions applied once at
+ *   initialization, both to the canvas backing store and its CSS display
+ *   size (1:1, ignoring `devicePixelRatio`), and switching the page to a
+ *   scrollable layout. When omitted, the caller drives sizing per frame
+ *   via {@link syncCanvasSize}.
  * @returns A {@link GpuContext} ready for rendering.
  * @throws {Error} If WebGPU is unavailable or no adapter/device can be obtained.
  */
-export async function createGpuContext(canvas: HTMLCanvasElement): Promise<GpuContext> {
+export async function createGpuContext(
+    canvas: HTMLCanvasElement,
+    fixedSize?: CanvasSize,
+): Promise<GpuContext> {
     if (!navigator.gpu) {
         throw new Error("WebGPU is not supported in this browser.");
     }
@@ -46,6 +62,14 @@ export async function createGpuContext(canvas: HTMLCanvasElement): Promise<GpuCo
         throw new Error("Failed to acquire a WebGPU canvas context.");
     }
 
+    if (fixedSize) {
+        canvas.width = fixedSize.width;
+        canvas.height = fixedSize.height;
+        canvas.style.width = `${fixedSize.width}px`;
+        canvas.style.height = `${fixedSize.height}px`;
+        document.body.classList.add("canvas-fixed");
+    }
+
     const format = navigator.gpu.getPreferredCanvasFormat();
     context.configure({
         device,
@@ -60,6 +84,9 @@ export async function createGpuContext(canvas: HTMLCanvasElement): Promise<GpuCo
  * Synchronizes the canvas backing-store resolution with its CSS size,
  * accounting for `devicePixelRatio`. Should be called once per frame
  * before acquiring the current texture via `context.getCurrentTexture()`.
+ *
+ * Use this only for canvases that were not given a fixed size in
+ * {@link createGpuContext}.
  *
  * The WebGPU canvas context does not need to be reconfigured after a size
  * change — the texture returned by `getCurrentTexture()` will match the
