@@ -41,10 +41,11 @@ point render so points sit on top.
 - **Luminance modulation** — lines do not darken in shadow in v1
   (luminance is computed by the shading pass but not consumed by the link
   renderer). Can be added once the basic rendering looks right.
-- **Dedup of mutual links** — target dedup (decision 9) bounds every
-  point's degree to ≤ 2, but a mutual pair (i→j and j→i) still renders
-  both segments as a tiny 2-cycle. Not needed for correctness; revisit
-  if it causes visual artifacts.
+- **Dedup of mutual links** — once chain filtering (decision 10) is in
+  place, mutual pairs (i→j and j→i) are removed indirectly: the
+  canonical cut opens the 2-cycle into a single-link path, which the min
+  rule then drops. Before Step 1c, both segments of a mutual pair
+  render.
 - **Depth testing** — no depth attachment; occlusion is resolved via
   `rayClearance` toward the eye (Step 4), not via the rasterizer's depth
   buffer.
@@ -240,6 +241,9 @@ runtime tuning is needed.
 | `LINK_RADIUS` | `= RELAX_RADIUS` | Search radius for neighbor scan (same as cell size) |
 | `LINK_TAN_EPS` | `1e-4` | Threshold below which the light is considered parallel to the normal (`L_tan ≈ 0`) — no principal direction, no link |
 | `COINCIDENT_EPS` | `1e-7` | Skip neighbors closer than this (link direction `diff / dist` undefined at zero distance; same threshold as the relax shader's coincident guard) |
+| `MIN_CHAIN_EDGES` | `2` | Drop polylines shorter than this many links (Step 1c chain filtering) |
+| `MAX_CHAIN_EDGES` | `8` | Bisect polylines longer than this many links at the mid-most link (Step 1c chain filtering) |
+| `CHAIN_CHASE_BUDGET` | `48` | Max hops per chain-chase walk; bounds the measurable chain length to `2 × 48 + 1 = 97` edges (Step 1c chain filtering) |
 
 These can be promoted to uniforms later if runtime tuning is needed.
 
@@ -271,12 +275,83 @@ All three run inside `LinkPipeline.dispatch` (one compute pass, three
 dispatches — WebGPU orders dispatches within a pass, so each stage's
 writes are visible to the next), so `main.ts` is unchanged. Winner
 criterion: smallest source index (deterministic). Mutual links (2-cycles
-i↔j) still render both segments — tolerated (denser, more organic look,
-segments nearly coincident).
+i↔j) still render both segments at this stage — tolerated (denser, more
+organic look, segments nearly coincident); chain filtering (decision 10)
+later removes them.
 
 **Cost.** Two extra N-sized dispatches plus one atomic per point —
 ~120 KB traffic, no contention hot spots. Negligible next to the
 shading pass.
+
+### 10. Chain-length filtering: bisect long chains, drop short ones
+
+Link chains have unbounded, uneven lengths — single-link fragments read
+as noise, and very long chains dominate the image. The link stage
+therefore filters each chain by length: polylines shorter than
+`MIN_CHAIN_EDGES` are dropped entirely, and polylines longer than
+`MAX_CHAIN_EDGES` are **bisected** — their mid-most link is dropped,
+subdividing the chain into two roughly even pieces rather than
+truncating it. Bisection is chosen over end-anchored cutting because it
+keeps pieces balanced and never manufactures min-rule victims: with
+`MAX = 8`, cutting a 10-link chain near its end yields an 8+1 split
+whose 1-link remainder the min rule then deletes, while a mid cut yields
+4+5, both well above `MIN`. Mid-cut fragments are always ≥ `⌊MAX/2⌋`
+edges.
+
+**Why per-point pointer chasing suffices.** Decision 9 bounds every
+point's degree to ≤ 2, so every component is a simple path or cycle. One
+extra array, `prev` (`prev[links[i]] = i`, conflict-free precisely
+because in-degree ≤ 1), turns chains into doubly linked lists. Each edge
+`i→j` can then measure its chain locally: walk `prev` from `i` counting
+hops `p` until the chain start (the point with no predecessor), walk
+`links` from `j` counting hops `f` until the chain end — both walks
+bounded by `CHAIN_CHASE_BUDGET` reads. All points do this
+simultaneously; no global synchronization, no CPU readback. The chain
+length is `L = p + 1 + f` and the edge's position is `p`.
+
+**Rules (per edge, re-evaluated every round):**
+
+- **Min rule** — drop iff `L < MIN_CHAIN_EDGES`. The `MIN = 2` case is
+  an O(1) check (`prev[i] == UINT_MAX && links[j] == UINT_MAX` — a
+  single-link chain), so no chasing is needed at the default.
+- **Mid rule** — for `L > MAX_CHAIN_EDGES` with both walks terminated:
+  the unique edge with `p == ⌊(L − 1) / 2⌋` drops itself
+  (`links[i] = UINT_MAX`); every other edge keeps. Exactly one edge per
+  chain satisfies the predicate, so no coordination between edges is
+  needed.
+- **Cycle rule** — a walk that returns to its own start point reveals a
+  closed loop; when the whole loop fits in the chase budget, every
+  member sees all of it, and the member with the smallest index drops
+  its outgoing edge (canonical, race-free), opening the loop into a path
+  that later rounds bisect normally. Loops with more members than the
+  budget stay whole (rare; exact canonicalization needs list ranking —
+  see *Switch points*).
+- A chase that saturates the budget without terminating or wrapping — a
+  chain longer than `2 × CHAIN_CHASE_BUDGET + 1 = 97` edges — keeps its
+  edge: beyond plausible chain lengths at this stipple density.
+
+**Rounds.** Cuts change the chain structure, so measure→apply repeats
+`CHAIN_FILTER_ROUNDS = 4` times (TS constant): each round, every
+still-too-long chain loses one mid link and halves, so `R` rounds fully
+bisect chains up to `2^R × MAX` edges (~128 at the defaults) — the
+chase budget's 97-edge bound is the binding limit. The min rule runs
+every round because cuts can create new single-link fragments — and
+open 2-cycles into them: a mutual pair is cut, becomes a single-link
+path, and is then dropped, so mutual links are filtered out entirely
+(superseding decision 9's tolerance).
+
+**Race discipline.** A dispatch that mutates `links` must not run while
+peers chase through it, so every round is three own-slot-safe
+dispatches: (1) **scatter** — reads stable `links`, writes `prev`;
+(2) **measure** — reads stable `links` + `prev`, writes only `keep[i]`;
+(3) **apply** — own-slot `links[i] = UINT_MAX` when `keep[i] == 0`,
+plus a fused `prev[i] = UINT_MAX` clear for the next round (the dedup
+dispatch clears `prev` the same way before round 1).
+
+**Cost.** Two extra buffers (`prev`, `keep`; 24 KB each) and
+`3 + 3R = 15` N-sized dispatches per frame, with at most
+~`2 × CHAIN_CHASE_BUDGET` dependent reads per edge per round.
+Negligible next to the shading pass; no CPU readback.
 
 ## Architecture & data flow
 
@@ -294,7 +369,8 @@ link compute (scan + subdivide + project)      ← NEW — writes linkCurves buf
    │  reads: points[readFromA], normalsBuffer, grid buffers
    │  writes: linkCurves (not ping-ponged)
    │  internally: owner clear → scan+elect (atomicMin) → dedup
-   │  (one compute pass, three dispatches — decision 9)
+   │  → CHAIN_FILTER_ROUNDS × (prev scatter → measure → apply)
+   │  (one compute pass, 3 + 3R dispatches — decisions 9 and 10)
    │
    ▼
 render pass:
@@ -348,6 +424,13 @@ pass.end();
 | `ownersBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (compute: clear + atomicMin election + read in dedup, once per frame) |
 | `linkRenderUniform` | `80` B (`mat4x4f` + `vec3f` eye + pad) | `UNIFORM \| COPY_DST` | link-render-pipeline (CPU write per frame) |
 
+### Step 1c additions (chain filtering)
+
+| Buffer | Size | Usage | Owner / writer |
+|---|---|---|---|
+| `prevBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (scatter per round; cleared fused into the dedup and apply dispatches) |
+| `keepBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (measure writes per round, apply reads) |
+
 ### Step 2+ (subdivided curves)
 
 | Buffer | Size | Usage | Owner / writer |
@@ -362,7 +445,7 @@ With `N_SEGMENTS = 4` and `POINT_COUNT = 6144`, `linkCurves` is
 
 | File | Responsibility |
 |---|---|
-| `src/stipple/link-pipeline.ts` | Owns the link compute pass: shader module, compute pipeline, params uniform, ping-pong read bind groups (A/B), and the output buffer (`linksBuffer` in Step 1, `linkCurves` from Step 2). |
+| `src/stipple/link-pipeline.ts` | Owns the link compute pass: shader module, compute pipeline, params uniform, ping-pong read bind groups (A/B), the output buffer (`linksBuffer` in Step 1, `linkCurves` from Step 2), and the dedup / chain-filter working buffers (Steps 1b/1c). |
 | `src/stipple/shaders/link-shader.ts` | WGSL compute shader. Includes `SDF_COMMON`, duplicates `GridParams` (same as relax/shading — WGSL has no cross-module struct import). Exports `LINK_SHADER` (Step 1) and later `buildLinkShader(...)` (Step 2+) — constants are defined directly in the WGSL (see decision 8). |
 | `src/stipple/link-render-pipeline.ts` | Owns the link render pipeline: shader module, render pipeline, uniform buffer, and bind group. From Step 3, no ping-pong bind groups (the curve buffer is not ping-ponged). |
 | `src/stipple/shaders/link-render-shader.ts` | WGSL vertex/fragment shader. Step 1: `line-list` topology, reads point buffer + links buffer. Step 2: reads `linkCurves` buffer. Step 3: camera-facing quads. Step 4: occlusion culling. |
@@ -520,6 +603,35 @@ rendered segments drops (edges = distinct targets). If lines become too
 sparse, revisit the winner criterion (best-continuation election, see
 *Switch points*).
 
+### Step 1c — Chain-length filtering and splitting
+
+**Goal:** keep polylines within a length band — drop chains shorter
+than `MIN_CHAIN_EDGES` and bisect longer chains at their mid-most link
+so no rendered polyline exceeds `MAX_CHAIN_EDGES`. See decision 10.
+
+**Changes:**
+- `link-shader.ts`: adds three entries — `link_prev_scatter_cs`
+  (`prev[links[i]] = i`), `link_filter_measure_cs` (per-edge min / mid
+  / cycle rules via bounded chases, writes `keep[i]`), and
+  `link_filter_apply_cs` (own-slot `links[i] = UINT_MAX` for dropped
+  edges, plus a fused `prev` clear for the next round). The dedup
+  dispatch additionally clears `prev` before round 1. New WGSL consts
+  `MIN_CHAIN_EDGES`, `MAX_CHAIN_EDGES`, `CHAIN_CHASE_BUDGET` with a
+  `const_assert` sanity check (decision 8).
+- `link-pipeline.ts`: creates the internal `prevBuffer` and `keepBuffer`
+  (`u32 × point_count`, `STORAGE`) and grows `dispatch` to one compute
+  pass with `3 + 3 · CHAIN_FILTER_ROUNDS` dispatches
+  (`CHAIN_FILTER_ROUNDS = 4`, a TS constant): owner clear → scan+elect
+  → dedup (+ fused `prev` clear), then per round: prev scatter →
+  measure → apply.
+- `main.ts`: unchanged — the `dispatch` signature and call site stay
+  the same.
+
+**Verify:** `npm run dev`. No orphan single-link segments; long lines
+are split into roughly even pieces of at most `MAX_CHAIN_EDGES` links;
+closed loops open at their smallest-index member (mutual-link pairs
+disappear); `npm run lint` clean.
+
 ### Step 2 — Curve subdivision + projected line-list render
 
 **Goal:** make lines follow the surface curvature by subdividing each
@@ -672,6 +784,7 @@ checkpoint to:
 |---|---|
 | 1 | Lines appear connecting nearby points, roughly orthogonal to the light direction. Lines fade when both endpoints are occluded. Connections look sensible (not random). |
 | 1b | No fans/stars at popular targets: every point has at most one incoming and one outgoing edge, so links form chains. Segment count drops (edges = distinct targets) but lines stay dense enough. |
+| 1c | No orphan single-link segments; long lines split into roughly even pieces of at most `MAX_CHAIN_EDGES` links; closed loops open at their smallest-index member (mutual-link pairs gone). |
 | 2 | Lines curve along the surface in high-curvature regions instead of cutting through. No visible penetration of the SDF surface. |
 | 3 | Lines have visible width with smooth anti-aliased edges. Width foreshortens with viewing angle. Billboard behavior correct when rotating. |
 | 4 | Lines on the far side of the shape are culled. Soft fade near silhouette edges. No lines visible through the surface. |
@@ -698,9 +811,19 @@ checkpoint to:
   source index)` `atomicMin` key, so the suitor whose edge best continues
   the line through the target wins (smoother polylines through kinks
   than an arbitrary index tie-break).
-- **Mutual-link dedup** — if mutual links (i→j and j→i) cause visual
-  artifacts, add a canonicalization pass that keeps only `min(i, j)` as
-  the link source.
+- **Exact chain ranking** — chains longer than
+  `2 × CHAIN_CHASE_BUDGET + 1` edges (97 at the default) and cycles with
+  more members than the chase budget are left uncut because no edge can
+  see both chain ends (or the whole loop). Pointer-doubling list ranking
+  (~13 N-sized passes) would compute exact per-point chain distances and
+  lift the bound entirely; not worth it at current stipple density.
+- **Raising MIN_CHAIN_EDGES** — the min rule is an O(1) check for
+  `MIN = 2` (single-link detection via `prev` / `links`); thresholds
+  above 2 need a forward-chase extension measuring the chain length per
+  edge.
+- **World-length chain metric** — the filters count links; accumulating
+  segment lengths during the same chases would instead measure polylines
+  in world units, if perceptual length matters more than link count.
 - **Runtime-tunable parameters** — promote `DISTANCE_WEIGHT`,
   `LINK_HALF_WIDTH`, `LINK_COLOR`, `LINK_ALPHA`, `N_SEGMENTS` to uniform
   buffer fields (or a GUI) for live experimentation.
