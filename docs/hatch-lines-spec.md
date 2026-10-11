@@ -341,12 +341,17 @@ path, and is then dropped, so mutual links are filtered out entirely
 (superseding decision 9's tolerance).
 
 **Race discipline.** A dispatch that mutates `links` must not run while
-peers chase through it, so every round is three own-slot-safe
+peers chase through it, so every round is three conflict-free
 dispatches: (1) **scatter** — reads stable `links`, writes `prev`;
 (2) **measure** — reads stable `links` + `prev`, writes only `keep[i]`;
-(3) **apply** — own-slot `links[i] = UINT_MAX` when `keep[i] == 0`,
-plus a fused `prev[i] = UINT_MAX` clear for the next round (the dedup
-dispatch clears `prev` the same way before round 1).
+(3) **apply** — when `keep[i] == 0`, read `links[i]` and, if it is
+valid, clear the cut **target's** slot, `prev[links[i]] = UINT_MAX`
+(guarded on `links[i] != UINT_MAX`), before own-slot nulling
+`links[i] = UINT_MAX`. The target loses its only incoming edge and
+scatter cannot refresh a slot no edge points to, so the cutter must
+clear it; the dropper's own `prev` stays valid and is rewritten by the
+next scatter. The dedup dispatch clears every `prev` slot wholesale
+before round 1 (a full clear of never-written data).
 
 **Cost.** Two extra buffers (`prev`, `keep`; 24 KB each) and
 `3 + 3R = 15` N-sized dispatches per frame, with at most
@@ -613,9 +618,11 @@ so no rendered polyline exceeds `MAX_CHAIN_EDGES`. See decision 10.
 - `link-shader.ts`: adds three entries — `link_prev_scatter_cs`
   (`prev[links[i]] = i`), `link_filter_measure_cs` (per-edge min / mid
   / cycle rules via bounded chases, writes `keep[i]`), and
-  `link_filter_apply_cs` (own-slot `links[i] = UINT_MAX` for dropped
-  edges, plus a fused `prev` clear for the next round). The dedup
-  dispatch additionally clears `prev` before round 1. New WGSL consts
+  `link_filter_apply_cs` (for dropped edges: read `links[i]` and, if
+  valid, clear the cut target's `prev[links[i]] = UINT_MAX`, then
+  own-slot `links[i] = UINT_MAX`; the target's slot must be cleared
+  because scatter cannot refresh it). The dedup dispatch additionally
+  clears every `prev` slot wholesale before round 1. New WGSL consts
   `MIN_CHAIN_EDGES`, `MAX_CHAIN_EDGES`, `CHAIN_CHASE_BUDGET` with a
   `const_assert` sanity check (decision 8).
 - `link-pipeline.ts`: creates the internal `prevBuffer` and `keepBuffer`
