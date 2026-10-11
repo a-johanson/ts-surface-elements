@@ -3,9 +3,9 @@
  *
  * Left-button drag orbits the camera around an adjustable target point
  * using spherical coordinates (azimuth + elevation). Mouse wheel adjusts
- * the orbit radius (zoom). Holding Q or E moves the target point down or
- * up along the world y axis. Right-click is left untouched so the
- * browser context menu remains available.
+ * the orbit radius (zoom). Holding A/D, W/S, or Q/E moves the target
+ * point along the world x, z, and y axes. Right-click is left untouched
+ * so the browser context menu remains available.
  *
  * The controls are passive — they only maintain spherical and target
  * state. The caller is responsible for invoking {@link update} each
@@ -40,20 +40,28 @@ const MAX_RADIUS = 30;
 /** Clamp elevation to just under ±π/2 to avoid gimbal lock. */
 const MAX_ELEVATION = Math.PI / 2 - 0.01;
 
-/** Physical key that lowers the target along the y axis while held. */
-const LOWER_TARGET_KEY = "KeyQ";
+/**
+ * World-space unit direction the target moves per held physical key:
+ * A/D along x, W/S along z (W pushes the target away from the viewer at
+ * the default azimuth), and Q/E along y.
+ */
+const TARGET_KEYS: Readonly<Record<string, readonly [number, number, number]>> = {
+    KeyA: [-1, 0, 0],
+    KeyD: [1, 0, 0],
+    KeyW: [0, 0, -1],
+    KeyS: [0, 0, 1],
+    KeyQ: [0, -1, 0],
+    KeyE: [0, 1, 0],
+};
 
-/** Physical key that raises the target along the y axis while held. */
-const RAISE_TARGET_KEY = "KeyE";
-
-/** Target movement speed along the y axis, in world units per second. */
+/** Target movement speed, in world units per second. */
 const TARGET_MOVE_SPEED = 1.5;
 
-/** Minimum target y position. */
-const TARGET_MIN_Y = -3;
+/** Minimum target position per world axis. */
+const TARGET_MIN: readonly [number, number, number] = [-3, -3, -3];
 
-/** Maximum target y position. */
-const TARGET_MAX_Y = 3;
+/** Maximum target position per world axis. */
+const TARGET_MAX: readonly [number, number, number] = [3, 3, 3];
 
 /**
  * Maintains spherical camera state and the adjustable target point, and
@@ -69,8 +77,7 @@ export class OrbitControls {
     private elevation: number;
     private radius: number;
     private target: [number, number, number];
-    private lowerTargetHeld: boolean = false;
-    private raiseTargetHeld: boolean = false;
+    private readonly heldTargetKeys: Set<string> = new Set();
     private dragging: boolean = false;
     private lastX: number = 0;
     private lastY: number = 0;
@@ -139,24 +146,17 @@ export class OrbitControls {
             if (e.ctrlKey || e.metaKey || e.altKey) {
                 return;
             }
-            if (e.code === LOWER_TARGET_KEY) {
-                this.lowerTargetHeld = true;
-            } else if (e.code === RAISE_TARGET_KEY) {
-                this.raiseTargetHeld = true;
+            if (e.code in TARGET_KEYS) {
+                this.heldTargetKeys.add(e.code);
             }
         };
 
         this.onKeyUp = (e: KeyboardEvent): void => {
-            if (e.code === LOWER_TARGET_KEY) {
-                this.lowerTargetHeld = false;
-            } else if (e.code === RAISE_TARGET_KEY) {
-                this.raiseTargetHeld = false;
-            }
+            this.heldTargetKeys.delete(e.code);
         };
 
         this.onBlur = (): void => {
-            this.lowerTargetHeld = false;
-            this.raiseTargetHeld = false;
+            this.heldTargetKeys.clear();
         };
 
         canvas.addEventListener("pointerdown", this.onPointerDown);
@@ -171,24 +171,40 @@ export class OrbitControls {
     /**
      * Advances held-key target movement over the elapsed frame time.
      *
-     * While the Q or E key is held, the target moves down or up the
-     * world y axis at a fixed speed, clamped to a bounded range. Call
-     * once per frame, before reading {@link getEye} or {@link getTarget}.
+     * While A/D, W/S, or Q/E is held, the target moves along the world
+     * x, z, or y axis at a fixed speed, clamped to a per-axis bounded
+     * range. Call once per frame, before reading {@link getEye}
+     * or {@link getTarget}.
      *
      * @param dt - Elapsed wall-clock time in seconds.
      */
     public update(dt: number): void {
+        let dx = 0;
         let dy = 0;
-        if (this.lowerTargetHeld) {
-            dy -= TARGET_MOVE_SPEED * dt;
+        let dz = 0;
+        for (const code of this.heldTargetKeys) {
+            const direction = TARGET_KEYS[code];
+            dx += direction[0];
+            dy += direction[1];
+            dz += direction[2];
         }
-        if (this.raiseTargetHeld) {
-            dy += TARGET_MOVE_SPEED * dt;
+        if (dx === 0 && dy === 0 && dz === 0) {
+            return;
         }
-        if (dy !== 0) {
-            const y = this.target[1] + dy;
-            this.target[1] = Math.max(TARGET_MIN_Y, Math.min(TARGET_MAX_Y, y));
-        }
+
+        const step = TARGET_MOVE_SPEED * dt;
+        this.target[0] = Math.max(
+            TARGET_MIN[0],
+            Math.min(TARGET_MAX[0], this.target[0] + dx * step),
+        );
+        this.target[1] = Math.max(
+            TARGET_MIN[1],
+            Math.min(TARGET_MAX[1], this.target[1] + dy * step),
+        );
+        this.target[2] = Math.max(
+            TARGET_MIN[2],
+            Math.min(TARGET_MAX[2], this.target[2] + dz * step),
+        );
     }
 
     /**
