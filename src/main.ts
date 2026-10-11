@@ -21,8 +21,10 @@ const CLEAR_COLOR: GPUColorDict = {
 
 /** Camera parameters. */
 const FIELD_OF_VIEW = (45 * Math.PI) / 180;
-const TARGET: readonly [number, number, number] = [0, 0, 0];
 const UP: readonly [number, number, number] = [0, 1, 0];
+
+/** Initial orbit target point — the orbit center and look-at target. */
+const TARGET: readonly [number, number, number] = [0, 0, 0];
 
 /** Number of stipple points. */
 const POINT_COUNT = 6 * 1024;
@@ -56,13 +58,13 @@ const DRAW_DEBUG = false;
  * canvas tracks the viewport and its backing store is re-synced to the
  * CSS size (with `devicePixelRatio`) every frame.
  */
-const FIXED_CANVAS_SIZE = false;
+const FIXED_CANVAS_SIZE = true;
 
 /**
  * Fixed canvas height in pixels — the long side of the portrait canvas.
  * Only used when {@link FIXED_CANVAS_SIZE} is enabled.
  */
-const CANVAS_HEIGHT = 2000;
+const CANVAS_HEIGHT = 4000;
 
 /**
  * Fixed canvas width in pixels, derived from {@link CANVAS_HEIGHT} for
@@ -122,7 +124,8 @@ function getCanvas(): HTMLCanvasElement {
  *
  * Each frame:
  * 1. Syncs the canvas size unless the canvas has a fixed size.
- * 2. Computes the capped wall-clock delta.
+ * 2. Computes the capped wall-clock delta and advances the orbit camera
+ *    (held-key target movement).
  * 3. While time is playing, accumulates animation time, dispatches the
  *    reproject compute pass to re-project points onto the current
  *    animated surface and refresh the shared normals buffer, builds the
@@ -188,7 +191,9 @@ function startFrameLoop(
         const dt = Math.min(now - lastNow, MAX_DT);
         lastNow = now;
 
+        controls.update(dt);
         const eye = controls.getEye();
+        const target = controls.getTarget();
 
         const encoder = device.createCommandEncoder();
 
@@ -244,9 +249,9 @@ function startFrameLoop(
         });
 
         if (DRAW_DEBUG) {
-            debugRender.render(pass, eye, gpu.canvas, time);
+            debugRender.render(pass, eye, target, gpu.canvas, time);
         }
-        pointRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
+        pointRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
 
         pass.end();
 
@@ -274,7 +279,6 @@ async function bootstrap(): Promise<void> {
 
     const cameraConfig: CameraConfig = {
         fov: FIELD_OF_VIEW,
-        target: TARGET,
         up: UP,
     };
 
@@ -295,6 +299,7 @@ async function bootstrap(): Promise<void> {
         azimuth: 0.0,
         elevation: 0.5,
         radius: 8,
+        target: TARGET,
     });
     const timeControls = new TimeControls();
     const frameCapture = new FrameCapture(canvas);

@@ -51,7 +51,7 @@ export class DebugRenderPipeline {
      * uniform buffers, and bind groups.
      *
      * @param device - The GPU device.
-     * @param config - Static camera configuration (FOV, target, up).
+     * @param config - Static camera configuration (FOV, up).
      * @param format - The canvas texture format (e.g. `bgra8unorm`).
      * @param bbox - The scene bounding box drawn as a wireframe overlay.
      */
@@ -139,8 +139,8 @@ export class DebugRenderPipeline {
      * Writes the camera rays uniform for the current frame.
      *
      * Computes forward/right/up basis vectors and half-FOV extents from
-     * the eye position, target, up vector, FOV, and canvas aspect ratio.
-     * Packs the result into five 16-byte aligned struct members:
+     * the eye position, target point, up vector, FOV, and canvas aspect
+     * ratio. Packs the result into five 16-byte aligned struct members:
      *   `eye: vec3f + half_width: f32`,
      *   `forward: vec3f + half_height: f32`,
      *   `right: vec3f + _pad0: f32`,
@@ -148,17 +148,19 @@ export class DebugRenderPipeline {
      *   `resolution: vec2u + _pad2: vec2u`.
      *
      * @param eye - Camera eye position [x, y, z].
+     * @param target - Look-at target point [x, y, z].
      * @param width - Canvas backing-store width.
      * @param height - Canvas backing-store height.
      * @param time - Current animation time in seconds.
      */
     private writeCamera(
         eye: readonly [number, number, number],
+        target: readonly [number, number, number],
         width: number,
         height: number,
         time: number,
     ): void {
-        const { target, up, fov } = this.config;
+        const { up, fov } = this.config;
 
         let fx = target[0] - eye[0];
         let fy = target[1] - eye[1];
@@ -233,17 +235,19 @@ export class DebugRenderPipeline {
      *   `bbox_max: vec3f + _pad1: f32`.
      *
      * @param eye - Camera eye position [x, y, z].
+     * @param target - Look-at target point [x, y, z].
      * @param width - Canvas backing-store width.
      * @param height - Canvas backing-store height.
      */
     private writeBBox(
         eye: readonly [number, number, number],
+        target: readonly [number, number, number],
         width: number,
         height: number,
     ): void {
         const viewProj = viewProjection(
             eye,
-            this.config.target,
+            target,
             this.config.up,
             this.config.fov,
             width / height,
@@ -271,6 +275,7 @@ export class DebugRenderPipeline {
      *
      * @param pass - The active render pass encoder.
      * @param eye - Camera eye position [x, y, z].
+     * @param target - Look-at target point [x, y, z].
      * @param canvas - The canvas whose backing-store size determines the
      *   ray direction per fragment.
      * @param time - Current animation time in seconds.
@@ -278,11 +283,12 @@ export class DebugRenderPipeline {
     public render(
         pass: GPURenderPassEncoder,
         eye: readonly [number, number, number],
+        target: readonly [number, number, number],
         canvas: HTMLCanvasElement,
         time: number,
     ): void {
-        this.writeCamera(eye, canvas.width, canvas.height, time);
-        this.writeBBox(eye, canvas.width, canvas.height);
+        this.writeCamera(eye, target, canvas.width, canvas.height, time);
+        this.writeBBox(eye, target, canvas.width, canvas.height);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, this.bindGroup);
         pass.draw(6);
