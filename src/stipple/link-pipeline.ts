@@ -1,18 +1,32 @@
 /**
  * Link compute pipeline — connects each stipple point to its
- * best-aligned neighbor along the principal direction.
+ * best-aligned neighbor along the principal direction, canonicalized by
+ * target.
  *
- * Each frame, {@link dispatch} records a single compute pass after the
- * shading pass: one invocation per point scans the 27-cell neighborhood
- * of its spatial grid cell (the grid must have been rebuilt from the
- * post-relax positions first), scores each candidate neighbor by
- * alignment with the principal direction discounted by distance, and
- * writes the winning neighbor index — or `UINT_MAX` when no valid
- * neighbor exists — into the shared {@link LinkPipeline.linksBuffer}.
+ * Each frame, {@link dispatch} records one compute pass with three
+ * dispatches, run after the post-relax spatial grid rebuild:
  *
- * Ping-pong: the pass reads from one point buffer (depending on
- * `readFromA` — the buffer relax most recently wrote) and writes only the
- * links buffer (not ping-ponged). Two static bind-group sets cover both
+ *  1. **Owner clear** — resets the `owners` buffer to `UINT_MAX`.
+ *  2. **Scan + elect** — one invocation per point scans the 27-cell
+ *     neighborhood of its spatial grid cell, scores each candidate
+ *     neighbor by alignment with the principal direction discounted by
+ *     distance, writes the winning neighbor index — or `UINT_MAX` when
+ *     no valid neighbor exists — into the shared
+ *     {@link LinkPipeline.linksBuffer}, and elects each target's owner
+ *     via `atomicMin` (after the dispatch, `owners[j]` is the smallest
+ *     source index targeting `j`).
+ *  3. **Dedup** — one invocation per point clears the link of every
+ *     source that lost its target's owner election, so each point keeps
+ *     at most one incoming edge (decision 9 in the hatch-lines spec) and
+ *     the surviving graph is a union of paths and cycles.
+ *
+ * WebGPU orders dispatches within a compute pass, so each stage's
+ * writes are visible to the next without explicit barriers.
+ *
+ * Ping-pong: the scan reads from one point buffer (depending on
+ * `readFromA` — the buffer relax most recently wrote); the clear and
+ * dedup stages touch only the shared links and owners buffers (neither
+ * is ping-ponged). Three static bind-group sets cover the ping-pong
  * read directions.
  */
 
@@ -37,7 +51,7 @@ const LINK_ENTRY_BYTES = 4;
 /**
  * WGSL sentinel for "no link" — matches `UINT_MAX` in the link shader.
  */
-const UINT_MAX = 0xFFFFFFFF;
+const UINT_MAX = 0xffffffff;
 
 /**
  * Manages the link compute pipeline, its params uniform, the shared
@@ -63,6 +77,18 @@ export class LinkPipeline {
     private readonly paramsBuffer: GPUBuffer;
     private readonly bindGroupA: GPUBindGroup;
     private readonly bindGroupB: GPUBindGroup;
+    private readonly clearPipeline: GPUComputePipeline;
+    private readonly clearBindGroup: GPUBindGroup;
+    private readonly dedupPipeline: GPUComputePipeline;
+    private readonly dedupBindGroup: GPUBindGroup;
+
+    /**
+     * Shared per-target owner buffer (not ping-ponged, internal): after
+     * the election dispatch, `owners[j]` is the smallest source index
+     * targeting `j`, or `UINT_MAX` when no source targets `j`. Cleared
+     * to `UINT_MAX` at the start of every dispatch.
+     */
+    private readonly ownersBuffer: GPUBuffer;
 
     /**
      * Creates the shader module, compute pipeline, params uniform
@@ -88,6 +114,12 @@ export class LinkPipeline {
         new Uint32Array(this.linksBuffer.getMappedRange()).fill(UINT_MAX);
         this.linksBuffer.unmap();
 
+        this.ownersBuffer = device.createBuffer({
+            label: "stipple-link-owners",
+            size: points.count * LINK_ENTRY_BYTES,
+            usage: GPUBufferUsage.STORAGE,
+        });
+
         const module = device.createShaderModule({
             label: "stipple-link-shader",
             code: LINK_SHADER,
@@ -101,8 +133,26 @@ export class LinkPipeline {
                 entryPoint: "link_cs",
             },
         });
+        this.clearPipeline = device.createComputePipeline({
+            label: "stipple-link-owners-clear-pipeline",
+            layout: "auto",
+            compute: {
+                module,
+                entryPoint: "link_owner_clear_cs",
+            },
+        });
+        this.dedupPipeline = device.createComputePipeline({
+            label: "stipple-link-dedup-pipeline",
+            layout: "auto",
+            compute: {
+                module,
+                entryPoint: "link_dedup_cs",
+            },
+        });
 
         this.layout = this.pipeline.getBindGroupLayout(0);
+        const clearLayout = this.clearPipeline.getBindGroupLayout(0);
+        const dedupLayout = this.dedupPipeline.getBindGroupLayout(0);
 
         this.paramsBuffer = device.createBuffer({
             label: "stipple-link-params",
@@ -122,6 +172,7 @@ export class LinkPipeline {
                 { binding: 5, resource: { buffer: grid.cellStart } },
                 { binding: 6, resource: { buffer: grid.cellCount } },
                 { binding: 7, resource: { buffer: this.linksBuffer } },
+                { binding: 8, resource: { buffer: this.ownersBuffer } },
             ],
         });
         this.bindGroupB = device.createBindGroup({
@@ -136,6 +187,25 @@ export class LinkPipeline {
                 { binding: 5, resource: { buffer: grid.cellStart } },
                 { binding: 6, resource: { buffer: grid.cellCount } },
                 { binding: 7, resource: { buffer: this.linksBuffer } },
+                { binding: 8, resource: { buffer: this.ownersBuffer } },
+            ],
+        });
+
+        this.clearBindGroup = device.createBindGroup({
+            label: "stipple-link-owners-clear-bind",
+            layout: clearLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.paramsBuffer } },
+                { binding: 1, resource: { buffer: this.ownersBuffer } },
+            ],
+        });
+        this.dedupBindGroup = device.createBindGroup({
+            label: "stipple-link-dedup-bind",
+            layout: dedupLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.paramsBuffer } },
+                { binding: 7, resource: { buffer: this.linksBuffer } },
+                { binding: 8, resource: { buffer: this.ownersBuffer } },
             ],
         });
     }
@@ -158,15 +228,17 @@ export class LinkPipeline {
     }
 
     /**
-     * Records a link compute pass into the given command encoder.
+     * Records the link compute stages into the given command encoder as
+     * one compute pass with three dispatches: owner clear → scan+elect →
+     * dedup.
      *
-     * Reads from one point buffer (depending on `readFromA`) — this must
-     * match the buffer relax most recently wrote — plus the shared
-     * normals buffer and the spatial grid rebuilt from that same buffer.
-     * Writes the best-neighbor indices into the shared links buffer.
-     * Should be called after the shading pass (which refreshes the
-     * normals buffer from the post-relax positions) and before the
-     * render pass.
+     * The scan reads from one point buffer (depending on `readFromA`) —
+     * this must match the buffer relax most recently wrote — plus the
+     * shared normals buffer and the spatial grid rebuilt from that same
+     * buffer. Writes the deduplicated best-neighbor indices into the
+     * shared links buffer. Should be called after the shading pass
+     * (which refreshes the normals buffer from the post-relax
+     * positions) and before the render pass.
      *
      * @param encoder - The command encoder to record into.
      * @param time - Current animation time in seconds.
@@ -180,9 +252,19 @@ export class LinkPipeline {
         const workgroupCount = Math.ceil(this.points.count / WORKGROUP_SIZE);
 
         const pass = encoder.beginComputePass();
+
+        pass.setPipeline(this.clearPipeline);
+        pass.setBindGroup(0, this.clearBindGroup);
+        pass.dispatchWorkgroups(workgroupCount);
+
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, readFromA ? this.bindGroupA : this.bindGroupB);
         pass.dispatchWorkgroups(workgroupCount);
+
+        pass.setPipeline(this.dedupPipeline);
+        pass.setBindGroup(0, this.dedupBindGroup);
+        pass.dispatchWorkgroups(workgroupCount);
+
         pass.end();
     }
 }

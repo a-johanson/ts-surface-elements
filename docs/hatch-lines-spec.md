@@ -41,9 +41,10 @@ point render so points sit on top.
 - **Luminance modulation** — lines do not darken in shadow in v1
   (luminance is computed by the shading pass but not consumed by the link
   renderer). Can be added once the basic rendering looks right.
-- **Dedup of mutual links** — if point `i` links to `j` and `j` links to
-  `i`, both segments render. Dedup is not needed for correctness and may
-  even look denser/nicer; revisit if it causes visual artifacts.
+- **Dedup of mutual links** — target dedup (decision 9) bounds every
+  point's degree to ≤ 2, but a mutual pair (i→j and j→i) still renders
+  both segments as a tiny 2-cycle. Not needed for correctness; revisit
+  if it causes visual artifacts.
 - **Depth testing** — no depth attachment; occlusion is resolved via
   `rayClearance` toward the eye (Step 4), not via the rasterizer's depth
   buffer.
@@ -242,14 +243,40 @@ runtime tuning is needed.
 
 These can be promoted to uniforms later if runtime tuning is needed.
 
-### 9. No mutual-link dedup
+### 9. Target dedup: at most one incoming edge per point (owner election)
 
-If point `i` links to `j` and `j` links to `i`, both segments are drawn.
-This is intentional — it produces denser, more organic-looking lines, and
-the overlap is visually harmless since the segments are nearly coincident.
-Dedup would require either a second pass to canonicalize pairs or an
-atomic compare-and-swap protocol, both of which add complexity for no
-visual benefit. Revisit if mutual links cause visual artifacts.
+Without dedup, every point has at most one **outgoing** edge (its own
+best-neighbor pick) but unbounded **incoming** edges — popular targets
+become fans/stars, which destroys the polyline reading. The link stage
+canonicalizes by target so each point has at most one incoming edge;
+combined with the single outgoing edge, every point's degree is ≤ 2 and
+the surviving graph is a disjoint union of paths and cycles — the
+hatch-line/streamline topology.
+
+**Mechanism (owner election).** Chosen over radix-sorting the
+`(target, source)` edge pairs and keeping the first edge of each
+equal-target run: a stable sort of source-ordered edges keeps the
+smallest source index first, and `atomicMin` elects exactly that winner
+with ~10× less memory traffic, no single-workgroup serialization, and
+no extra sort machinery. Three dispatches inside one compute pass:
+
+1. Clear `owners` to `UINT_MAX`.
+2. The link compute scan writes `links[i] = best_j` and, for valid
+   links, `atomicMin(&owners[best_j], i)` — after the dispatch,
+   `owners[j]` is the smallest source index targeting `j`.
+3. The dedup pass clears `links[i]` to `UINT_MAX` when
+   `owners[links[i]] != i`.
+
+All three run inside `LinkPipeline.dispatch` (one compute pass, three
+dispatches — WebGPU orders dispatches within a pass, so each stage's
+writes are visible to the next), so `main.ts` is unchanged. Winner
+criterion: smallest source index (deterministic). Mutual links (2-cycles
+i↔j) still render both segments — tolerated (denser, more organic look,
+segments nearly coincident).
+
+**Cost.** Two extra N-sized dispatches plus one atomic per point —
+~120 KB traffic, no contention hot spots. Negligible next to the
+shading pass.
 
 ## Architecture & data flow
 
@@ -266,6 +293,8 @@ grid rebuild (from post-relax buffer)          ← NEW (reuses SpatialGridPipeli
 link compute (scan + subdivide + project)      ← NEW — writes linkCurves buffer
    │  reads: points[readFromA], normalsBuffer, grid buffers
    │  writes: linkCurves (not ping-ponged)
+   │  internally: owner clear → scan+elect (atomicMin) → dedup
+   │  (one compute pass, three dispatches — decision 9)
    │
    ▼
 render pass:
@@ -316,6 +345,7 @@ pass.end();
 | Buffer | Size | Usage | Owner / writer |
 |---|---|---|---|
 | `linksBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (compute, once per frame) |
+| `ownersBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (compute: clear + atomicMin election + read in dedup, once per frame) |
 | `linkRenderUniform` | `80` B (`mat4x4f` + `vec3f` eye + pad) | `UNIFORM \| COPY_DST` | link-render-pipeline (CPU write per frame) |
 
 ### Step 2+ (subdivided curves)
@@ -360,12 +390,14 @@ connections with minimal rendering infrastructure.
   `linksBuffer` (`u32 × point_count`, `STORAGE`, pre-filled with
   `UINT_MAX` so a frame rendered before the link compute has ever
   dispatched — e.g. paused at startup — draws no lines instead of
-  linking every point to index 0), the compute pipeline, and two read
-  bind groups (A/B — reads `points.bufferA` or `bufferB`,
-  `normalsBuffer`, and the 4 grid buffers). `dispatch(encoder, time,
-  readFromA)` writes the params uniform (`time`, `point_count`) and
-  records one compute pass. `DISTANCE_WEIGHT` and `LINK_RADIUS` are
-  compile-time WGSL constants (decision 8).
+   linking every point to index 0), the compute pipeline, and two read
+   bind groups (A/B — reads `points.bufferA` or `bufferB`,
+   `normalsBuffer`, and the 4 grid buffers). `dispatch(encoder, time,
+   readFromA)` writes the params uniform (`time`, `point_count`) and
+   records one compute pass. `DISTANCE_WEIGHT` and `LINK_RADIUS` are
+   compile-time WGSL constants (decision 8). Step 1b adds the
+   `ownersBuffer`, the owner-clear and dedup pipelines, and the
+   three-dispatch pass — see below.
 - `src/stipple/shaders/link-render-shader.ts` — exports
   `LINK_RENDER_SHADER` (Step 1 variant: `line-list` topology).
 - `src/stipple/link-render-pipeline.ts` — `LinkRenderPipeline` class.
@@ -392,6 +424,7 @@ The compute shader includes `SDF_COMMON` and duplicates `GridParams`
 | 5 | storage, read `cell_start` | `array<u32>` |
 | 6 | storage, read `cell_count` | `array<u32>` |
 | 7 | storage, read_write `links_out` | `array<u32>` — best neighbor index or `UINT_MAX` |
+| 8 | storage, read_write `owners_elect` | `array<atomic<u32>>` — per-target elected source index (Step 1b owner election) |
 
 The neighbor scan mirrors the relax shader's 27-cell loop exactly (same
 cell recomputation, same `UINT_MAX` empty-cell sentinel, same thin-wall
@@ -455,6 +488,37 @@ camera and observe that lines fade when both endpoints are occluded
 anti-aliasing, no curvature following) but should confirm the
 neighbor-finding logic is working. If connections look random or missing,
 debug the scoring / principal direction computation before proceeding.
+
+### Step 1b — Target dedup (owner election)
+
+**Status:** completed.
+
+**Goal:** canonicalize links by target so each point has at most one
+incoming edge — with the single outgoing edge, degree ≤ 2 and the
+surviving graph becomes a union of paths and cycles instead of fans at
+popular targets. See decision 9.
+
+**Changes:**
+- `link-shader.ts`: adds `link_owner_clear_cs` (clears `owners` to
+  `UINT_MAX`) and `link_dedup_cs` (clears `links[i]` when
+  `owners[links[i]] != i`); `link_cs` gains the
+  `atomicMin(&owners[best_j], i)` election. The owners buffer is bound
+  at binding 8 in the scan (`atomic` read_write) and dedup (read)
+  entries, and at binding 1 in the clear entry — bindings may repeat
+  across entry points since each pipeline derives its layout from its
+  own entry point's statically used resources.
+- `link-pipeline.ts`: creates the `ownersBuffer` (`u32 × point_count`,
+  `STORAGE`, internal) and three compute pipelines from one shader
+  module. `dispatch` records one compute pass with three dispatches:
+  owner clear → scan+elect → dedup.
+- `main.ts`: unchanged — the `dispatch` signature and call site stay
+  the same.
+
+**Verify:** `npm run dev`. No fans/stars: every point has at most one
+incoming and one outgoing edge, so links form chains. The number of
+rendered segments drops (edges = distinct targets). If lines become too
+sparse, revisit the winner criterion (best-continuation election, see
+*Switch points*).
 
 ### Step 2 — Curve subdivision + projected line-list render
 
@@ -607,6 +671,7 @@ checkpoint to:
 | Step | How to confirm |
 |---|---|
 | 1 | Lines appear connecting nearby points, roughly orthogonal to the light direction. Lines fade when both endpoints are occluded. Connections look sensible (not random). |
+| 1b | No fans/stars at popular targets: every point has at most one incoming and one outgoing edge, so links form chains. Segment count drops (edges = distinct targets) but lines stay dense enough. |
 | 2 | Lines curve along the surface in high-curvature regions instead of cutting through. No visible penetration of the SDF surface. |
 | 3 | Lines have visible width with smooth anti-aliased edges. Width foreshortens with viewing angle. Billboard behavior correct when rotating. |
 | 4 | Lines on the far side of the shape are culled. Soft fade near silhouette edges. No lines visible through the surface. |
@@ -628,6 +693,11 @@ checkpoint to:
 - **Density modulation**: With hatching, we typically do not encode brightness via luminance modulation of the lines but via density 
   modulation. Maybe we can try to achieve that later by modulating the forces in the force kernel of the relax step by the luminance of
   the points so that points have less spacing in darker regions.
+- **Best-continuation link election** — replace the smallest-source-index
+  owner election with a packed `(quantized continuation-alignment score,
+  source index)` `atomicMin` key, so the suitor whose edge best continues
+  the line through the target wins (smoother polylines through kinks
+  than an arbitrary index tie-break).
 - **Mutual-link dedup** — if mutual links (i→j and j→i) cause visual
   artifacts, add a canonicalization pass that keeps only `min(i, j)` as
   the link source.

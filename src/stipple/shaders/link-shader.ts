@@ -1,27 +1,38 @@
 /**
  * Link compute shader — best-neighbor selection along the principal
- * direction.
+ * direction, canonicalized by target.
  *
- * One invocation per point `i`. The 27-cell neighborhood of point `i`'s
- * grid cell is scanned exactly as in the relax shader (same cell
- * recomputation, same `UINT_MAX` empty-cell sentinel, same thin-wall
- * filter). For each candidate neighbor `j` within `LINK_RADIUS`:
+ * One module, three entry points, dispatched in order within a single
+ * compute pass by `LinkPipeline` (WebGPU orders dispatches within a
+ * pass, so each stage's writes are visible to the next):
  *
- *  - pairs closer than `COINCIDENT_EPS` are skipped (the direction
- *    `diff / dist` is undefined at `dist == 0`)
- *  - pairs whose midpoint is deep inside the surface with opposing
- *    normals are skipped (likely opposite sides of a thin wall)
- *  - the principal direction is the unit vector in the tangent plane at
- *    `p_i` orthogonal to the light direction's tangent projection — hatch
- *    lines run "across the grain" of the lighting; when the light is
- *    nearly parallel to the normal (`|L_tan| < LINK_TAN_EPS`) no
- *    principal direction exists and the point gets no link
- *  - only the forward hemisphere is considered (`alignment > 0`) and the
- *    score `alignment - DISTANCE_WEIGHT * dist` trades alignment against
- *    proximity; the highest-scoring neighbor wins
+ *  1. `link_owner_clear_cs` — clears the `owners` buffer to `UINT_MAX`.
+ *  2. `link_cs` — one invocation per point `i`. The 27-cell neighborhood
+ *     of point `i`'s grid cell is scanned exactly as in the relax shader
+ *     (same cell recomputation, same `UINT_MAX` empty-cell sentinel, same
+ *     thin-wall filter). For each candidate neighbor `j` within
+ *     `LINK_RADIUS`:
  *
- * The output is one `u32` per point: the best neighbor index, or
- * `UINT_MAX` when no valid neighbor was found.
+ *      - pairs closer than `COINCIDENT_EPS` are skipped (the direction
+ *        `diff / dist` is undefined at `dist == 0`)
+ *      - pairs whose midpoint is deep inside the surface with opposing
+ *        normals are skipped (likely opposite sides of a thin wall)
+ *      - the principal direction is the unit vector in the tangent plane
+ *        at `p_i` orthogonal to the light direction's tangent projection
+ *        — hatch lines run "across the grain" of the lighting; when the
+ *        light is nearly parallel to the normal (`|L_tan| < LINK_TAN_EPS`)
+ *        no principal direction exists and the point gets no link
+ *      - only the forward hemisphere is considered (`alignment > 0`) and
+ *        the score `alignment - DISTANCE_WEIGHT * dist` trades alignment
+ *        against proximity; the highest-scoring neighbor wins
+ *
+ *     Writes `links[i] = best_j` (or `UINT_MAX`) and, for valid links,
+ *     elects the owner via `atomicMin(&owners[best_j], i)` — after the
+ *     pass, `owners[j]` is the smallest source index targeting `j`.
+ *  3. `link_dedup_cs` — one invocation per point: clears `links[i]` when
+ *     `owners[links[i]] != i`, so every point keeps at most one incoming
+ *     edge (decision 9 in the hatch-lines spec) and the surviving graph
+ *     is a union of paths and cycles.
  *
  * `GridParams` is duplicated here (WGSL has no cross-module struct
  * import) — it matches the layout in `cell-index-shader.ts` and
@@ -73,6 +84,31 @@ const COINCIDENT_EPS: f32 = 1e-7;
 @group(0) @binding(5) var<storage, read> cell_start: array<u32>;
 @group(0) @binding(6) var<storage, read> cell_count: array<u32>;
 @group(0) @binding(7) var<storage, read_write> links_out: array<u32>;
+@group(0) @binding(8) var<storage, read_write> owners_elect: array<atomic<u32>>;
+
+/**
+ * Owner buffer alias for the clear entry — same GPU buffer as
+ * owners_elect, bound at a slot unused by the scan. Bindings may
+ * repeat across entry points: each pipeline derives its layout from its
+ * own entry point's statically used resources.
+ */
+@group(0) @binding(1) var<storage, read_write> owners_reset: array<atomic<u32>>;
+
+/**
+ * Owner buffer alias for the dedup entry — read-only plain view of the
+ * same GPU buffer (the atomic writes of the election pass are visible
+ * after the inter-dispatch ordering within the compute pass).
+ */
+@group(0) @binding(8) var<storage, read> owners_in: array<u32>;
+
+@compute @workgroup_size(64)
+fn link_owner_clear_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+    atomicStore(&owners_reset[i], UINT_MAX);
+}
 
 @compute @workgroup_size(64)
 fn link_cs(@builtin(global_invocation_id) gid: vec3u) {
@@ -156,5 +192,26 @@ fn link_cs(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     links_out[i] = best_j;
+
+    // Owner election: the smallest source index targeting best_j wins.
+    // The dedup pass then clears every other suitor's link (decision 9
+    // in the hatch-lines spec).
+    if (best_j != UINT_MAX) {
+        atomicMin(&owners_elect[best_j], i);
+    }
+}
+
+@compute @workgroup_size(64)
+fn link_dedup_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let j = links_out[i];
+    if (j != UINT_MAX && owners_in[j] != i) {
+        // Another (smaller) source index owns j — drop this link.
+        links_out[i] = UINT_MAX;
+    }
 }
 `;
