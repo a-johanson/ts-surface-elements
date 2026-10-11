@@ -26,8 +26,6 @@ const UNIFORM_BUFFER_BYTES = 64;
 export interface CameraConfig {
     /** Vertical field of view in radians. */
     readonly fov: number;
-    /** Look-at target in world space. */
-    readonly target: readonly [number, number, number];
     /** World-space up direction. */
     readonly up: readonly [number, number, number];
 }
@@ -50,7 +48,7 @@ export class PointRenderPipeline {
      *
      * @param device - The GPU device.
      * @param points - The ping-pong point buffer pair.
-     * @param config - Static camera configuration (FOV, target, up).
+     * @param config - Static camera configuration (FOV, up).
      * @param format - The canvas texture format.
      */
     public constructor(
@@ -135,21 +133,17 @@ export class PointRenderPipeline {
      * Writes the view-projection matrix into the uniform buffer.
      *
      * @param eye - Camera eye position [x, y, z].
+     * @param target - Look-at target point [x, y, z].
      * @param canvas - The canvas whose backing-store size determines the
      *   projection aspect ratio.
      */
     private writeUniform(
         eye: readonly [number, number, number],
+        target: readonly [number, number, number],
         canvas: HTMLCanvasElement,
     ): void {
         const aspect = canvas.width / canvas.height;
-        const viewProj = viewProjection(
-            eye,
-            this.config.target,
-            this.config.up,
-            this.config.fov,
-            aspect,
-        );
+        const viewProj = viewProjection(eye, target, this.config.up, this.config.fov, aspect);
 
         const buffer = new ArrayBuffer(UNIFORM_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
@@ -166,6 +160,7 @@ export class PointRenderPipeline {
      *
      * @param pass - The active render pass encoder.
      * @param eye - Camera eye position [x, y, z].
+     * @param target - Look-at target point [x, y, z].
      * @param canvas - The canvas whose size determines the projection
      * aspect.
      * @param readFromBufferA - If `true`, reads from `bufferA`; else
@@ -176,11 +171,12 @@ export class PointRenderPipeline {
     public render(
         pass: GPURenderPassEncoder,
         eye: readonly [number, number, number],
+        target: readonly [number, number, number],
         canvas: HTMLCanvasElement,
         readFromBufferA: boolean,
         instanceCount: number,
     ): void {
-        this.writeUniform(eye, canvas);
+        this.writeUniform(eye, target, canvas);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, readFromBufferA ? this.bindGroupA : this.bindGroupB);
         pass.draw(6, instanceCount);

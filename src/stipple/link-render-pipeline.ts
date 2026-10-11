@@ -46,7 +46,7 @@ export class LinkRenderPipeline {
      * @param points - The ping-pong point buffer pair.
      * @param links - The shared links buffer written by the link compute
      *   pass.
-     * @param config - Static camera configuration (FOV, target, up).
+     * @param config - Static camera configuration (FOV, up).
      * @param format - The canvas texture format.
      */
     public constructor(
@@ -133,21 +133,17 @@ export class LinkRenderPipeline {
      * uniform buffer.
      *
      * @param eye - Camera eye position [x, y, z].
+     * @param target - Look-at target point [x, y, z].
      * @param canvas - The canvas whose backing-store size determines the
      *   projection aspect ratio.
      */
     private writeUniform(
         eye: readonly [number, number, number],
+        target: readonly [number, number, number],
         canvas: HTMLCanvasElement,
     ): void {
         const aspect = canvas.width / canvas.height;
-        const viewProj = viewProjection(
-            eye,
-            this.config.target,
-            this.config.up,
-            this.config.fov,
-            aspect,
-        );
+        const viewProj = viewProjection(eye, target, this.config.up, this.config.fov, aspect);
 
         const buffer = new ArrayBuffer(UNIFORM_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
@@ -167,6 +163,7 @@ export class LinkRenderPipeline {
      *
      * @param pass - The active render pass encoder.
      * @param eye - Camera eye position [x, y, z].
+     * @param target - Look-at target point [x, y, z].
      * @param canvas - The canvas whose size determines the projection
      *   aspect.
      * @param readFromBufferA - If `true`, reads from `bufferA`; else
@@ -177,11 +174,12 @@ export class LinkRenderPipeline {
     public render(
         pass: GPURenderPassEncoder,
         eye: readonly [number, number, number],
+        target: readonly [number, number, number],
         canvas: HTMLCanvasElement,
         readFromBufferA: boolean,
         instanceCount: number,
     ): void {
-        this.writeUniform(eye, canvas);
+        this.writeUniform(eye, target, canvas);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, readFromBufferA ? this.bindGroupA : this.bindGroupB);
         pass.draw(2, instanceCount);

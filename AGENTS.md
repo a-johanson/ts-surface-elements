@@ -8,7 +8,7 @@ Use this section to orient before opening files. It describes module **responsib
 
 * `src/main.ts` is the application entrypoint. It resolves the canvas, initializes WebGPU, creates the pipelines and orbit camera, submits a one-shot seed dispatch, and runs the frame loop that shades and renders the points every frame and — while time is playing — reprojects, builds the spatial grid, and relaxes, fulfilling pending frame exports after presenting. It computes a capped wall-clock animation time that threads through all per-frame pipelines.
 * `src/webgpu.ts` owns WebGPU initialization and canvas sizing. It exports the `GpuContext` interface bundling the device, canvas context, format, and canvas element.
-* `src/orbit-controls.ts` owns the orbit camera — a mouse-driven spherical camera (drag to rotate, wheel to zoom) that exposes the eye position for view-matrix construction.
+* `src/orbit-controls.ts` owns the orbit camera — a mouse- and keyboard-driven spherical camera (drag to rotate, wheel to zoom, WASD/Q/E to move the target) that owns the adjustable orbit-center/look-at target point and exposes both the eye position and target point for view-matrix construction.
 * `src/time-controls.ts` owns animation-time playback — a window-level keyboard toggle that flips a playing flag the frame loop reads to gate the simulation passes.
 * `src/frame-capture.ts` owns still-image export — a window-level keyboard trigger whose requests the frame loop fulfills after presenting, serializing the canvas to a downloadable PNG.
 * `src/stipple` owns the surface-stippling pipeline — distributing points on the surface of a time-animated SDF scene. Data flow is one-directional: seed → reproject → spatial grid build → relax → shade → render.
