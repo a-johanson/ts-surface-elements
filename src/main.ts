@@ -58,7 +58,7 @@ const DRAW_DEBUG = false;
  * canvas tracks the viewport and its backing store is re-synced to the
  * CSS size (with `devicePixelRatio`) every frame.
  */
-const FIXED_CANVAS_SIZE = true;
+const FIXED_CANVAS_SIZE = false;
 
 /**
  * Fixed canvas height in pixels — the long side of the portrait canvas.
