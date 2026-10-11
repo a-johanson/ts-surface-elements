@@ -22,7 +22,7 @@ export interface OrbitState {
 }
 
 /** Radians of rotation per pixel of drag. */
-const ROTATE_SENSITIVITY = 0.0015;
+const ROTATE_SENSITIVITY = 0.0025;
 
 /** Radius delta per pixel of wheel scroll. */
 const ZOOM_SENSITIVITY = 0.005;
