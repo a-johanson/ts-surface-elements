@@ -181,7 +181,7 @@ fn rayClearance(ro: vec3f, rd: vec3f, max_dist: f32, time: f32) -> f32 {
     }
 
     if t < max_dist - SURF_EPS {
-        return 0.0;
+        return min(min_dist, 0.0);
     }
 
     return min_dist;
