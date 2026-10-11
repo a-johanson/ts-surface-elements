@@ -85,7 +85,9 @@ link pass calls `spatialGrid.dispatch(encoder, readFromA)` a second time
 (after the shading pass, where `readFromA` now points at the buffer relax
 most recently wrote). This reuses the existing `SpatialGridPipeline`
 infrastructure — no new grid code, just one extra dispatch call in
-`main.ts`.
+`main.ts`. The rebuild and the link dispatch run only on frames where
+time is playing — while paused, no link input changes, so both are
+skipped (see *Placement in the frame loop*).
 
 **Cost.** One extra cell-index + radix-sort + cell-ranges build per frame
 (~14 small dispatches for 6K points). Negligible.
@@ -235,6 +237,8 @@ runtime tuning is needed.
 | `LINK_NEWTON_ITERS` | `3` | Newton iterations per curve-point projection |
 | `LINK_NEWTON_ALPHA` | `0.7` | Newton step size (conservative for smin blend regions) |
 | `LINK_RADIUS` | `= RELAX_RADIUS` | Search radius for neighbor scan (same as cell size) |
+| `LINK_TAN_EPS` | `1e-4` | Threshold below which the light is considered parallel to the normal (`L_tan ≈ 0`) — no principal direction, no link |
+| `COINCIDENT_EPS` | `1e-7` | Skip neighbors closer than this (link direction `diff / dist` undefined at zero distance; same threshold as the relax shader's coincident guard) |
 
 These can be promoted to uniforms later if runtime tuning is needed.
 
@@ -276,6 +280,11 @@ grid and the shared normals buffer (written by the shading pass). The
 `linkCurves` buffer is written once per frame and read by the link render
 inside the same render pass as the point render.
 
+While time is paused, the grid rebuild and link compute are skipped
+(positions, normals, and animation time are unchanged, so the links from
+the last playing frame stay valid); the link render still runs every
+frame since its visibility handling is view-dependent.
+
 ### Placement in the frame loop (`src/main.ts`)
 
 After the shading dispatch and before the render pass:
@@ -283,15 +292,19 @@ After the shading dispatch and before the render pass:
 ```ts
 shading.dispatch(encoder, eye, time, shadingReadsA);
 
-// --- Grid rebuild from post-relax positions (for link pass) ---
-spatialGrid.dispatch(encoder, shadingReadsA);
+// Grid rebuild + link compute run only on frames where the simulation
+// stepped; while paused the links cannot change.
+if (playedThisFrame) {
+    // --- Grid rebuild from post-relax positions (for link pass) ---
+    spatialGrid.dispatch(encoder, shadingReadsA);
 
-// --- Link compute: find connections + subdivide + project ---
-link.dispatch(encoder, eye, time, shadingReadsA);
+    // --- Link compute: find connections + subdivide + project ---
+    link.dispatch(encoder, eye, time, shadingReadsA);
+}
 
 // --- Render pass: link render (under) + point render (top) ---
 const pass = encoder.beginRenderPass({ /* ... */ });
-linkRender.render(pass, eye, gpu.canvas, points.count);
+linkRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
 pointRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
 pass.end();
 ```
@@ -334,6 +347,8 @@ lint` after each step that touches TS files.
 
 ### Step 1 — Link compute + simple line-list render (validation)
 
+**Status:** completed.
+
 **Goal:** verify the neighbor-finding logic produces visually sensible
 connections with minimal rendering infrastructure.
 
@@ -342,21 +357,25 @@ connections with minimal rendering infrastructure.
   variant: outputs `u32` best-neighbor index per point, no subdivision).
 - `src/stipple/link-pipeline.ts` — `LinkPipeline` class. Constructor takes
   `(device, points: PointBuffers, grid: GridBuffers)`. Creates the
-  `linksBuffer` (`u32 × point_count`, `STORAGE`), the compute pipeline,
-  and two read bind groups (A/B — reads `points.bufferA` or `bufferB`,
+  `linksBuffer` (`u32 × point_count`, `STORAGE`, pre-filled with
+  `UINT_MAX` so a frame rendered before the link compute has ever
+  dispatched — e.g. paused at startup — draws no lines instead of
+  linking every point to index 0), the compute pipeline, and two read
+  bind groups (A/B — reads `points.bufferA` or `bufferB`,
   `normalsBuffer`, and the 4 grid buffers). `dispatch(encoder, time,
-  readFromA)` writes the params uniform (`time`, `point_count`,
-  `DISTANCE_WEIGHT`, `LINK_RADIUS`) and records one compute pass.
+  readFromA)` writes the params uniform (`time`, `point_count`) and
+  records one compute pass. `DISTANCE_WEIGHT` and `LINK_RADIUS` are
+  compile-time WGSL constants (decision 8).
 - `src/stipple/shaders/link-render-shader.ts` — exports
   `LINK_RENDER_SHADER` (Step 1 variant: `line-list` topology).
 - `src/stipple/link-render-pipeline.ts` — `LinkRenderPipeline` class.
   Constructor takes `(device, points: PointBuffers, links: GPUBuffer,
   config: CameraConfig, format: GPUTextureFormat)`. Creates the render
   pipeline (`line-list` topology), uniform buffer (`mat4x4f` + `eye` +
-  pad = 80 B), and bind group (binds: uniform, `points.bufferA`,
-  `points.bufferB`, `links`, `shadingBuffer`). `render(pass, eye, canvas,
-  readFromA, pointCount)` writes the view-projection uniform and calls
-  `pass.draw(2, pointCount)`.
+  pad = 80 B), and two bind groups (A/B — binds: uniform,
+  `points.bufferA` or `bufferB`, `links`, `shadingBuffer`).
+  `render(pass, eye, canvas, readFromA, pointCount)` writes the
+  view-projection uniform and calls `pass.draw(2, pointCount)`.
 
 **Shader details — link compute (Step 1):**
 
@@ -365,7 +384,7 @@ The compute shader includes `SDF_COMMON` and duplicates `GridParams`
 
 | Binding | Type | Description |
 |---|---|---|
-| 0 | uniform `LinkParams` | `time: f32, point_count: u32, distance_weight: f32, link_radius: f32` (16 B) |
+| 0 | uniform `LinkParams` | `time: f32, point_count: u32` (8 B) |
 | 1 | storage, read `points_in` | `array<Point>` — the post-relax point buffer |
 | 2 | storage, read `normals_in` | `array<vec4f>` — shared normals buffer |
 | 3 | uniform `GridParams` | Grid params (bbox, dims, cell size) |
@@ -376,10 +395,13 @@ The compute shader includes `SDF_COMMON` and duplicates `GridParams`
 
 The neighbor scan mirrors the relax shader's 27-cell loop exactly (same
 cell recomputation, same `UINT_MAX` empty-cell sentinel, same thin-wall
-filter). For each valid neighbor `j` in the forward hemisphere
-(`alignment > 0`), compute `score = alignment - DISTANCE_WEIGHT * dist`
-and track the maximum. After the scan, write `best_j` (or `UINT_MAX` if
-no valid neighbor was found, including the `L_tan ≈ 0` case).
+filter), plus a coincident-pair skip below `COINCIDENT_EPS` — the link
+direction `diff / dist` is undefined at zero distance (see decision 8
+for both guard constants). For each valid neighbor `j` in the forward
+hemisphere (`alignment > 0`), compute `score = alignment -
+DISTANCE_WEIGHT * dist` and track the maximum. After the scan, write
+`best_j` (or `UINT_MAX` if no valid neighbor was found, including the
+`L_tan ≈ 0` case, gated by `LINK_TAN_EPS`).
 
 **Shader details — link render (Step 1):**
 
@@ -389,16 +411,17 @@ no valid neighbor was found, including the `L_tan ≈ 0` case).
 | Binding | Type | Description |
 |---|---|---|
 | 0 | uniform `LinkRenderUniform` | `view_proj: mat4x4f, eye: vec3f, _pad: f32` (80 B) |
-| 1 | storage, read `pointsA` | `array<Point>` |
-| 2 | storage, read `pointsB` | `array<Point>` |
-| 3 | storage, read `links` | `array<u32>` |
-| 4 | storage, read `shading` | `array<ShadingSample>` |
+| 1 | storage, read `points` | `array<Point>` — the post-relax point buffer |
+| 2 | storage, read `links` | `array<u32>` |
+| 3 | storage, read `shading` | `array<ShadingSample>` |
 
 Vertex shader: `vid` selects endpoint 0 or 1. Endpoint 0 = `points[inst]`
-(the point itself). Endpoint 1 = `points[links[inst]]` (the linked
-neighbor — reads from bufferA or bufferB depending on
-`readFromBufferA`). If `links[inst] == UINT_MAX`, push offscreen. For
-visibility: read `shading[inst].clearance` and
+(the point itself); endpoint 1 = `points[links[inst]]` (the linked
+neighbor). Both endpoints read from the same post-relax buffer: the
+pipeline has two bind groups (A/B, bound at construction) and `render`
+selects the buffer via the `readFromBufferA` flag — the same ping-pong
+pattern as the point renderer. If `links[inst] == UINT_MAX`, push
+offscreen. For visibility: read `shading[inst].clearance` and
 `shading[links[inst]].clearance`; if both endpoints have
 `max(clearance) <= 0.0` (fully occluded), push offscreen. Otherwise
 project the endpoint via `view_proj` and output `clip_pos`.
@@ -408,12 +431,17 @@ WGSL constants — see decision 8).
 
 **Frame loop wiring (`src/main.ts`):**
 
-After `shading.dispatch`:
+After `shading.dispatch` — but only on frames where time is playing
+(while paused the post-relax positions, normals, and animation time are
+unchanged, so the links computed on the last playing frame stay valid):
 1. Call `spatialGrid.dispatch(encoder, shadingReadsA)` — rebuild grid
    from post-relax positions.
 2. Call `link.dispatch(encoder, time, shadingReadsA)` — run link compute.
-3. In the render pass, before `pointRender.render`: call
-   `linkRender.render(pass, eye, gpu.canvas, renderReadsA, points.count)`.
+Unconditionally, in the render pass, before `pointRender.render` (the
+occlusion culling is view-dependent, so lines keep updating with the
+camera while paused):
+3. Call `linkRender.render(pass, eye, gpu.canvas, renderReadsA,
+   points.count)`.
 
 Construct `LinkPipeline` and `LinkRenderPipeline` in `bootstrap()`,
 after `spatialGrid` and before the frame loop starts. The

@@ -1,6 +1,8 @@
 import { FrameCapture } from "./frame-capture.js";
 import { OrbitControls } from "./orbit-controls.js";
 import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
+import { LinkPipeline } from "./stipple/link-pipeline.js";
+import { LinkRenderPipeline } from "./stipple/link-render-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
 import { type CameraConfig, PointRenderPipeline } from "./stipple/point-render-pipeline.js";
 import { RelaxPipeline } from "./stipple/relax-pipeline.js";
@@ -132,16 +134,20 @@ function getCanvas(): HTMLCanvasElement {
  *    `ceil(dt / TARGET_SUBSTEP_DT)` sub-passes (capped at
  *    `MAX_SUBSTEPS`), each flipping the ping-pong direction, so the
  *    per-step Euler integration size stays stable regardless of frame
- *    rate. While time is paused, these simulation passes are skipped and
- *    their state is left untouched, so they resume exactly where they
- *    left off.
+ *    rate. After the relax substeps, rebuilds the spatial grid from the
+ *    post-relax positions and dispatches the link compute pass, which
+ *    connects each point to its best-aligned neighbor along the
+ *    principal direction. While time is paused, these passes are skipped
+ *    and their state is left untouched, so they resume exactly where
+ *    they left off — paused frames keep the links from the last playing
+ *    frame since no link input changes while paused.
  * 4. Dispatches the shading compute pass to refresh the normals buffer
  *    and compute per-point corner occlusion clearances (sphere-traced
  *    toward the eye) and luminance (Lambert with shadow) from the relaxed
  *    positions. Always runs since it is view-dependent — the camera stays
  *    interactive while time is paused.
  * 5. Begins a render pass that draws the SDF debug view (grayscale
- *    Lambert) and then the stipple points.
+ *    Lambert), then the link lines, and then the stipple points on top.
  * 6. Submits the command buffer.
  * 7. If a still-image export was requested, serializes the canvas's last
  *    presented frame to a downloadable PNG tagged with the current
@@ -154,9 +160,11 @@ function getCanvas(): HTMLCanvasElement {
  * @param reproject - The reproject compute pipeline.
  * @param relax - The relax compute pipeline.
  * @param shading - The shading compute pipeline.
+ * @param link - The link compute pipeline.
  * @param points - The ping-pong point buffer pair.
  * @param debugRender - The debug render pipeline (SDF visualization).
  * @param pointRender - The point render pipeline.
+ * @param linkRender - The link render pipeline.
  * @param controls - Orbit camera controls.
  * @param timeControls - Animation-time playback controls.
  * @param frameCapture - Still-image export controls.
@@ -167,9 +175,11 @@ function startFrameLoop(
     spatialGrid: SpatialGridPipeline,
     relax: RelaxPipeline,
     shading: ShadingPipeline,
+    link: LinkPipeline,
     points: PointBuffers,
     debugRender: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
+    linkRender: LinkRenderPipeline,
     controls: OrbitControls,
     timeControls: TimeControls,
     frameCapture: FrameCapture,
@@ -193,10 +203,12 @@ function startFrameLoop(
         const encoder = device.createCommandEncoder();
 
         // While time is paused the surface is static, so the simulation
-        // passes are skipped entirely: points, the spatial grid, and the
-        // ping-pong direction are left untouched and everything resumes
-        // exactly where it left off when playback restarts.
-        if (timeControls.isPlaying) {
+        // and link passes are skipped entirely: points, the spatial grid,
+        // the ping-pong direction, and the links are left untouched and
+        // everything resumes exactly where it left off when playback
+        // restarts.
+        const playedThisFrame = timeControls.isPlaying;
+        if (playedThisFrame) {
             time += dt;
 
             // --- Compute pass: reproject (in-place, before relax) ---
@@ -226,10 +238,24 @@ function startFrameLoop(
         const shadingReadsA = readFromA;
         shading.dispatch(encoder, eye, time, shadingReadsA);
 
+        // The link passes run only on frames where the simulation
+        // stepped: while paused the post-relax positions, normals, and
+        // animation time are unchanged, so the links computed on the last
+        // playing frame are still valid. The link render below still runs
+        // every frame — its occlusion culling is view-dependent.
+        if (playedThisFrame) {
+            // --- Compute pass: spatial grid rebuild (from post-relax
+            // positions, for the link pass) ---
+            spatialGrid.dispatch(encoder, shadingReadsA);
+
+            // --- Compute pass: link (best-neighbor scan) ---
+            link.dispatch(encoder, time, shadingReadsA);
+        }
+
         // Render reads the same buffer shading just read.
         const renderReadsA = shadingReadsA;
 
-        // --- Render pass: debug SDF view + draw points ---
+        // --- Render pass: debug SDF view + draw links + points ---
         const texture = gpu.context.getCurrentTexture();
         const view = texture.createView();
         const pass = encoder.beginRenderPass({
@@ -246,6 +272,7 @@ function startFrameLoop(
         if (DRAW_DEBUG) {
             debugRender.render(pass, eye, gpu.canvas, time);
         }
+        linkRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
         pointRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
 
         pass.end();
@@ -284,6 +311,7 @@ async function bootstrap(): Promise<void> {
     const spatialGrid = new SpatialGridPipeline(gpu.device, points, SCENE_BBOX, RELAX_RADIUS);
     const relax = new RelaxPipeline(gpu.device, points, spatialGrid, RELAX_RADIUS);
     const shading = new ShadingPipeline(gpu.device, points);
+    const link = new LinkPipeline(gpu.device, points, spatialGrid);
     const debugRender = new DebugRenderPipeline(
         gpu.device,
         cameraConfig,
@@ -291,6 +319,13 @@ async function bootstrap(): Promise<void> {
         SCENE_BBOX,
     );
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
+    const linkRender = new LinkRenderPipeline(
+        gpu.device,
+        points,
+        link.linksBuffer,
+        cameraConfig,
+        gpu.format,
+    );
     const controls = new OrbitControls(canvas, {
         azimuth: 0.0,
         elevation: 0.5,
@@ -310,9 +345,11 @@ async function bootstrap(): Promise<void> {
         spatialGrid,
         relax,
         shading,
+        link,
         points,
         debugRender,
         pointRender,
+        linkRender,
         controls,
         timeControls,
         frameCapture,
