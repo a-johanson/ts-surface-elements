@@ -32,7 +32,11 @@
  *  3. `link_dedup_cs` — one invocation per point: clears `links[i]` when
  *     `owners[links[i]] != i`, so every point keeps at most one incoming
  *     edge (decision 9 in the hatch-lines spec) and the surviving graph
- *     is a union of paths and cycles.
+ *     is a union of paths and cycles. Additionally breaks mutual 2-cycles
+ *     (i→j and j→i that both survived dedup): when `owners[j] == i` and
+ *     `owners[i] == j` and `i > j`, the larger-index edge is dropped.
+ *     This reads only the stable `owners` buffer plus the own `links`
+ *     slot, so it is race-free within the existing dedup dispatch.
  *
  * `GridParams` is duplicated here (WGSL has no cross-module struct
  * import) — it matches the layout in `cell-index-shader.ts` and
@@ -209,8 +213,20 @@ fn link_dedup_cs(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     let j = links_out[i];
-    if (j != UINT_MAX && owners_in[j] != i) {
+    if (j == UINT_MAX) {
+        return;
+    }
+
+    if (owners_in[j] != i) {
         // Another (smaller) source index owns j — drop this link.
+        links_out[i] = UINT_MAX;
+        return;
+    }
+
+    // i's edge survived dedup. Break mutual 2-cycles (i→j and j→i both
+    // survived): owners_in[i] == j means j's edge targets i and also
+    // survived. Keep the smaller-index edge, drop the larger.
+    if (owners_in[i] == j && i > j) {
         links_out[i] = UINT_MAX;
     }
 }

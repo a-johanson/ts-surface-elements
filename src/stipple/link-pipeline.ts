@@ -18,7 +18,10 @@
  *  3. **Dedup** — one invocation per point clears the link of every
  *     source that lost its target's owner election, so each point keeps
  *     at most one incoming edge (decision 9 in the hatch-lines spec) and
- *     the surviving graph is a union of paths and cycles.
+ *     the surviving graph is a union of paths and cycles. Additionally
+ *     breaks mutual 2-cycles (i→j and j→i that both survived dedup) by
+ *     dropping the larger-index edge — race-free, using only the stable
+ *     `owners` buffer and the own `links` slot.
  *
  * WebGPU orders dispatches within a compute pass, so each stage's
  * writes are visible to the next without explicit barriers.
