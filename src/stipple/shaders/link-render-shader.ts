@@ -6,8 +6,8 @@
  * The vertex shader resolves the two endpoints from the post-relax point
  * buffer: endpoint 0 is the point itself, endpoint 1 is its linked
  * neighbor. Points with no link (`UINT_MAX`) and links whose endpoints
- * are both fully occluded (both endpoints' corner clearances in the
- * shading buffer are non-positive) are pushed offscreen so no fragments
+ * are both fully occluded (both endpoints' center-ray clearance in the
+ * shading buffer is non-positive) are pushed offscreen so no fragments
  * are rasterized for them.
  *
  * The fragment shader paints a solid translucent color.
@@ -28,7 +28,7 @@ const UINT_MAX: u32 = 0xFFFFFFFFu;
 @group(0) @binding(0) var<uniform> u: LinkRenderUniform;
 @group(0) @binding(1) var<storage, read> points: array<Point>;
 @group(0) @binding(2) var<storage, read> links: array<u32>;
-@group(0) @binding(3) var<storage, read> shading: array<ShadingSample>;
+@group(0) @binding(3) var<storage, read> shading: array<PointShading>;
 
 @vertex
 fn link_vs(
@@ -41,11 +41,9 @@ fn link_vs(
     }
 
     // Coarse visibility: draw only when at least one endpoint's stipple
-    // splat is visible to the camera.
-    let sh_i = shading[iid];
-    let sh_j = shading[j];
-    let clearance_i = max(max(sh_i.clearance.x, sh_i.clearance.y), max(sh_i.clearance.z, sh_i.clearance.w));
-    let clearance_j = max(max(sh_j.clearance.x, sh_j.clearance.y), max(sh_j.clearance.z, sh_j.clearance.w));
+    // dot is visible to the camera.
+    let clearance_i = shading[iid].clearance;
+    let clearance_j = shading[j].clearance;
     if (clearance_i <= 0.0 && clearance_j <= 0.0) {
         return vec4f(2.0, 2.0, 2.0, 1.0);
     }

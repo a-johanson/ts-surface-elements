@@ -1,19 +1,18 @@
 /**
- * Point render shader — draws stipple points as tangent-plane quads
- * oriented from the shared normals buffer and projected via a
- * view-projection matrix uniform.
+ * Point render shader — draws stipple points as small fixed-size dots:
+ * tangent-plane quads oriented from the shared normals buffer and
+ * projected via a view-projection matrix uniform.
  *
  * The vertex shader builds the shared tangent basis for each point and
  * offsets the quad corners in world space by `POINT_RADIUS_WORLD`, so
  * quads lie flat on the SDF surface and foreshorten with viewing angle.
- * Each corner carries its occlusion clearance from the shading buffer;
- * points whose corners are all fully occluded are pushed offscreen so no
- * fragments are rasterized for them.
+ * Points whose center-ray clearance (from the shading buffer) is
+ * non-positive — the surface occludes them from the camera — are pushed
+ * offscreen so no fragments are rasterized for them.
  *
- * The fragment shader paints a white ring outline whose radius scales
- * linearly with per-point luminance (collapsing to a point at zero
- * luminance); the line width is configurable via `LINE_WIDTH` and the ring
- * never exceeds the quad boundary. Occlusion is resolved per fragment.
+ * The fragment shader paints a plain white anti-aliased filled disc at a
+ * fixed radius, independent of luminance, so dots read as a uniform
+ * overlay for the hatch lines.
  */
 import { SDF_COMMON } from "./sdf-common.js";
 
@@ -26,14 +25,12 @@ struct PointUniform {
 
 @group(0) @binding(0) var<uniform> u: PointUniform;
 @group(0) @binding(1) var<storage, read> points: array<Point>;
-@group(0) @binding(2) var<storage, read> shading: array<ShadingSample>;
+@group(0) @binding(2) var<storage, read> shading: array<PointShading>;
 @group(0) @binding(3) var<storage, read> normals: array<vec4f>;
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4f,
     @location(0) uv: vec2f,
-    @location(1) luminance: f32,
-    @location(2) clearance: f32,
 };
 
 @vertex
@@ -49,16 +46,13 @@ fn point_vs(
         vec2f( 1.0, -1.0),
         vec2f( 1.0,  1.0),
     );
-    let corner_ids = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u);
 
-    let sh = shading[iid];
     var out: VertexOut;
     out.uv = corner[vid];
-    out.luminance = sh.luminance.x;
-    out.clearance = sh.clearance[corner_ids[vid]];
 
-    let clearance_max = max(max(sh.clearance.x, sh.clearance.y), max(sh.clearance.z, sh.clearance.w));
-    if (clearance_max <= 0.0) {
+    // Coarse occlusion cull: non-positive center-ray clearance means the
+    // surface between the point and the camera occludes it.
+    if (shading[iid].clearance <= 0.0) {
         out.clip_pos = vec4f(2.0, 2.0, 2.0, 1.0);
         return out;
     }
@@ -74,28 +68,17 @@ fn point_vs(
 
 @fragment
 fn point_fs(in: VertexOut) -> @location(0) vec4f {
-    const LINE_WIDTH: f32 = 0.25;
-    const HALF_W: f32 = LINE_WIDTH * 0.5;
-    const MIN_R: f32 = 0.75 * HALF_W;
-    const MAX_R: f32 = 1.0 - 1.5 * HALF_W;
+    // Dot radius as a fraction of the quad half-extent (fixed size,
+    // irrespective of luminance).
+    const DOT_RADIUS: f32 = 0.5;
     const AA_WIDTH: f32 = 0.5;
 
-    let aa_clearance = fwidth(in.clearance);
-    let half_band_clearance = aa_clearance * AA_WIDTH;
-    if (in.clearance < -half_band_clearance) {
-        discard;
-    }
-    let alpha_clearance = smoothstep(-half_band_clearance, half_band_clearance, in.clearance);
-
     let d_center = length(in.uv);
-    let aa = fwidth(d_center);
-    let half_band = aa * AA_WIDTH;
-    let r = (MAX_R - MIN_R) * in.luminance + MIN_R;
-    let d_ring = abs(d_center - r);
-    if (d_ring > HALF_W + half_band) {
+    let half_band = fwidth(d_center) * AA_WIDTH;
+    if (d_center > DOT_RADIUS + half_band) {
         discard;
     }
-    let alpha = smoothstep(HALF_W + half_band, HALF_W - half_band, d_ring);
-    return vec4f(1.0, 1.0, 1.0, alpha * alpha_clearance);
+    let alpha = smoothstep(DOT_RADIUS + half_band, DOT_RADIUS - half_band, d_center);
+    return vec4f(1.0, 1.0, 1.0, alpha);
 }
 `;

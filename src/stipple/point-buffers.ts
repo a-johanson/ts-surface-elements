@@ -22,13 +22,14 @@
  * because the shading pass writes normals from the buffer that the *next*
  * relax pass will read.
  *
- * A second non-ping-pong `shadingBuffer` holds the per-point shading
- * result (32 bytes: a `lum` `vec4f` with the luminance in `x`, and a
- * `clearance` `vec4f` with one occlusion clearance value per quad corner).
- * It is written every frame by the shading pass and read by the point
- * renderer, which pushes fully occluded points offscreen in the vertex
- * shader, clips each ring fragment against the interpolated clearance,
- * and modulates the color by luminance.
+ * A second non-ping-pong `shadingBuffer` holds one packed 16-byte
+ * shading record per point: the view-independent `luminance` and the
+ * center-ray `clearance` occlusion value (plus two spare slots). The
+ * luminance field is written every frame by the reproject pass (before
+ * relax, for the relax kernel's density modulation); the clearance
+ * field is written every frame by the shading pass and read by the
+ * point renderer (offscreen cull) and the link renderer (endpoint
+ * visibility check).
  *
  * No CPU readback is performed — seeding, relaxation, and shading are
  * entirely GPU-side.
@@ -40,11 +41,11 @@ export const POINT_FLOATS = 4;
 /** Size of one point in bytes. */
 export const POINT_BYTES = POINT_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 
-/** Number of `f32` values per shading sample (two `vec4f`s). */
-export const SHADING_SAMPLE_FLOATS = 8;
+/** Number of `f32` values per point shading record (one 16-byte value). */
+export const POINT_SHADING_FLOATS = 4;
 
-/** Size of one shading sample in bytes. */
-export const SHADING_SAMPLE_BYTES = SHADING_SAMPLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
+/** Size of one point shading record in bytes. */
+export const POINT_SHADING_BYTES = POINT_SHADING_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 
 /** Buffer usage flags for point and normals storage buffers. */
 const POINT_BUFFER_USAGE: GPUBufferUsageFlags =
@@ -85,12 +86,12 @@ export class PointBuffers {
     /**
      * Shared per-point shading buffer (not ping-ponged).
      *
-     * Written every frame by the shading pass; read by the point renderer
-     * to push fully occluded points offscreen (in the vertex shader),
-     * clip the ring per fragment against the interpolated corner
-     * clearance, and modulate the fragment color by luminance. Packed as
-     * `ShadingSample` (32 bytes): `lum.x` = luminance, `clearance` = one
-     * occlusion clearance per quad corner.
+     * One 16-byte `PointShading` record per point: `luminance` =
+     * view-independent luminance, written every frame by the reproject
+     * pass (before relax); `clearance` = center-ray occlusion clearance,
+     * written every frame by the shading pass and read by the point
+     * renderer (offscreen cull) and the link renderer (endpoint
+     * visibility check).
      */
     public readonly shadingBuffer: GPUBuffer;
 
@@ -103,13 +104,13 @@ export class PointBuffers {
      */
     public constructor(device: GPUDevice, count: number) {
         this.count = count;
-        // Point, normals, and shading samples are vec4f-structured: points
-        // are pos + unused w, normals are vec3f + pad, shading samples pack
-        // luminance and four corner clearances into two vec4f. WGSL storage
-        // arrays of vec4f / 32-byte structs require 16-byte alignment, which
-        // is satisfied here.
+        // Every per-point buffer element is 16 bytes: points and normals
+        // are vec4f-structured (pos + unused w, vec3f + pad), and the
+        // shading record packs luminance, the center-ray clearance, and
+        // two spare slots into 16 bytes. WGSL storage arrays of vec4f /
+        // 16-byte structs are 16-byte aligned, which the sizes satisfy.
         const size = count * POINT_BYTES;
-        const shadingSize = count * SHADING_SAMPLE_BYTES;
+        const shadingSize = count * POINT_SHADING_BYTES;
 
         this.bufferA = this.createBuffer(device, size);
         this.bufferB = this.createBuffer(device, size);

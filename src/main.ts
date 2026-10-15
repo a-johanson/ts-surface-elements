@@ -55,6 +55,13 @@ const SEED_BAND = RELAX_RADIUS;
 const DRAW_DEBUG = false;
 
 /**
+ * Whether to draw the stipple points.
+ *
+ * Debug toggle — turn off to inspect the hatch lines alone.
+ */
+const DRAW_POINTS = true;
+
+/**
  * Whether the canvas has a fixed size, applied once at bootstrap to both
  * the rendering attachment and the HTML element. When disabled, the
  * canvas tracks the viewport and its backing store is re-synced to the
@@ -145,12 +152,12 @@ function getCanvas(): HTMLCanvasElement {
  *    they left off — paused frames keep the links from the last playing
  *    frame since no link input changes while paused.
  * 4. Dispatches the shading compute pass to refresh the normals buffer
- *    and compute per-point corner occlusion clearances (sphere-traced
- *    toward the eye) and luminance (Lambert with shadow) from the relaxed
- *    positions. Always runs since it is view-dependent — the camera stays
- *    interactive while time is paused.
+ *    and compute the per-point center-ray visibility clearance from the
+ *    relaxed positions. Always runs since it is view-dependent — the
+ *    camera stays interactive while time is paused.
  * 5. Begins a render pass that draws the SDF debug view (grayscale
- *    Lambert), then the link lines, and then the stipple points on top.
+ *    Lambert), then the link lines, and then — when {@link DRAW_POINTS}
+ *    is enabled — the stipple points on top.
  * 6. Submits the command buffer.
  * 7. If a still-image export was requested, serializes the canvas's last
  *    presented frame to a downloadable PNG tagged with the current
@@ -278,7 +285,9 @@ function startFrameLoop(
             debugRender.render(pass, eye, target, gpu.canvas, time);
         }
         linkRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
-        pointRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
+        if (DRAW_POINTS) {
+            pointRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
+        }
 
         pass.end();
 

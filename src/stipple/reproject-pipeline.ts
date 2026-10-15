@@ -1,6 +1,6 @@
 /**
  * Reproject compute pipeline — re-projects points onto the current animated
- * SDF surface and refreshes the shared normals buffer.
+ * SDF surface and refreshes the shared normals and luminance buffers.
  *
  * Each frame, {@link dispatch} records a single compute pass that runs
  * *before* relax. One invocation per point reads `p_i` from the point
@@ -8,8 +8,10 @@
  * the current animation time (16 iterations, `alpha = 0.5` — generous
  * budget since the per-frame surface motion may be larger than relax's
  * tail re-projection assumes), writes the projected position back
- * in-place, and writes the matching surface normal into the shared
- * normals buffer.
+ * in-place, writes the matching surface normal into the shared
+ * normals buffer, and computes the per-point view-independent luminance
+ * into the shared shading buffer — ahead of relax, so the relax kernel's
+ * density modulation reads fresh same-frame values.
  *
  * This ensures relax starts with on-surface positions and matching
  * normals even when the SDF has moved since the last frame. Without this
@@ -43,9 +45,12 @@ const REPROJECT_PARAMS_BUFFER_BYTES = 16;
  * Manages the reproject compute pipeline, its params uniform, and the
  * ping-pong read bind groups.
  *
- * The normals buffer is allocated once by {@link PointBuffers} and shared
- * between this pipeline (written before relax), the seed pipeline (written
- * once at bootstrap), and the shading pipeline (written after relax).
+ * The normals and shading buffers are allocated once by
+ * {@link PointBuffers} and shared: the normals buffer between this
+ * pipeline (written before relax), the seed pipeline (written once at
+ * bootstrap), and the shading pipeline (written after relax); the
+ * shading buffer's luminance field is written here, its clearance field
+ * by the shading pass.
  */
 export class ReprojectPipeline {
     private readonly device: GPUDevice;
@@ -62,7 +67,7 @@ export class ReprojectPipeline {
      *
      * @param device - The GPU device.
      * @param points - The ping-pong point buffer pair plus shared
-     *   normals buffer.
+     *   normals and shading buffers.
      */
     public constructor(device: GPUDevice, points: PointBuffers) {
         this.device = device;
@@ -97,6 +102,7 @@ export class ReprojectPipeline {
                 { binding: 0, resource: { buffer: this.paramsBuffer } },
                 { binding: 1, resource: { buffer: points.bufferA } },
                 { binding: 2, resource: { buffer: points.normalsBuffer } },
+                { binding: 3, resource: { buffer: points.shadingBuffer } },
             ],
         });
 
@@ -107,6 +113,7 @@ export class ReprojectPipeline {
                 { binding: 0, resource: { buffer: this.paramsBuffer } },
                 { binding: 1, resource: { buffer: points.bufferB } },
                 { binding: 2, resource: { buffer: points.normalsBuffer } },
+                { binding: 3, resource: { buffer: points.shadingBuffer } },
             ],
         });
     }
@@ -133,10 +140,10 @@ export class ReprojectPipeline {
      * Records a reproject compute pass into the given command encoder.
      *
      * Reads from and writes back to one point buffer (depending on
-     * `readFromA`) in-place, and writes the refreshed normals into the
-     * shared normals buffer. Should be called before
-     * {@link RelaxPipeline.dispatch} so relax starts with on-surface
-     * positions and matching normals.
+     * `readFromA`) in-place, and writes the refreshed normals and the
+     * per-point luminance into the shared buffers. Should be called
+     * before {@link RelaxPipeline.dispatch} so relax starts with
+     * on-surface positions and matching normals.
      *
      * @param encoder - The command encoder to record into.
      * @param time - The current animation time in seconds.

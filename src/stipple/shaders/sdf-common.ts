@@ -21,16 +21,16 @@
  *   normals live in a separate shared buffer, written by the seed pass
  *   (once, at bootstrap at t=0), by the reproject pass (every frame, before
  *   relax), and by the shading pass (every frame, after relax).
- * - `ShadingSample` — the per-point shading output layout (32 bytes):
- *   `luminance` carries the point's luminance in `x`; `clearance` carries
- *   one occlusion clearance value per quad corner (see `rayClearance`).
- *   Written by the shading pass every frame and read by the point
- *   renderer.
+ * - `PointShading` — the per-point shading record (16 bytes: luminance,
+ *   center-ray clearance, two spare slots): `luminance` carries the
+ *   point's view-independent luminance (written by the reproject pass);
+ *   `clearance` carries the center-ray occlusion clearance (see
+ *   `rayClearance`), written by the shading pass and read by the point
+ *   renderer and the link renderer.
  * - `POINT_RADIUS_WORLD` / `tangentFrame(n)` — the canonical splat radius
- *   and tangent-basis construction shared by the shading pass (which
- *   samples occlusion clearance at the quad corners) and the point
- *   renderer (which builds the same quad corners), so corner rays and
- *   rasterized corners always coincide.
+ *   and tangent-basis construction used by the point renderer to offset
+ *   its quad corners onto the tangent plane, so quads lie flat on the
+ *   curved surface.
  * - `map(p, time)` — the scene signed distance field, parameterized by
  *   `time` for smooth morphing.
  * - `lightDir(time)` — the animated light direction.
@@ -47,7 +47,7 @@
  * - `rayMarch(ro, rd, time)` — sphere-traces `map()` along `rd` from `ro`
  *   up to `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance,
  *   or `-1.0` on miss. Shared by the debug render (per-fragment SDF
- *   visualization) and the shading pass (per-point visibility tests).
+ *   visualization).
  * - `rayClearance(ro, rd, max_dist, time)` — sphere-traces `map()` along
  *   `rd` from `ro` over `[0, max_dist]` and returns the minimum signed
  *   clearance between the ray and the SDF surface. Negative values are
@@ -67,17 +67,19 @@
  *   current and previous unbounding spheres to estimate the closest
  *   surface approach to the ray, catching penumbras that fall between
  *   sample positions (especially near sharp corners). Shared by the
- *   debug render (per-fragment self-shadowing) and the shading pass
- *   (per-point soft shadow).
+ *   debug render (per-fragment self-shadowing) and the reproject pass
+ *   (per-point soft shadow for luminance).
  */
 export const SDF_COMMON = /* wgsl */ `
 struct Point {
     pos: vec4f,
 };
 
-struct ShadingSample {
-    luminance: vec4f,
-    clearance: vec4f,
+struct PointShading {
+    luminance: f32,
+    clearance: f32,
+    _pad0: f32,
+    _pad1: f32,
 };
 
 struct TangentFrame {

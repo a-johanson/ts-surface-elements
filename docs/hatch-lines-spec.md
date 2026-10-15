@@ -38,9 +38,11 @@ point render so points sit on top.
 
 - **Mitering** — overlapping segments at joints to eliminate hairline
   gaps. Step 5 addresses this; v1 tolerates small gaps.
-- **Luminance modulation** — lines do not darken in shadow in v1
+- **Line luminance modulation** — lines do not darken in shadow in v1
   (luminance is computed by the shading pass but not consumed by the link
-  renderer). Can be added once the basic rendering looks right.
+  renderer for line color/alpha). Can be added once the basic rendering
+  looks right. Point *density* modulation is handled separately in
+  Step 1d.
 - **Depth testing** — no depth attachment; occlusion is resolved via
   `rayClearance` toward the eye (Step 4), not via the rasterizer's depth
   buffer.
@@ -65,6 +67,9 @@ point render so points sit on top.
 - `projectToSurface(p, time, iters, alpha)` is available in `SDF_COMMON`.
 - `rayClearance(ro, rd, max_dist, time)` is available in `SDF_COMMON` and
   returns the minimum signed clearance between a ray and the SDF surface.
+- The shading buffer's `luminance` field holds the view-independent
+  per-point luminance (`lit * lambert`), written by the reproject pass
+  (Step 1c).
 - `viewProjection(eye, target, up, fov, aspect)` is available in
   `src/stipple/camera.ts` and returns a 16-element column-major
   `mat4x4f` array.
@@ -113,8 +118,8 @@ replaces the `u32` index buffer with the subdivided curve buffer.
 
 **Cost.** `N_SEGMENTS` Newton projections per point (~4 `map()` + gradient
 evals each). For `N_SEGMENTS = 4` and 6K points this is ~24K SDF
-evaluations — negligible compared to the shading pass which already does
-~4 `rayClearance` traces per point.
+evaluations — negligible compared to the shading pass's per-point
+visibility trace (one `rayClearance` per point since Step 1c).
 
 ### 3. Principal direction: orthogonal to the light's tangent projection
 
@@ -202,16 +207,19 @@ minimum clearance. The render shader culls or fades segments whose
 clearance is negative (occluded by the surface between the segment and the
 camera).
 
-This mirrors the shading pass's per-corner clearance approach but applied
-to curve points. The cost is one `rayClearance` trace per curve point per
-frame — for `N_SEGMENTS + 1 = 5` points and 6K stipple points, that is
-~30K traces, comparable to the shading pass's existing ~24K corner traces.
+This reuses the same `rayClearance` infrastructure the shading pass uses
+for its per-point visibility trace (one center ray per point since
+Step 1c), applied to curve points. The cost is one `rayClearance` trace
+per curve point per frame — for `N_SEGMENTS + 1 = 5` points and 6K
+stipple points, that is ~30K traces, about 5× the shading pass's
+per-point visibility traces.
 
 **Step 1 uses a coarse visibility check**: a segment is drawn if at least
-one of its two endpoints has positive maximum corner clearance in the
-existing `shadingBuffer` (i.e. at least one endpoint's stipple splat is
-visible to the camera). This is free (no extra compute) and sufficient
-to validate the connection-finding logic.
+one of its two endpoints has positive clearance in the existing
+`shadingBuffer` (since Step 1c a single center-ray value per point; i.e.
+at least one endpoint's stipple dot is visible to the camera). This is
+free (no extra compute) and sufficient to validate the
+connection-finding logic.
 
 ### 8. Compile-time WGSL constants
 
@@ -305,7 +313,8 @@ The link stages are inserted into the per-frame pipeline after shading and
 before the render pass:
 
 ```
-reproject → grid build → relax (substeps) → shading
+reproject (+ per-point luminance, Step 1c) → grid build → relax (substeps)
+   → shading (normals refresh + center-ray visibility clearance)
    │
    ▼
 grid rebuild (from post-relax buffer)          ← NEW (reuses SpatialGridPipeline)
@@ -330,6 +339,14 @@ relaxed positions. The link compute reads the same buffer plus the fresh
 grid and the shared normals buffer (written by the shading pass). The
 `linkCurves` buffer is written once per frame and read by the link render
 inside the same render pass as the point render.
+
+The relax substeps additionally read the shared `shadingBuffer` for
+per-neighbor luminance to modulate point density (Step 1d). Since
+Step 1c, the luminance is written by the **reproject pass** earlier in
+the same frame (before the relax substeps), so relax reads fresh
+same-frame values rather than last frame's. The buffer is not
+ping-ponged, so the binding is the same for both relax read bind groups
+(A/B).
 
 While time is paused, the grid rebuild and link compute are skipped
 (positions, normals, and animation time are unchanged, so the links from
@@ -468,7 +485,7 @@ DISTANCE_WEIGHT * dist` and track the maximum. After the scan, write
 | 0 | uniform `LinkRenderUniform` | `view_proj: mat4x4f, eye: vec3f, _pad: f32` (80 B) |
 | 1 | storage, read `points` | `array<Point>` — the post-relax point buffer |
 | 2 | storage, read `links` | `array<u32>` |
-| 3 | storage, read `shading` | `array<ShadingSample>` |
+| 3 | storage, read `shading` | `array<PointShading>` |
 
 Vertex shader: `vid` selects endpoint 0 or 1. Endpoint 0 = `points[inst]`
 (the point itself); endpoint 1 = `points[links[inst]]` (the linked
@@ -544,6 +561,208 @@ fused mutual-break drops the larger-index edge of each 2-cycle. The
 number of rendered segments drops (edges = distinct targets). If lines
 become too sparse, revisit the winner criterion (best-continuation
 election, see *Switch points*).
+
+### Step 1c — Simplified point renderer + pre-relax luminance
+
+**Status:** completed.
+
+**Goal:** demote the point renderer from the elaborate corner-clearance
+splat renderer to a simple fixed-size dot overlay, and restructure the
+shading work so the view-independent luminance is computed *before*
+relax. Step 1d's density modulation then reads fresh same-frame values
+instead of last frame's, and the first-frame transient disappears.
+
+**Point renderer — fixed-size dots.** The tangent-plane quad stays
+(normals-buffer orientation, `POINT_RADIUS_WORLD` half-extent, 6-vertex
+triangle list, src-alpha blending), but the fragment shader paints a
+plain anti-aliased **filled disc** of fixed radius instead of a
+luminance-scaled ring, and there are no per-corner clearance values and
+no per-fragment clearance clipping. Dots therefore have the same size
+in lit and shadowed regions. The vertex shader keeps a coarse occlusion
+cull: a point whose **center-ray** clearance (from the shading buffer)
+is ≤ 0 is pushed offscreen — one comparison, not a corner check.
+
+**Shading pass slimmed to normals + visibility clearance.** The pass
+keeps the post-relax normals refresh and now traces a single center-ray
+`rayClearance` per point (instead of center + up to four corner traces,
+each with a `projectToSurface`). It no longer computes luminance, and
+its writes are member-wise (`shading_out[i].clearance` only) so the
+reproject-written luminance in the same buffer is not clobbered. The
+back-face guard (`dot(n, eye_dir) <= 0`) writes an explicitly occluded
+clearance (a negative value) instead of being traced. The pass remains
+view-dependent and runs every frame, including while paused.
+
+The per-point shading record is a **single packed 16-byte value**
+(`PointShading` in `SDF_COMMON`): the view-independent `luminance` and
+the center-ray `clearance` as named `f32` fields plus two spare slots —
+every per-point buffer element is 16 bytes, and each pass writes one
+field. Compared to the old per-corner maximum, the cull tightens
+slightly near silhouettes (a point whose center is occluded but whose
+corners peek out is now culled) — acceptable for a stopgap that Step 4
+replaces with per-segment traces.
+
+**Luminance moved into the reproject pass.** Luminance
+(`lit * lambert`) is view-independent — it needs only position, normal,
+and the light, never the eye — so it can be computed before relax. The
+reproject pass already evaluates each point's projected position and
+fresh surface normal; after projecting, it computes
+`lambert = max(dot(n, lightDir(time)), 0.0)`, traces
+`softShadow(p + n·SHADOW_BIAS, light, time)` only when `lambert > 0`,
+and writes `shading_out[i].luminance = lit * lambert` (member-wise,
+leaving the `clearance` field — owned by the shading pass — untouched). The pass stays view-independent and gated on
+`playedThisFrame`, like relax itself. The old view-dependent luminance
+semantics (zeroed for back-facing points, consumed by the retired ring
+renderer) is retired; the `luminance` field now holds the
+view-independent value. First-frame transient: none — reproject
+writes luminance before relax's first dispatch, so relax never reads
+the zero-initialized buffer.
+
+**Changes:**
+- `point-shader.ts`: drop the `luminance`/`clearance` varyings and the
+  ring; render an AA filled disc at a fixed radius (new WGSL constant
+  `POINT_DOT_RADIUS`, a fraction of the quad half-extent); keep the
+  center-clearance offscreen cull in the vertex shader.
+- `shading-shader.ts`: drop `cornerClearance` and luminance; trace one
+  center-ray clearance; member-wise `clearance` writes.
+- `reproject-shader.ts`: add the `shading_out` binding (binding 3) and
+  the luminance computation/write.
+- `reproject-pipeline.ts`: add `shadingBuffer` to both bind groups.
+- `link-render-shader.ts`: the coarse visibility check reads the scalar
+  `clearance` field directly (the `max()` over four components goes
+  away).
+- `main.ts`: add `DRAW_POINTS = true` (const, beside `DRAW_DEBUG`) and
+  guard the `pointRender.render` call; update the frame-loop TSDoc.
+- `AGENTS.md`: update the structural-overview bullets for
+  `reproject-pipeline.ts`, `shading-pipeline.ts`,
+  `point-render-pipeline.ts`, and `point-buffers.ts`.
+
+**Verify:** `npm run dev`. Points render as identical-size dots in lit
+and shadowed regions (no ring, no luminance-dependent size). Dots
+disappear when `DRAW_POINTS = false`; links are unaffected. Dots on the
+far side of the shape are still culled via the center-ray clearance.
+Run `npm run lint` (the step touches TS files).
+
+### Step 1d — Luminance-driven density modulation in the relax kernel
+
+**Status:** not started.
+
+**Goal:** make points pack more densely in unlit (low-luminance) regions
+and spread out in lit regions, so that hatch lines — which connect
+neighboring points — are denser in shadow and sparser in light,
+encoding brightness via density (the classical hatching signal) rather
+than via line color or alpha.
+
+**Mechanism — j-based effective radius.** The relax kernel's force is
+`force += (1 - d_E/r) * diff/d_E`, gated by `d_E > r`. To modulate
+density, the effective interaction radius is computed **per neighbor j**
+from j's luminance:
+
+```wgsl
+let lum_j = shading_in[j].luminance;
+let r_eff_j = r * mix(MIN_RADIUS_SCALE, 1.0, lum_j);
+```
+
+and substitutes `r_eff_j` for `r` in both the distance gate and the
+kernel envelope:
+
+```wgsl
+if (d_E > r_eff_j) { continue; }                      // was: d_E > r
+// ... coincident kick and thin-wall filter unchanged (keep original r) ...
+force += (1.0 - d_E / r_eff_j) * diff / d_E;           // was: (1.0 - d_E / r)
+```
+
+The thin-wall filter and coincident-pair kick keep the original `r` —
+they are geometric predicates (surface thickness, degenerate pair
+separation), not spacing controls. `lum_i` is not read; the modulation
+is purely j-based, so point i's own luminance never enters its own
+force accumulation.
+
+Dark neighbors (low `lum_j`) get a small effective radius — they only
+repel within a small shell, so points can pack close around them. Lit
+neighbors get the full radius — normal spacing. The asymmetry is key:
+when point i is processed, the force from a lit neighbor uses
+`r_eff = r` (full push), while the force from a dark neighbor uses
+`r_eff = r * MIN_RADIUS_SCALE` (weak push). At a lit/dark boundary,
+dark points feel strong repulsion from their lit neighbors (pushed
+deeper into the dark region) but weak repulsion from their dark
+neighbors (can sit close) — net migration into dark regions. In a
+uniform dark interior, all neighbors are dark → all radii small →
+equilibrium spacing scales with `r * MIN_RADIUS_SCALE` → up to
+`(1/MIN_RADIUS_SCALE)²`× denser than lit regions. Points are conserved
+(no creation/destruction); density redistribution is emergent from the
+asymmetric force.
+
+**Luminance source — computed by the reproject pass (Step 1c).** The
+reproject pass already computes each point's projected position and
+fresh surface normal before relax runs; Step 1c extended it to also
+compute the view-independent luminance `lit * lambert` (where
+`lit = softShadow(...)` ∈ [0,1] is shadow-aware and `lambert =
+max(dot(n, light), 0.0)` ∈ [0,1], with the `softShadow` trace skipped
+when `lambert <= 0`) and write it to the shading buffer's `luminance`
+field. The
+values are view-independent (they depend only on position, normal, and
+the light — never on the camera), so density tracks the light and stays
+stable while orbiting. Because the reproject pass dispatches before the
+relax substeps in the same frame, relax reads **fresh same-frame**
+values — no cross-frame staleness, no first-frame transient (see
+below). Luminance is computed from pre-relax positions; points drift
+<0.05/frame vs 0.3 cell size, so the within-frame drift is negligible.
+
+**Why not alternatives:**
+
+- *i-based radius* (compute `r_eff` from point i's own luminance):
+  produces migration in the wrong direction — lit points flee dark
+  neighbors (full radius felt), dark points don't move (reduced radius
+  → weak forces felt) → lit regions empty, dark regions don't fill.
+  Rejected.
+- *Drift force* (`F_drift = -∇lum`): the 27-cell gradient estimate is
+  too local (0.3-unit scale) and noisy to drive smooth migration.
+  Rejected.
+- *Dedicated pre-relax shadow pass*: an extra compute pass per frame
+  (~6K `softShadow` traces) for fresh, shadow-aware luminance.
+  Superseded — Step 1c folded the luminance computation into the
+  existing reproject pass, which already evaluates the projected
+  position and normal, at zero extra dispatches.
+
+**Grid safety.** `r_eff_j ≤ r = cell_size` always (we only shrink,
+never grow), so the existing 27-cell neighborhood search always covers
+the full interaction range. No grid changes.
+
+**First-frame transient.** None: the reproject pass writes luminance
+before relax's first-ever dispatch (both run on the first playing
+frame), so relax never reads the zero-initialized shading buffer.
+
+**New compile-time WGSL constant** (defined in the relax shader,
+following decision 8's pattern — literal value in WGSL, documented
+here for reference):
+
+| Constant | Default | Description |
+|---|---|---|
+| `MIN_RADIUS_SCALE` | `0.5` | Minimum effective radius scale at `lum=0`. Dark regions pack up to `(1/0.5)² = 4×` denser than lit regions. Tune visually. |
+
+**Relax shader bindings after Step 1d:**
+
+| Binding | Type | Description |
+|---|---|---|
+| 0 | uniform `RelaxParams` | `dt, radius, time, point_count` (16 B) |
+| 1 | storage, read `points_in` | `array<Point>` — the read-side point buffer |
+| 2 | storage, read_write `points_out` | `array<Point>` — the write-side point buffer |
+| 3 | storage, read `normals_in` | `array<vec4f>` — shared normals buffer |
+| 4 | uniform `GridParams` | Grid params (bbox, dims, cell size) |
+| 5 | storage, read `sorted_values` | `array<u32>` |
+| 6 | storage, read `cell_start` | `array<u32>` |
+| 7 | storage, read `cell_count` | `array<u32>` |
+| 8 | storage, read `shading_in` | `array<PointShading>` — shared shading buffer (reads the `luminance` field per neighbor) — **NEW** |
+
+**Verify:** `npm run dev`. Points should visibly cluster in shadowed
+regions (surfaces facing away from the light, and in cast shadows) and
+spread out in lit regions. Rotate the camera — the clustering should be
+**view-independent** (it tracks the light, not the camera). Pause time
+and orbit: clusters stay fixed to the surface, not the view. Hatch lines
+(from Steps 1/1b) should appear denser in dark regions. If points
+collapse into tight blobs in deep shadow, raise `MIN_RADIUS_SCALE`
+(toward 1.0 for subtler effect). If the effect is too weak, lower it
+(toward 0.3 for ~11× density).
 
 ### Step 2 — Curve subdivision + projected line-list render
 
@@ -631,8 +850,9 @@ are not visible through it.
     f32, point_count: u32, distance_weight: f32, link_radius: f32,
     _pad: u32` (32 B). `dispatch` gains an `eye` parameter.
   - **Cost:** `N_SEGMENTS + 1` `rayClearance` traces per point per frame.
-    For `N_SEGMENTS = 4`, 6K points: ~30K traces. Comparable to the
-    shading pass's existing ~24K corner traces. Acceptable.
+    For `N_SEGMENTS = 4`, 6K points: ~30K traces — about 5× the shading
+    pass's per-point visibility traces (one per point since Step 1c).
+    Acceptable.
 - `link-render-shader.ts`: the vertex shader reads `.w` as clearance
   instead of a binary flag. Push offscreen if `.w <= 0.0` (invalid or
   fully occluded). Optionally pass clearance as a varying and let the
@@ -697,6 +917,8 @@ checkpoint to:
 |---|---|
 | 1 | Lines appear connecting nearby points, roughly orthogonal to the light direction. Lines fade when both endpoints are occluded. Connections look sensible (not random). |
 | 1b | No fans/stars at popular targets: every point has at most one incoming and one outgoing edge, so links form chains. No mutual-link pairs (both segments of an i↔j pair render) — the dedup dispatch's fused mutual-break drops the larger-index edge. Segment count drops (edges = distinct targets) but lines stay dense enough. |
+| 1c | Points render as fixed-size dots irrespective of luminance or shadow. `DRAW_POINTS = false` in `main.ts` hides them; links are unaffected. Dots behind the surface are still culled via the center-ray clearance. Shading pass does one `rayClearance` trace per point. |
+| 1d | Points visibly cluster in shadowed regions and spread out in lit regions. Clustering is view-independent (tracks the light, not the camera — pause time and orbit to confirm). Hatch lines appear denser in dark regions. No point collapse in deep shadow. |
 | 2 | Lines curve along the surface in high-curvature regions instead of cutting through. No visible penetration of the SDF surface. |
 | 3 | Lines have visible width with smooth anti-aliased edges. Width foreshortens with viewing angle. Billboard behavior correct when rotating. |
 | 4 | Lines on the far side of the shape are culled. Soft fade near silhouette edges. No lines visible through the surface. |
@@ -715,9 +937,6 @@ checkpoint to:
   Requires binding `shadingBuffer` in the link render pipeline and
   interpolating luminance across the curve (or sampling it per curve
   point in the compute shader).
-- **Density modulation**: With hatching, we typically do not encode brightness via luminance modulation of the lines but via density 
-  modulation. Maybe we can try to achieve that later by modulating the forces in the force kernel of the relax step by the luminance of
-  the points so that points have less spacing in darker regions.
 - **Best-continuation link election** — replace the smallest-source-index
   owner election with a packed `(quantized continuation-alignment score,
   source index)` `atomicMin` key, so the suitor whose edge best continues

@@ -1,15 +1,14 @@
 /**
- * Shading compute pipeline — per-point visibility, shadow, and normal
+ * Shading compute pipeline — per-point visibility clearance and normal
  * refresh.
  *
  * Each frame, {@link dispatch} records a single compute pass that runs
  * after relax and before the point render. One invocation per point
  * reads the buffer relax most recently wrote, computes the surface
- * normal from the (final) position, writes it into the shared
- * {@link PointBuffers.normalsBuffer}, then sphere-traces toward the eye
- * to sample per-corner occlusion clearances and toward the light (soft
- * shadow) and writes the result into the shared
- * {@link PointBuffers.shadingBuffer}.
+ * normal from the (final) position and writes it into the shared
+ * {@link PointBuffers.normalsBuffer}, then sphere-traces a single
+ * center-ray occlusion clearance toward the eye and writes it into the
+ * shared {@link PointBuffers.shadingBuffer}.
  *
  * Because the shading pass writes normals from the buffer relax just
  * produced, the normals buffer always matches the buffer that the
@@ -44,8 +43,9 @@ const SHADING_PARAMS_BUFFER_BYTES = 32;
  * ping-pong read bind groups.
  *
  * The normals and shading buffers are allocated once by
- * {@link PointBuffers} and shared (not ping-ponged) — both are written
- * by this pass every frame.
+ * {@link PointBuffers} and shared (not ping-ponged) — this pass writes
+ * the normals buffer and the shading buffer's clearance field every
+ * frame; the luminance field is written by the reproject pass.
  */
 export class ShadingPipeline {
     private readonly device: GPUDevice;
@@ -140,9 +140,9 @@ export class ShadingPipeline {
      *
      * Reads from one point buffer (depending on `readFromA`) — this must
      * match the buffer relax most recently wrote. Writes the refreshed
-     * normals and the per-point shading result into the shared buffers.
-     * Should be called after {@link RelaxPipeline.dispatch} and before the
-     * render pass.
+     * normals and the per-point visibility clearance into the shared
+     * buffers. Should be called after {@link RelaxPipeline.dispatch} and
+     * before the render pass.
      *
      * @param encoder - The command encoder to record into.
      * @param eye - Camera eye position in world space.

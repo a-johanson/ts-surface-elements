@@ -1,12 +1,15 @@
 /**
- * Point render pipeline — draws stipple points as tangent-plane quads
- * oriented from the shared normals buffer and projected from 3D world
- * space onto the canvas.
+ * Point render pipeline — draws stipple points as fixed-size dots:
+ * tangent-plane quads oriented from the shared normals buffer and
+ * projected from 3D world space onto the canvas.
  *
  * The vertex shader builds an orthonormal tangent basis from the
  * pre-computed surface normal at each point and offsets the quad corners
  * in world space by `point_radius_world`, so quads lie flat on the SDF
- * surface and foreshorten with viewing angle.
+ * surface and foreshorten with viewing angle. Points whose center-ray
+ * clearance (from the shading buffer) is non-positive are pushed
+ * offscreen. The fragment shader paints a fixed-size anti-aliased dot,
+ * independent of luminance.
  *
  * Two bind groups support the ping-pong buffer pair so the render can
  * read from whichever buffer the relax pass most recently wrote to. The
