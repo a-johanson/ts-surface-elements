@@ -1,16 +1,23 @@
 /**
- * Link render shader — draws each point's link as a straight line
- * segment to its best-aligned neighbor (`line-list` topology, one line
- * per point instance).
+ * Link render shader — draws each surviving link as a chain of
+ * `N_SEGMENTS` straight line segments following the subdivided,
+ * surface-projected curve written by the link compute pass
+ * (`line-list` topology, one sub-segment per instance).
  *
- * The vertex shader resolves the two endpoints from the post-relax point
- * buffer: endpoint 0 is the point itself, endpoint 1 is its linked
- * neighbor. Points with no link (`UINT_MAX`) and links whose endpoints
- * are both fully occluded (both endpoints' center-ray clearance in the
- * shading buffer is non-positive) are pushed offscreen so no fragments
- * are rasterized for them.
+ * Each instance maps to point `i = inst / N_SEGMENTS` and sub-segment
+ * `s = inst % N_SEGMENTS`; the endpoints are the adjacent curve points
+ * `curves[i * STRIDE + s]` and `curves[i * STRIDE + s + 1]`.
  *
- * The fragment shader paints a solid translucent color.
+ * Two offscreen culls apply in the vertex shader:
+ *
+ *  - a link with no neighbor (or dropped by dedup) has an invalid
+ *    curve slice — the validity flag `.w == 0.0` on either endpoint;
+ *  - the interim coarse visibility cull (Step 2b in the hatch-lines
+ *    spec): a link whose stipple endpoints are both fully occluded
+ *    (non-positive center-ray clearance in the shading buffer) draws
+ *    nothing. Per-segment occlusion replaces this in Step 4.
+ *
+ * The fragment shader paints a solid color.
  */
 import { SDF_COMMON } from "./sdf-common.js";
 
@@ -23,10 +30,18 @@ struct LinkRenderUniform {
     _pad: f32,
 };
 
-const UINT_MAX: u32 = 0xFFFFFFFFu;
+/**
+ * Curve subdivision count per link — must match the N_SEGMENTS
+ * constant in the link shader (the WGSL value is the source of truth;
+ * this mirror resolves the instance → point/sub-segment mapping).
+ */
+const N_SEGMENTS: u32 = 4u;
+
+/** Curve points per link (N_SEGMENTS + 1). */
+const STRIDE: u32 = N_SEGMENTS + 1u;
 
 @group(0) @binding(0) var<uniform> u: LinkRenderUniform;
-@group(0) @binding(1) var<storage, read> points: array<Point>;
+@group(0) @binding(1) var<storage, read> curves: array<vec4f>;
 @group(0) @binding(2) var<storage, read> links: array<u32>;
 @group(0) @binding(3) var<storage, read> shading: array<PointShading>;
 
@@ -35,22 +50,26 @@ fn link_vs(
     @builtin(vertex_index) vid: u32,
     @builtin(instance_index) iid: u32,
 ) -> @builtin(position) vec4f {
-    let j = links[iid];
-    if (j == UINT_MAX) {
+    let i = iid / N_SEGMENTS;
+    let s = iid % N_SEGMENTS;
+    let e0 = curves[i * STRIDE + s];
+    let e1 = curves[i * STRIDE + s + 1u];
+    if (e0.w == 0.0 || e1.w == 0.0) {
         return vec4f(2.0, 2.0, 2.0, 1.0);
     }
 
-    // Coarse visibility: draw only when at least one endpoint's stipple
-    // dot is visible to the camera.
-    let clearance_i = shading[iid].clearance;
+    // Coarse visibility (interim until per-segment clearance arrives
+    // in Step 4): draw only when at least one endpoint's stipple dot
+    // is visible to the camera. The validity check above guarantees a
+    // surviving link, so j is a valid point index here.
+    let j = links[i];
+    let clearance_i = shading[i].clearance;
     let clearance_j = shading[j].clearance;
     if (clearance_i <= 0.0 && clearance_j <= 0.0) {
         return vec4f(2.0, 2.0, 2.0, 1.0);
     }
 
-    let p_i = points[iid].pos.xyz;
-    let p_j = points[j].pos.xyz;
-    let p = select(p_j, p_i, vid == 0u);
+    let p = select(e1.xyz, e0.xyz, vid == 0u);
     return u.view_proj * vec4f(p, 1.0);
 }
 

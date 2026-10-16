@@ -54,7 +54,8 @@ point render so points sit on top.
 
 ## Assumptions
 
-- `POINT_COUNT = 6 * 1024` (current `main.ts` constant).
+- `POINT_COUNT` between `6 * 1024` and `16 * 1024` (currently
+  `10 * 1024` in `main.ts`).
 - `RELAX_RADIUS = 0.3` (current cell size / relax interaction radius).
 - The spatial grid (`SpatialGridPipeline`) and its `GridBuffers` interface
   are available and already wired into the frame loop.
@@ -100,26 +101,40 @@ size (0.3), so most neighbor pairs are still found. If visual quality is
 acceptable with the stale grid, the second rebuild can be dropped. See
 *Switch points*. For now, the spec mandates the correct (rebuild) path.
 
-### 2. Single compute pass: scan + subdivide + project
+### 2. Single compute pass: scan → dedup → subdivide + project
 
-The link compute shader does **both** the neighbor scan and the curve
-subdivision in a single pass. After finding the best neighbor `j` for
-point `i`, the shader immediately subdivides `lerp(p_i, p_j, t)` for `t ∈
-[0, 1]` in `N_SEGMENTS` steps and Newton-projects each sample onto the
-SDF surface, writing `N_SEGMENTS + 1` `vec4f` positions per point (`.xyz`
-= position, `.w` = validity flag). This eliminates the need for an
-intermediate `u32` index buffer and a second compute pass.
+The link compute does the neighbor scan, the dedup decision, and the
+curve subdivision in a single pass of three dispatches (see decision 9
+for the dispatch breakdown). The subdivision runs in the third dispatch
+— **after** the dedup decision — so dropped links never emit curve
+points: the scan finds the best neighbor `j` for point `i` and records
+it in the `links` buffer; the third dispatch (dedup+subdiv) then drops
+losing links and, for surviving links, subdivides `lerp(p_i, p_j, t)`
+for `t ∈ [0, 1]` in `N_SEGMENTS` steps, Newton-projects each sample
+onto the SDF surface, and writes `N_SEGMENTS + 1` `vec4f` positions
+per point (`.xyz` = position, `.w` = validity flag) into `linkCurves`;
+dropped or absent links zero their slice, so every slice is rewritten
+each frame (the buffer persists across frames and keeps rendering while
+paused).
+
+**Historical note.** This decision originally placed the subdivision
+inline in the scan dispatch and eliminated the `u32` index buffer;
+both were overtaken by decision 9 (owner election + dedup), which needs
+the `u32` `links` buffer as working state and requires curve emission
+to happen after the dedup decision so deduped-out edges never render.
 
 **Step 1 exception.** Step 1 (the initial validation step) writes a
 simple `u32` index per point and renders a flat line-list — no
 subdivision, no projection. This is intentionally minimal to verify the
 neighbor-finding logic produces visually sensible connections. Step 2
-replaces the `u32` index buffer with the subdivided curve buffer.
+moves the curve buffer in alongside the (now internal) `u32` index
+buffer.
 
-**Cost.** `N_SEGMENTS` Newton projections per point (~4 `map()` + gradient
-evals each). For `N_SEGMENTS = 4` and 6K points this is ~24K SDF
-evaluations — negligible compared to the shading pass's per-point
-visibility trace (one `rayClearance` per point since Step 1c).
+**Cost.** `N_SEGMENTS` Newton projections per surviving link (~4
+`map()` + gradient evals each); dropped links only zero their slice.
+For `N_SEGMENTS = 4` and 6K points this is ~24K SDF evaluations —
+negligible compared to the shading pass's per-point visibility trace
+(one `rayClearance` per point since Step 1c).
 
 ### 3. Principal direction: orthogonal to the light's tangent projection
 
@@ -170,9 +185,12 @@ compute reads from whichever point buffer relax most recently wrote
 (determined by `readFromA` at call time), so it needs two read bind groups
 (A and B), like the shading pipeline.
 
-In Step 1, the output is a simpler `linksBuffer` of `u32 × point_count`
-(best neighbor index or `UINT_MAX`). Step 2 replaces it with the curve
-buffer.
+In Step 1, the output was a simpler `linksBuffer` of `u32 × point_count`
+(best neighbor index or `UINT_MAX`); since Step 2, that buffer is
+internal working state for the dedup machinery (decision 9) and the
+render-facing output is the curve buffer. From Step 2, the
+dedup+subdiv dispatch also reads the same ping-pong-selected point
+buffer (for `p_i`/`p_j`), so it carries A/B bind groups of its own.
 
 ### 6. Rendering: camera-facing quads (Step 3+)
 
@@ -268,23 +286,29 @@ no extra sort machinery. Three dispatches inside one compute pass:
 2. The link compute scan writes `links[i] = best_j` and, for valid
    links, `atomicMin(&owners[best_j], i)` — after the dispatch,
    `owners[j]` is the smallest source index targeting `j`.
-3. The dedup pass clears `links[i]` to `UINT_MAX` when
-   `owners[links[i]] != i` (i's edge lost the election). It
-   **additionally breaks mutual 2-cycles**: when `owners[j] == i`
-   (i's edge survived) **and** `owners[i] == j` (j's surviving edge
-   targets i) **and** `i > j`, clear `links[i] = UINT_MAX`. This reads
-   only the stable `owners` buffer (written by the prior scan+elect
-   dispatch) plus the own `links[i]` slot (read-before-write), so it is
-   race-free within the existing dedup dispatch — no new pass, buffer,
-   or dispatch. Both i and j evaluate the predicate; exactly the
-   larger index drops, so one segment of each mutual pair survives.
+3. The **dedup+subdiv** dispatch evaluates, per point, whether `i`'s
+   edge survived the election (`owners[links[i]] == i`) and clears
+   `links[i]` to `UINT_MAX` when it did not. It **additionally breaks
+   mutual 2-cycles**: when `owners[j] == i` (i's edge survived) **and**
+   `owners[i] == j` (j's surviving edge targets i) **and** `i > j`,
+   clear `links[i] = UINT_MAX`. This reads only the stable `owners`
+   buffer (written by the prior scan+elect dispatch) plus the own
+   `links[i]` slot (read-before-write), so it is race-free within the
+   dispatch — no new pass, buffer, or dispatch. Both i and j evaluate
+   the predicate; exactly the larger index drops, so one segment of
+   each mutual pair survives. It then emits the render-facing geometry
+   (decision 2): surviving links are subdivided into `N_SEGMENTS`
+   surface-projected segments written to `linkCurves`; dropped or
+   absent links zero their slice.
 
 All three run inside `LinkPipeline.dispatch` (one compute pass, three
 dispatches — WebGPU orders dispatches within a pass, so each stage's
 writes are visible to the next), so `main.ts` is unchanged. Winner
 criterion: smallest source index (deterministic). Mutual links (2-cycles
-i↔j) are removed by the fused mutual-break in the dedup dispatch's
-step 3 — no separate chain-filtering pass is needed.
+i↔j) are removed by the fused mutual-break in the dedup+subdiv
+dispatch — no separate chain-filtering pass is needed. The `links`
+buffer is internal working state; since Step 2 the render consumes the
+curve buffer instead (decision 5).
 
 **Cost.** Two extra N-sized dispatches plus one atomic per point —
 ~120 KB traffic, no contention hot spots. Negligible next to the
@@ -320,16 +344,17 @@ reproject (+ per-point luminance, Step 1c) → grid build → relax (substeps)
 grid rebuild (from post-relax buffer)          ← NEW (reuses SpatialGridPipeline)
    │
    ▼
-link compute (scan + subdivide + project)      ← NEW — writes linkCurves buffer
+link compute (scan → dedup → subdivide + project)  ← NEW — writes linkCurves buffer
    │  reads: points[readFromA], normalsBuffer, grid buffers
    │  writes: linkCurves (not ping-ponged)
-   │  internally: owner clear → scan+elect (atomicMin) → dedup
-   │  (with fused mutual-break)
-   │  (one compute pass, 3 dispatches — decision 9)
+   │  internally: owner clear → scan+elect (atomicMin) →
+   │  dedup+subdiv (fused mutual-break + curve emission)
+   │  (one compute pass, 3 dispatches — decisions 2 and 9)
    │
    ▼
 render pass:
-   link render (camera-facing quads)            ← NEW — drawn first
+   link render (line-list from Step 2; camera-facing
+   quads from Step 3)                           ← NEW — drawn first
    point render (existing)                      — drawn on top
 ```
 
@@ -366,14 +391,14 @@ if (playedThisFrame) {
     // --- Grid rebuild from post-relax positions (for link pass) ---
     spatialGrid.dispatch(encoder, shadingReadsA);
 
-    // --- Link compute: find connections + subdivide + project ---
-    link.dispatch(encoder, eye, time, shadingReadsA);
+    // --- Link compute: find connections → dedup → subdivide + project ---
+    link.dispatch(encoder, time, shadingReadsA);
 }
 
 // --- Render pass: link render (under) + point render (top) ---
 const pass = encoder.beginRenderPass({ /* ... */ });
-linkRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
-pointRender.render(pass, eye, gpu.canvas, renderReadsA, points.count);
+linkRender.render(pass, eye, target, gpu.canvas, points.count);
+pointRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
 pass.end();
 ```
 
@@ -391,19 +416,22 @@ pass.end();
 
 | Buffer | Size | Usage | Owner / writer |
 |---|---|---|---|
+| `linksBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (internal working state: scan writes best-neighbor indices; dedup+subdiv reads and drops losers) |
+| `ownersBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (internal: clear + atomicMin election + read in dedup+subdiv, once per frame) |
 | `linkCurves` | `point_count * (N_SEGMENTS + 1) * 16` B | `STORAGE` | link-pipeline (compute, once per frame) |
 | `linkRenderUniform` | `80` B (`mat4x4f` + `vec3f` eye + pad) | `UNIFORM \| COPY_DST` | link-render-pipeline (CPU write per frame) |
 
-With `N_SEGMENTS = 4` and `POINT_COUNT = 6144`, `linkCurves` is
-`6144 * 5 * 16 = 491,520 B ≈ 480 KB` — trivial.
+With `N_SEGMENTS = 4` and `POINT_COUNT` between `6 * 1024` and
+`16 * 1024`, `linkCurves` is `POINT_COUNT * 5 * 16` B ≈ 480 KB –
+1.25 MB — trivial.
 
 ## Module structure
 
 | File | Responsibility |
 |---|---|
-| `src/stipple/link-pipeline.ts` | Owns the link compute pass: shader module, compute pipeline, params uniform, ping-pong read bind groups (A/B), the output buffer (`linksBuffer` in Step 1, `linkCurves` from Step 2), and the dedup working buffers (Step 1b). |
-| `src/stipple/shaders/link-shader.ts` | WGSL compute shader. Includes `SDF_COMMON`, duplicates `GridParams` (same as relax/shading — WGSL has no cross-module struct import). Exports `LINK_SHADER` (Step 1) and later `buildLinkShader(...)` (Step 2+) — constants are defined directly in the WGSL (see decision 8). |
-| `src/stipple/link-render-pipeline.ts` | Owns the link render pipeline: shader module, render pipeline, uniform buffer, and bind group. From Step 3, no ping-pong bind groups (the curve buffer is not ping-ponged). |
+| `src/stipple/link-pipeline.ts` | Owns the link compute pass: shader module, compute pipelines, params uniform, ping-pong read bind groups (A/B) for the scan and the dedup+subdiv stage, the render-facing output buffer (`linksBuffer` in Step 1, `linkCurves` from Step 2), and the internal working buffers (`linksBuffer` from Step 2, `ownersBuffer`). |
+| `src/stipple/shaders/link-shader.ts` | WGSL compute shader. Includes `SDF_COMMON`, duplicates `GridParams` (same as relax/shading — WGSL has no cross-module struct import). Exports `LINK_SHADER` (one module, one entry point per stage). Constants are defined directly in the WGSL (see decision 8). |
+| `src/stipple/link-render-pipeline.ts` | Owns the link render pipeline: shader module, render pipeline, uniform buffer, and a single bind group (curve buffer, plus the `links` and `shading` buffers for the Step 2b interim visibility cull — nothing ping-ponged since Step 2). |
 | `src/stipple/shaders/link-render-shader.ts` | WGSL vertex/fragment shader. Step 1: `line-list` topology, reads point buffer + links buffer. Step 2: reads `linkCurves` buffer. Step 3: camera-facing quads. Step 4: occlusion culling. |
 
 All new shaders are re-exported through `src/stipple/shaders/index.ts`.
@@ -766,41 +794,109 @@ collapse into tight blobs in deep shadow, raise `MIN_RADIUS_SCALE`
 
 ### Step 2 — Curve subdivision + projected line-list render
 
+**Status:** completed.
+
 **Goal:** make lines follow the surface curvature by subdividing each
 link into `N_SEGMENTS` surface-projected segments.
 
 **Changes:**
-- `link-shader.ts`: replace the `u32 links_out` output with a
-  `linkCurves_out: array<vec4f>` output of size
-  `point_count * (N_SEGMENTS + 1)`. After finding `best_j`, subdivide
-  `lerp(p_i, p_j, t)` for `t ∈ {0, 1/N, 2/N, ..., 1}` and Newton-project
-  each sample onto the surface via `projectToSurface`. Write
-  `linkCurves[i * STRIDE + k] = vec4f(projected_pos, 1.0)` for valid
-  links, `vec4f(0.0, 0.0, 0.0, 0.0)` for invalid (`.w = 0.0` flag).
-  All tunable constants (`N_SEGMENTS`, `DISTANCE_WEIGHT`, etc.) are
-  defined directly in the WGSL as `const` declarations (see decision 8).
-- `link-pipeline.ts`: replace `linksBuffer` with `linkCurves` buffer
-  (`point_count * (N_SEGMENTS + 1) * 16` B). Update the bind group
-  (binding 7 changes from `array<u32>` to `array<vec4f>` — same buffer,
-  different WGSL type annotation). The `GridBuffers` interface is passed
-  at construction (same as Step 1). Export `linkCurves` buffer for the
-  render pipeline to bind.
-- `link-render-shader.ts`: read `linkCurves` instead of `points +
-  links`. Each instance `inst` maps to point `i = inst / N_SEGMENTS`,
-  segment `s = inst % N_SEGMENTS`. Endpoint 0 =
-  `linkCurves[i * STRIDE + s]`, endpoint 1 =
-  `linkCurves[i * STRIDE + s + 1]`. If either `.w == 0.0`, push
-  offscreen. `draw(2, pointCount * N_SEGMENTS)`.
-- `link-render-pipeline.ts`: bind group now binds `linkCurves` (single
-  buffer, no ping-pong needed for the curve data) plus the uniform. Drop
-  the `pointsA` / `pointsB` / `links` / `shading` bindings (Step 2
-  visibility uses the `.w` flag only; the `shadingBuffer`-based visibility
-  from Step 1 is dropped — per-segment occlusion arrives in Step 4).
-  `render(pass, eye, canvas, pointCount)` — no `readFromBufferA` needed.
+- `link-shader.ts`: add the curve constants (`N_SEGMENTS`,
+  `LINK_NEWTON_ITERS`, `LINK_NEWTON_ALPHA` — literal values in WGSL,
+  see decision 8) and a `curves_out: array<vec4f>` binding (binding 9)
+  statically used only by the third dispatch, which is renamed
+  `link_dedup_cs` → `link_dedup_subdiv_cs`. The dispatch evaluates the
+  dedup predicate as before (owner election + fused mutual-break) and
+  keeps `links[i]` in sync; for surviving links it subdivides
+  `lerp(p_i, p_j, t)` for `t ∈ {0, 1/N, 2/N, ..., 1}` and
+  Newton-projects each sample onto the surface via `projectToSurface`,
+  writing `curves_out[i * STRIDE + k] = vec4f(projected_pos, 1.0)`;
+  dropped or absent links zero their slice — every slice is rewritten
+  every frame (the buffer persists across frames and keeps rendering
+  while paused). The scan dispatch is unchanged.
+- `link-pipeline.ts`: keep `linksBuffer` (now internal, private) as the
+  dedup machinery's working state and add the `linkCurves` buffer
+  (`point_count * (N_SEGMENTS + 1) * 16` B, zero-initialized — `.w =
+  0.0` renders nothing before the link pass has ever dispatched). The
+  dedup+subdiv dispatch now reads the post-relax point buffer (for
+  `p_i`/`p_j`), so its bind group becomes ping-pong-dependent: A/B
+  variants selected by `readFromA`. Export `linkCurves` (plus a TS
+  mirror of `N_SEGMENTS` for the render instance count; WGSL remains
+  the source of truth — decision 8) for the render pipeline.
+- `link-render-shader.ts`: read `linkCurves` instead of
+  `points + links` (bind group shrinks to uniform + curve buffer; the
+  `N_SEGMENTS`/`STRIDE` consts are mirrored in this module). Each
+  instance `inst` maps to point `i = inst / N_SEGMENTS`, segment
+  `s = inst % N_SEGMENTS`. Endpoint 0 = `linkCurves[i * STRIDE + s]`,
+  endpoint 1 = `linkCurves[i * STRIDE + s + 1]`. If either `.w == 0.0`,
+  push offscreen. `draw(2, pointCount * N_SEGMENTS)`.
+- `link-render-pipeline.ts`: constructor takes the `linkCurves` buffer
+  (no ping-pong bind groups — the curve data is shared); the Step 1
+  bindings (`pointsA` / `pointsB` / `links` / `shading`) are dropped
+  (Step 2 visibility uses the `.w` flag only; the `shadingBuffer`-based
+  visibility from Step 1 is dropped — per-segment occlusion arrives in
+  Step 4, so back-side lines are temporarily visible through the
+  surface). `render(pass, eye, target, canvas, pointCount)` — the
+  look-at `target` must stay (the view projection needs it); only the
+  `readFromBufferA` argument goes away.
+- `main.ts`: construct the render pipeline with `link.linkCurves` and
+  drop the `readFromBufferA` argument from the render call. The link
+  compute call site is unchanged.
 
-**Verify:** Lines should now curve along the surface instead of cutting
-through it. On highly curved regions the difference should be clearly
-visible. Lines that previously penetrated the surface now hug it.
+**Verify:** `npm run lint` (TS files touched), then `npm run dev`.
+Lines should now curve along the surface instead of cutting through it.
+On highly curved regions the difference should be clearly visible.
+Lines that previously penetrated the surface now hug it. No fans/stars
+or mutual-link pairs reappear (dedup still effective — check with
+`DRAW_POINTS = false`). Back-side lines whose stipple endpoints are
+both occluded are culled again by the Step 2b interim endpoint check;
+mid-segment and single-endpoint occlusion remain until Step 4.
+
+### Step 2b — Interim endpoint-visibility cull
+
+**Status:** completed.
+
+**Goal:** restore back-face/occlusion culling for the lines between
+Step 2 and Step 4. Step 2 dropped the Step 1 shading-based visibility
+check together with the render's point/links/shading bindings, leaving
+the view-independent `.w` validity flag as the only cull — so
+back-facing and otherwise occluded lines rendered through the shape.
+
+**Mechanism.** The link render re-binds the internal `links` buffer and
+the shared `shadingBuffer` and applies the Step 1 coarse check in the
+vertex shader: a sub-segment is pushed offscreen when the curve slice
+is invalid (`.w == 0.0` on either endpoint — checked first, so the
+`links[i]` read below only happens for surviving links and `j` is
+always a valid point index) or when **both** endpoint stipple points
+have non-positive center-ray clearance
+(`shading[i].clearance <= 0.0 && shading[links[i]].clearance <= 0.0`).
+All `N_SEGMENTS` sub-segments of a link cull or draw together (they
+share `i` and `links[i]`) — the same granularity as Step 1. The check
+stays render-side and reads the shading buffer, which the shading pass
+refreshes every frame — so culling remains correct while time is
+paused and the camera orbits.
+
+**Changes:**
+- `link-render-shader.ts`: re-add `SDF_COMMON` (for `PointShading`);
+  bindings 2 (`links`, read) and 3 (`shading`, read); coarse cull in
+  the vertex shader after the validity check.
+- `link-render-pipeline.ts`: constructor takes `links` and `shading`
+  buffers; bind group grows to four entries (uniform, curves, links,
+  shading). Still a single bind group — nothing ping-ponged.
+- `link-pipeline.ts`: `linksBuffer` becomes public readonly again
+  (internal working state, exposed for the render's interim cull).
+- `main.ts`: passes `link.linksBuffer` and `points.shadingBuffer` to
+  the render pipeline constructor.
+
+**Not fixed until Step 4:** segments with exactly one occluded endpoint
+still draw, and mid-segment occlusion (a curve hidden behind a bulge
+while both stipple endpoints face the camera) still draws. Step 4's
+per-curve-point `rayClearance` traces replace this check and drop the
+`links`/`shading` render bindings again.
+
+**Verify:** `npm run lint` (TS files touched), then `npm run dev`.
+Back-side lines disappear again as in Step 1. Rotate the camera while
+time is paused — culling updates live. Step 2's surface-following
+behavior unchanged.
 
 ### Step 3 — Camera-facing quad rendering with soft AA
 
@@ -919,7 +1015,8 @@ checkpoint to:
 | 1b | No fans/stars at popular targets: every point has at most one incoming and one outgoing edge, so links form chains. No mutual-link pairs (both segments of an i↔j pair render) — the dedup dispatch's fused mutual-break drops the larger-index edge. Segment count drops (edges = distinct targets) but lines stay dense enough. |
 | 1c | Points render as fixed-size dots irrespective of luminance or shadow. `DRAW_POINTS = false` in `main.ts` hides them; links are unaffected. Dots behind the surface are still culled via the center-ray clearance. Shading pass does one `rayClearance` trace per point. |
 | 1d | Points visibly cluster in shadowed regions and spread out in lit regions. Clustering is view-independent (tracks the light, not the camera — pause time and orbit to confirm). Hatch lines appear denser in dark regions. No point collapse in deep shadow. |
-| 2 | Lines curve along the surface in high-curvature regions instead of cutting through. No visible penetration of the SDF surface. |
+| 2 | Lines curve along the surface in high-curvature regions instead of cutting through. No visible penetration of the SDF surface. No fans/stars or mutual pairs reappear (dedup still effective). |
+| 2b | Back-side lines disappear again as in Step 1 (both endpoints occluded → culled). Culling updates live while paused and orbiting. Segments with one occluded endpoint or mid-segment occlusion still draw until Step 4. |
 | 3 | Lines have visible width with smooth anti-aliased edges. Width foreshortens with viewing angle. Billboard behavior correct when rotating. |
 | 4 | Lines on the far side of the shape are culled. Soft fade near silhouette edges. No lines visible through the surface. |
 | 5 | No gaps at segment joints. No doubled-alpha seams. Correct from multiple viewing angles. |

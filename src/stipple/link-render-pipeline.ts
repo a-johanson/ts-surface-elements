@@ -1,20 +1,22 @@
 /**
- * Link render pipeline — draws the link segments connecting stipple
- * points to their best-aligned neighbors as straight 1px lines.
+ * Link render pipeline — draws the link curves connecting stipple
+ * points to their best-aligned neighbors as chains of straight 1px
+ * line segments following the surface.
  *
- * Each instance draws one `line-list` segment: endpoint 0 is the point
- * itself, endpoint 1 is its linked neighbor (both read from the
- * post-relax point buffer). Links with no neighbor and links whose
- * endpoints are both fully occluded are pushed offscreen in the vertex
- * shader (see the link render shader).
+ * Each instance draws one `line-list` sub-segment between two adjacent
+ * curve points of the subdivided, surface-projected curve written by
+ * the link compute pass. The vertex shader culls links with invalid
+ * curve slices and — as the interim coarse visibility cull from
+ * Step 2b in the hatch-lines spec — links whose stipple endpoints are
+ * both fully occluded (per-segment occlusion replaces this in
+ * Step 4).
  *
- * Two bind groups support the ping-pong point buffer pair so the render
- * can read from whichever buffer the relax pass most recently wrote to.
- * The links and shading buffers are non-ping-ponged.
+ * The curve, links, and shading buffers are not ping-ponged, so a
+ * single bind group covers them.
  */
 
 import { viewProjection } from "./camera.js";
-import type { PointBuffers } from "./point-buffers.js";
+import { LINK_N_SEGMENTS } from "./link-pipeline.js";
 import type { CameraConfig } from "./point-render-pipeline.js";
 import { LINK_RENDER_SHADER } from "./shaders/index.js";
 
@@ -27,32 +29,34 @@ import { LINK_RENDER_SHADER } from "./shaders/index.js";
 const UNIFORM_BUFFER_BYTES = 80;
 
 /**
- * Manages the link render pipeline, uniform buffer, and ping-pong bind
- * groups.
+ * Manages the link render pipeline, uniform buffer, and bind group.
  */
 export class LinkRenderPipeline {
     private readonly device: GPUDevice;
     private readonly pipeline: GPURenderPipeline;
     private readonly uniformBuffer: GPUBuffer;
-    private readonly bindGroupA: GPUBindGroup;
-    private readonly bindGroupB: GPUBindGroup;
+    private readonly bindGroup: GPUBindGroup;
     private readonly config: CameraConfig;
 
     /**
      * Creates the shader module, render pipeline, uniform buffer, and
-     * both ping-pong bind groups.
+     * bind group.
      *
      * @param device - The GPU device.
-     * @param points - The ping-pong point buffer pair.
-     * @param links - The shared links buffer written by the link compute
-     *   pass.
+     * @param linkCurves - The shared curve buffer written by the link
+     *   compute pass.
+     * @param links - The internal post-dedup links buffer (the target
+     *   stipple point per link, for the coarse visibility cull).
+     * @param shading - The shared shading buffer (per-point center-ray
+     *   clearance for the coarse visibility cull).
      * @param config - Static camera configuration (FOV, up).
      * @param format - The canvas texture format.
      */
     public constructor(
         device: GPUDevice,
-        points: PointBuffers,
+        linkCurves: GPUBuffer,
         links: GPUBuffer,
+        shading: GPUBuffer,
         config: CameraConfig,
         format: GPUTextureFormat,
     ) {
@@ -105,25 +109,14 @@ export class LinkRenderPipeline {
 
         const layout = this.pipeline.getBindGroupLayout(0);
 
-        this.bindGroupA = device.createBindGroup({
-            label: "stipple-link-render-bind-A",
+        this.bindGroup = device.createBindGroup({
+            label: "stipple-link-render-bind",
             layout,
             entries: [
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
-                { binding: 1, resource: { buffer: points.bufferA } },
+                { binding: 1, resource: { buffer: linkCurves } },
                 { binding: 2, resource: { buffer: links } },
-                { binding: 3, resource: { buffer: points.shadingBuffer } },
-            ],
-        });
-
-        this.bindGroupB = device.createBindGroup({
-            label: "stipple-link-render-bind-B",
-            layout,
-            entries: [
-                { binding: 0, resource: { buffer: this.uniformBuffer } },
-                { binding: 1, resource: { buffer: points.bufferB } },
-                { binding: 2, resource: { buffer: links } },
-                { binding: 3, resource: { buffer: points.shadingBuffer } },
+                { binding: 3, resource: { buffer: shading } },
             ],
         });
     }
@@ -155,8 +148,8 @@ export class LinkRenderPipeline {
     }
 
     /**
-     * Draws all link segments as instanced lines into the given render
-     * pass.
+     * Draws all link curve segments as instanced lines into the given
+     * render pass.
      *
      * Must be called *inside* an active `GPURenderPassEncoder`, before
      * the point render so points sit on top of the lines.
@@ -166,22 +159,19 @@ export class LinkRenderPipeline {
      * @param target - Look-at target point [x, y, z].
      * @param canvas - The canvas whose size determines the projection
      *   aspect.
-     * @param readFromBufferA - If `true`, reads from `bufferA`; else
-     *   `bufferB`. Should match the buffer the relax pass most recently
-     *   wrote.
-     * @param instanceCount - Number of points (instances) to draw.
+     * @param pointCount - Number of stipple points; each contributes
+     *   `LINK_N_SEGMENTS` sub-segment instances.
      */
     public render(
         pass: GPURenderPassEncoder,
         eye: readonly [number, number, number],
         target: readonly [number, number, number],
         canvas: HTMLCanvasElement,
-        readFromBufferA: boolean,
-        instanceCount: number,
+        pointCount: number,
     ): void {
         this.writeUniform(eye, target, canvas);
         pass.setPipeline(this.pipeline);
-        pass.setBindGroup(0, readFromBufferA ? this.bindGroupA : this.bindGroupB);
-        pass.draw(2, instanceCount);
+        pass.setBindGroup(0, this.bindGroup);
+        pass.draw(2, pointCount * LINK_N_SEGMENTS);
     }
 }

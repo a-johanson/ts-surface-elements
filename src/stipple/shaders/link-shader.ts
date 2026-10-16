@@ -1,6 +1,7 @@
 /**
  * Link compute shader — best-neighbor selection along the principal
- * direction, canonicalized by target.
+ * direction, canonicalized by target, plus per-link curve subdivision
+ * and surface projection.
  *
  * One module, three entry points, dispatched in order within a single
  * compute pass by `LinkPipeline` (WebGPU orders dispatches within a
@@ -29,14 +30,22 @@
  *     Writes `links[i] = best_j` (or `UINT_MAX`) and, for valid links,
  *     elects the owner via `atomicMin(&owners[best_j], i)` — after the
  *     pass, `owners[j]` is the smallest source index targeting `j`.
- *  3. `link_dedup_cs` — one invocation per point: clears `links[i]` when
- *     `owners[links[i]] != i`, so every point keeps at most one incoming
+ *  3. `link_dedup_subdiv_cs` — one invocation per point. Dedup:
+ *     evaluates the edge-survival predicate — `links[i]` survives when
+ *     `owners[links[i]] == i`, so every point keeps at most one incoming
  *     edge (decision 9 in the hatch-lines spec) and the surviving graph
- *     is a union of paths and cycles. Additionally breaks mutual 2-cycles
- *     (i→j and j→i that both survived dedup): when `owners[j] == i` and
- *     `owners[i] == j` and `i > j`, the larger-index edge is dropped.
- *     This reads only the stable `owners` buffer plus the own `links`
- *     slot, so it is race-free within the existing dedup dispatch.
+ *     is a union of paths and cycles — and additionally breaks mutual
+ *     2-cycles (i→j and j→i that both survived dedup): when
+ *     `owners[j] == i` and `owners[i] == j` and `i > j`, the
+ *     larger-index edge is dropped. This reads only the stable `owners`
+ *     buffer plus the own `links` slot, so it is race-free within the
+ *     dispatch. Subdiv: for every surviving link, subdivides the chord
+ *     to the linked neighbor into `N_SEGMENTS` steps and Newton-projects
+ *     each sample onto the surface, writing `STRIDE` curve points to
+ *     `curves_out` (`.xyz` = position, `.w` = 1.0); dropped or absent
+ *     links zero their slice — every slice is rewritten each frame,
+ *     since the buffer persists across frames and keeps rendering while
+ *     time is paused.
  *
  * `GridParams` is duplicated here (WGSL has no cross-module struct
  * import) — it matches the layout in `cell-index-shader.ts` and
@@ -80,6 +89,21 @@ const LINK_TAN_EPS: f32 = 1e-4;
  */
 const COINCIDENT_EPS: f32 = 1e-7;
 
+/**
+ * Curve subdivision count per link: each surviving link is emitted as
+ * N_SEGMENTS + 1 surface-projected curve points.
+ */
+const N_SEGMENTS: u32 = 4u;
+
+/** Curve points per link (N_SEGMENTS + 1). */
+const STRIDE: u32 = N_SEGMENTS + 1u;
+
+/** Newton iterations per curve-point projection. */
+const LINK_NEWTON_ITERS: i32 = 2;
+
+/** Newton step size. */
+const LINK_NEWTON_ALPHA: f32 = 1.0;
+
 @group(0) @binding(0) var<uniform> params: LinkParams;
 @group(0) @binding(1) var<storage, read> points_in: array<Point>;
 @group(0) @binding(2) var<storage, read> normals_in: array<vec4f>;
@@ -99,11 +123,20 @@ const COINCIDENT_EPS: f32 = 1e-7;
 @group(0) @binding(1) var<storage, read_write> owners_reset: array<atomic<u32>>;
 
 /**
- * Owner buffer alias for the dedup entry — read-only plain view of the
- * same GPU buffer (the atomic writes of the election pass are visible
- * after the inter-dispatch ordering within the compute pass).
+ * Owner buffer alias for the dedup+subdiv entry — read-only plain view
+ * of the same GPU buffer (the atomic writes of the election pass are
+ * visible after the inter-dispatch ordering within the compute pass).
  */
 @group(0) @binding(8) var<storage, read> owners_in: array<u32>;
+
+/**
+ * Subdivided curve points, written by link_dedup_subdiv_cs only — one
+ * vec4f per curve point: .xyz = surface-projected position, .w =
+ * validity flag (1.0 valid, 0.0 dropped or absent link). The other
+ * entry points do not statically use it, so it is absent from their
+ * derived bind group layouts.
+ */
+@group(0) @binding(9) var<storage, read_write> curves_out: array<vec4f>;
 
 @compute @workgroup_size(64)
 fn link_owner_clear_cs(@builtin(global_invocation_id) gid: vec3u) {
@@ -198,36 +231,53 @@ fn link_cs(@builtin(global_invocation_id) gid: vec3u) {
     links_out[i] = best_j;
 
     // Owner election: the smallest source index targeting best_j wins.
-    // The dedup pass then clears every other suitor's link (decision 9
-    // in the hatch-lines spec).
+    // The dedup+subdiv dispatch then clears every other suitor's link
+    // and emits the surviving curve (decision 9 in the hatch-lines
+    // spec).
     if (best_j != UINT_MAX) {
         atomicMin(&owners_elect[best_j], i);
     }
 }
 
 @compute @workgroup_size(64)
-fn link_dedup_cs(@builtin(global_invocation_id) gid: vec3u) {
+fn link_dedup_subdiv_cs(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
     if (i >= params.point_count) {
         return;
     }
 
     let j = links_out[i];
-    if (j == UINT_MAX) {
-        return;
-    }
 
-    if (owners_in[j] != i) {
-        // Another (smaller) source index owns j — drop this link.
-        links_out[i] = UINT_MAX;
-        return;
+    // Dedup: i's edge survives only when it won its target's owner
+    // election. Break mutual 2-cycles (i→j and j→i both survived):
+    // owners_in[i] == j means j's edge targets i and also survived.
+    // Keep the smaller-index edge, drop the larger.
+    var keep = false;
+    if (j != UINT_MAX && owners_in[j] == i) {
+        if (!(owners_in[i] == j && i > j)) {
+            keep = true;
+        }
     }
+    links_out[i] = select(UINT_MAX, j, keep);
 
-    // i's edge survived dedup. Break mutual 2-cycles (i→j and j→i both
-    // survived): owners_in[i] == j means j's edge targets i and also
-    // survived. Keep the smaller-index edge, drop the larger.
-    if (owners_in[i] == j && i > j) {
-        links_out[i] = UINT_MAX;
+    // Subdiv: emit the subdivided, surface-projected curve for
+    // surviving links; zero the slice otherwise. Every slice is
+    // rewritten each frame — the buffer persists across frames and
+    // keeps rendering while time is paused.
+    let base = i * STRIDE;
+    if (keep) {
+        let p_i = points_in[i].pos.xyz;
+        let p_j = points_in[j].pos.xyz;
+        for (var k: u32 = 0u; k <= N_SEGMENTS; k = k + 1u) {
+            let t = f32(k) / f32(N_SEGMENTS);
+            let sample = mix(p_i, p_j, t);
+            let projected = projectToSurface(sample, params.time, LINK_NEWTON_ITERS, LINK_NEWTON_ALPHA);
+            curves_out[base + k] = vec4f(projected, 1.0);
+        }
+    } else {
+        for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
+            curves_out[base + k] = vec4f(0.0);
+        }
     }
 }
 `;

@@ -1,7 +1,7 @@
 /**
  * Link compute pipeline — connects each stipple point to its
  * best-aligned neighbor along the principal direction, canonicalized by
- * target.
+ * target, and emits a surface-projected subdivided curve per link.
  *
  * Each frame, {@link dispatch} records one compute pass with three
  * dispatches, run after the post-relax spatial grid rebuild:
@@ -11,26 +11,30 @@
  *     neighborhood of its spatial grid cell, scores each candidate
  *     neighbor by alignment with the principal direction discounted by
  *     distance, writes the winning neighbor index — or `UINT_MAX` when
- *     no valid neighbor exists — into the shared
+ *     no valid neighbor exists — into the internal
  *     {@link LinkPipeline.linksBuffer}, and elects each target's owner
  *     via `atomicMin` (after the dispatch, `owners[j]` is the smallest
  *     source index targeting `j`).
- *  3. **Dedup** — one invocation per point clears the link of every
- *     source that lost its target's owner election, so each point keeps
- *     at most one incoming edge (decision 9 in the hatch-lines spec) and
- *     the surviving graph is a union of paths and cycles. Additionally
- *     breaks mutual 2-cycles (i→j and j→i that both survived dedup) by
- *     dropping the larger-index edge — race-free, using only the stable
- *     `owners` buffer and the own `links` slot.
+ *  3. **Dedup + subdiv** — one invocation per point drops the link of
+ *     every source that lost its target's owner election, so each point
+ *     keeps at most one incoming edge (decision 9 in the hatch-lines
+ *     spec) and the surviving graph is a union of paths and cycles —
+ *     additionally breaking mutual 2-cycles (i→j and j→i that both
+ *     survived dedup) by dropping the larger-index edge, race-free,
+ *     using only the stable `owners` buffer and the own `links` slot —
+ *     then subdivides each surviving link into `N_SEGMENTS` steps,
+ *     Newton-projects each sample onto the surface, and writes the
+ *     curve points into {@link LinkPipeline.linkCurves}. Dropped or
+ *     absent links zero their slice.
  *
  * WebGPU orders dispatches within a compute pass, so each stage's
  * writes are visible to the next without explicit barriers.
  *
- * Ping-pong: the scan reads from one point buffer (depending on
- * `readFromA` — the buffer relax most recently wrote); the clear and
- * dedup stages touch only the shared links and owners buffers (neither
- * is ping-ponged). Three static bind-group sets cover the ping-pong
- * read directions.
+ * Ping-pong: the scan and the curve subdivision both read from one
+ * point buffer (depending on `readFromA` — the buffer relax most
+ * recently wrote); the clear stage touches only the shared owners
+ * buffer. Static bind groups cover the ping-pong read directions of
+ * both stages.
  */
 
 import type { PointBuffers } from "./point-buffers.js";
@@ -52,28 +56,57 @@ const LINK_PARAMS_BUFFER_BYTES = 8;
 const LINK_ENTRY_BYTES = 4;
 
 /**
+ * Curve subdivision count per link.
+ *
+ * Must match the `N_SEGMENTS` constant in the link shader — the WGSL
+ * value is the source of truth (decision 8 in the hatch-lines spec);
+ * this mirror sizes the curve buffer and the render instance count.
+ */
+export const LINK_N_SEGMENTS = 4;
+
+/** Curve points per link (`N_SEGMENTS + 1`). */
+const LINK_CURVE_STRIDE = LINK_N_SEGMENTS + 1;
+
+/** Size of one curve point in bytes (one `vec4f`). */
+const CURVE_POINT_BYTES = 16;
+
+/**
  * WGSL sentinel for "no link" — matches `UINT_MAX` in the link shader.
  */
 const UINT_MAX = 0xffffffff;
 
 /**
- * Manages the link compute pipeline, its params uniform, the shared
- * links output buffer, and the ping-pong read bind groups.
+ * Manages the link compute pipeline, its params uniform, the links and
+ * owners working buffers, the curve output buffer, and the bind groups.
  */
 export class LinkPipeline {
     private readonly device: GPUDevice;
     private readonly points: PointBuffers;
 
     /**
-     * Shared per-point link buffer (not ping-ponged): the best neighbor
-     * index per point, or `UINT_MAX` when no valid neighbor exists.
+     * Per-point link buffer (not ping-ponged): the best neighbor index
+     * per point, or `UINT_MAX` when no valid neighbor exists. The scan
+     * stage writes every entry; the dedup + subdiv stage then drops
+     * losing entries and emits the matching curve slice. Pre-filled
+     * with `UINT_MAX` for determinism before the first dispatch.
      *
-     * Written every frame by the link compute pass and read by the link
-     * render pipeline. Pre-filled with `UINT_MAX` so a frame that renders
-     * before the link compute has ever dispatched (e.g. paused at
-     * startup) draws no lines instead of linking every point to index 0.
+     * Internal working state, exposed readonly for the link render's
+     * interim coarse visibility cull (Step 2b in the hatch-lines spec);
+     * the render-side use goes away in Step 4, when per-segment
+     * clearance is baked into the curve buffer.
      */
     public readonly linksBuffer: GPUBuffer;
+
+    /**
+     * Shared per-point curve buffer (not ping-ponged): for each point,
+     * one `vec4f` per curve point — `.xyz` is the surface-projected
+     * position, `.w` the validity flag (1.0 valid, 0.0 dropped or
+     * absent link). Written every frame by the dedup + subdiv stage
+     * and read by the link render pipeline. Zero-initialized, so
+     * `.w = 0.0` renders nothing before the link compute has ever
+     * dispatched (e.g. paused at startup).
+     */
+    public readonly linkCurves: GPUBuffer;
 
     private readonly pipeline: GPUComputePipeline;
     private readonly layout: GPUBindGroupLayout;
@@ -82,8 +115,9 @@ export class LinkPipeline {
     private readonly bindGroupB: GPUBindGroup;
     private readonly clearPipeline: GPUComputePipeline;
     private readonly clearBindGroup: GPUBindGroup;
-    private readonly dedupPipeline: GPUComputePipeline;
-    private readonly dedupBindGroup: GPUBindGroup;
+    private readonly dedupSubdivPipeline: GPUComputePipeline;
+    private readonly dedupSubdivBindGroupA: GPUBindGroup;
+    private readonly dedupSubdivBindGroupB: GPUBindGroup;
 
     /**
      * Shared per-target owner buffer (not ping-ponged, internal): after
@@ -94,8 +128,8 @@ export class LinkPipeline {
     private readonly ownersBuffer: GPUBuffer;
 
     /**
-     * Creates the shader module, compute pipeline, params uniform
-     * buffer, links output buffer, and both ping-pong read bind groups.
+     * Creates the shader module, compute pipelines, params uniform
+     * buffer, curve output buffer, and the bind groups.
      *
      * @param device - The GPU device.
      * @param points - The ping-pong point buffer pair plus shared
@@ -123,6 +157,12 @@ export class LinkPipeline {
             usage: GPUBufferUsage.STORAGE,
         });
 
+        this.linkCurves = device.createBuffer({
+            label: "stipple-link-curves",
+            size: points.count * LINK_CURVE_STRIDE * CURVE_POINT_BYTES,
+            usage: GPUBufferUsage.STORAGE,
+        });
+
         const module = device.createShaderModule({
             label: "stipple-link-shader",
             code: LINK_SHADER,
@@ -144,18 +184,18 @@ export class LinkPipeline {
                 entryPoint: "link_owner_clear_cs",
             },
         });
-        this.dedupPipeline = device.createComputePipeline({
-            label: "stipple-link-dedup-pipeline",
+        this.dedupSubdivPipeline = device.createComputePipeline({
+            label: "stipple-link-dedup-subdiv-pipeline",
             layout: "auto",
             compute: {
                 module,
-                entryPoint: "link_dedup_cs",
+                entryPoint: "link_dedup_subdiv_cs",
             },
         });
 
         this.layout = this.pipeline.getBindGroupLayout(0);
         const clearLayout = this.clearPipeline.getBindGroupLayout(0);
-        const dedupLayout = this.dedupPipeline.getBindGroupLayout(0);
+        const dedupSubdivLayout = this.dedupSubdivPipeline.getBindGroupLayout(0);
 
         this.paramsBuffer = device.createBuffer({
             label: "stipple-link-params",
@@ -202,13 +242,26 @@ export class LinkPipeline {
                 { binding: 1, resource: { buffer: this.ownersBuffer } },
             ],
         });
-        this.dedupBindGroup = device.createBindGroup({
-            label: "stipple-link-dedup-bind",
-            layout: dedupLayout,
+        this.dedupSubdivBindGroupA = device.createBindGroup({
+            label: "stipple-link-dedup-subdiv-bind-A",
+            layout: dedupSubdivLayout,
             entries: [
                 { binding: 0, resource: { buffer: this.paramsBuffer } },
+                { binding: 1, resource: { buffer: points.bufferA } },
                 { binding: 7, resource: { buffer: this.linksBuffer } },
                 { binding: 8, resource: { buffer: this.ownersBuffer } },
+                { binding: 9, resource: { buffer: this.linkCurves } },
+            ],
+        });
+        this.dedupSubdivBindGroupB = device.createBindGroup({
+            label: "stipple-link-dedup-subdiv-bind-B",
+            layout: dedupSubdivLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.paramsBuffer } },
+                { binding: 1, resource: { buffer: points.bufferB } },
+                { binding: 7, resource: { buffer: this.linksBuffer } },
+                { binding: 8, resource: { buffer: this.ownersBuffer } },
+                { binding: 9, resource: { buffer: this.linkCurves } },
             ],
         });
     }
@@ -233,15 +286,17 @@ export class LinkPipeline {
     /**
      * Records the link compute stages into the given command encoder as
      * one compute pass with three dispatches: owner clear → scan+elect →
-     * dedup.
+     * dedup+subdiv.
      *
-     * The scan reads from one point buffer (depending on `readFromA`) —
-     * this must match the buffer relax most recently wrote — plus the
-     * shared normals buffer and the spatial grid rebuilt from that same
-     * buffer. Writes the deduplicated best-neighbor indices into the
-     * shared links buffer. Should be called after the shading pass
-     * (which refreshes the normals buffer from the post-relax
-     * positions) and before the render pass.
+     * The scan and the curve subdivision read from one point buffer
+     * (depending on `readFromA`) — this must match the buffer relax most
+     * recently wrote — plus, for the scan, the shared normals buffer and
+     * the spatial grid rebuilt from that same buffer. The dedup+subdiv
+     * stage drops losing links and writes the subdivided,
+     * surface-projected curve points into the shared curve buffer.
+     * Should be called after the shading pass (which refreshes the
+     * normals buffer from the post-relax positions) and before the
+     * render pass.
      *
      * @param encoder - The command encoder to record into.
      * @param time - Current animation time in seconds.
@@ -264,8 +319,11 @@ export class LinkPipeline {
         pass.setBindGroup(0, readFromA ? this.bindGroupA : this.bindGroupB);
         pass.dispatchWorkgroups(workgroupCount);
 
-        pass.setPipeline(this.dedupPipeline);
-        pass.setBindGroup(0, this.dedupBindGroup);
+        pass.setPipeline(this.dedupSubdivPipeline);
+        pass.setBindGroup(
+            0,
+            readFromA ? this.dedupSubdivBindGroupA : this.dedupSubdivBindGroupB,
+        );
         pass.dispatchWorkgroups(workgroupCount);
 
         pass.end();

@@ -59,7 +59,7 @@ const DRAW_DEBUG = false;
  *
  * Debug toggle — turn off to inspect the hatch lines alone.
  */
-const DRAW_POINTS = true;
+const DRAW_POINTS = false;
 
 /**
  * Whether the canvas has a fixed size, applied once at bootstrap to both
@@ -147,7 +147,8 @@ function getCanvas(): HTMLCanvasElement {
  *    rate. After the relax substeps, rebuilds the spatial grid from the
  *    post-relax positions and dispatches the link compute pass, which
  *    connects each point to its best-aligned neighbor along the
- *    principal direction. While time is paused, these passes are skipped
+ *    principal direction and subdivides each link into surface-projected
+ *    curve segments. While time is paused, these passes are skipped
  *    and their state is left untouched, so they resume exactly where
  *    they left off — paused frames keep the links from the last playing
  *    frame since no link input changes while paused.
@@ -156,7 +157,7 @@ function getCanvas(): HTMLCanvasElement {
  *    relaxed positions. Always runs since it is view-dependent — the
  *    camera stays interactive while time is paused.
  * 5. Begins a render pass that draws the SDF debug view (grayscale
- *    Lambert), then the link lines, and then — when {@link DRAW_POINTS}
+ *    Lambert), then the link curves, and then — when {@link DRAW_POINTS}
  *    is enabled — the stipple points on top.
  * 6. Submits the command buffer.
  * 7. If a still-image export was requested, serializes the canvas's last
@@ -264,7 +265,8 @@ function startFrameLoop(
             link.dispatch(encoder, time, shadingReadsA);
         }
 
-        // Render reads the same buffer shading just read.
+        // Render reads the same buffer shading just read (the point
+        // renderer; the link renderer reads the curve buffer instead).
         const renderReadsA = shadingReadsA;
 
         // --- Render pass: debug SDF view + draw links + points ---
@@ -284,7 +286,7 @@ function startFrameLoop(
         if (DRAW_DEBUG) {
             debugRender.render(pass, eye, target, gpu.canvas, time);
         }
-        linkRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
+        linkRender.render(pass, eye, target, gpu.canvas, points.count);
         if (DRAW_POINTS) {
             pointRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
         }
@@ -334,8 +336,9 @@ async function bootstrap(): Promise<void> {
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
     const linkRender = new LinkRenderPipeline(
         gpu.device,
-        points,
+        link.linkCurves,
         link.linksBuffer,
+        points.shadingBuffer,
         cameraConfig,
         gpu.format,
     );
