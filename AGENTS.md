@@ -32,6 +32,7 @@ Use this section to orient before opening files. It describes module **responsib
 
 ## General guardrails and style
 
+* Do not install software or tools, and do not add project dependencies, without asking first and receiving explicit approval — even when a validation, lint, or build step seems to require it.
 * Organize the application logic in TypeScript in `src/`.
 * Use modern ECMAScript patterns and TypeScript-specific type utilities (target ES2024 with ESNext module structure, avoid legacy TS).
 * Prefer object-oriented design whenever it makes sense to combine data and logic into classes.

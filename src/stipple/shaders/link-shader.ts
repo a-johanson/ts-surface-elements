@@ -1,7 +1,7 @@
 /**
  * Link compute shader — best-neighbor selection along the principal
- * direction, canonicalized by target, plus per-link curve subdivision
- * and surface projection.
+ * direction, canonicalized by target, plus per-link curve emission as
+ * sampled cubic Hermite segments with C1 chain-window tangents.
  *
  * One module, three entry points, dispatched in order within a single
  * compute pass by `LinkPipeline` (WebGPU orders dispatches within a
@@ -30,6 +30,10 @@
  *     Writes `links[i] = best_j` (or `UINT_MAX`) and, for valid links,
  *     elects the owner via `atomicMin(&owners[best_j], i)` — after the
  *     pass, `owners[j]` is the smallest source index targeting `j`.
+ *     This is the final write to `links`: the buffer stays the raw
+ *     scan output, which makes the subdivision's chain-window reads
+ *     race-free; every consumer evaluates the survival predicate from
+ *     `links` + `owners` (decision 11 in the hatch-lines spec).
  *  3. `link_dedup_subdiv_cs` — one invocation per point. Dedup:
  *     evaluates the edge-survival predicate — `links[i]` survives when
  *     `owners[links[i]] == i`, so every point keeps at most one incoming
@@ -37,11 +41,22 @@
  *     is a union of paths and cycles — and additionally breaks mutual
  *     2-cycles (i→j and j→i that both survived dedup): when
  *     `owners[j] == i` and `owners[i] == j` and `i > j`, the
- *     larger-index edge is dropped. This reads only the stable `owners`
- *     buffer plus the own `links` slot, so it is race-free within the
- *     dispatch. Subdiv: for every surviving link, subdivides the chord
- *     to the linked neighbor into `N_SEGMENTS` steps and Newton-projects
- *     each sample onto the surface, writing `STRIDE` curve points to
+ *     larger-index edge is dropped. The predicate gates curve emission;
+ *     `links` itself is not mutated here (stage 2 made the final
+ *     write). Subdiv: for every surviving link, samples a cubic Hermite
+ *     segment between the two stipple endpoints (Step 2c / decision 11
+ *     in the hatch-lines spec): the tangent at each endpoint is the
+ *     chain-window average over the vertex's `{previous, self, next}`
+ *     stipple points — the predecessor comes from `owners`, the
+ *     successor from the raw `links` slot of the target, and both
+ *     candidates are validated against the dedup rules so chain ends
+ *     and dropped edges fall back to one-sided chord tangents. Because
+ *     the tangent at a shared chain vertex is a pure function of that
+ *     vertex's window, both adjacent segments compute identical tangent
+ *     vectors and the chain of curve segments is C1. Interior samples
+ *     are Newton-projected onto the surface; the endpoints are the
+ *     stipple points themselves and are written exactly, so adjacent
+ *     segments join seamlessly. Writes `STRIDE` curve points to
  *     `curves_out` (`.xyz` = position, `.w` = 1.0); dropped or absent
  *     links zero their slice — every slice is rewritten each frame,
  *     since the buffer persists across frames and keeps rendering while
@@ -52,6 +67,23 @@
  * `cell-ranges-shader.ts` byte-for-byte.
  */
 import { SDF_COMMON } from "./sdf-common.js";
+
+/**
+ * Hermite sub-segment count per link — the single source of truth for
+ * this value.
+ *
+ * Structural constant, not a tunable: it sizes the curve buffer and
+ * the render instance count, which live on the TypeScript side, so it
+ * is defined here (beside the shader that consumes it) and
+ * interpolated into both the link compute shader and the link render
+ * shader (decision 8 in the hatch-lines spec). Each surviving link is
+ * emitted as `LINK_N_SEGMENTS + 1` curve points — the two stipple
+ * endpoints plus `LINK_N_SEGMENTS - 1` interior Hermite samples. The
+ * curve's shape is fixed by the chain-window tangents and
+ * `LINK_TANGENT_SCALE`; this value only sets tessellation fidelity
+ * (decision 11).
+ */
+export const LINK_N_SEGMENTS = 4;
 
 export const LINK_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -90,13 +122,27 @@ const LINK_TAN_EPS: f32 = 1e-4;
 const COINCIDENT_EPS: f32 = 1e-7;
 
 /**
- * Curve subdivision count per link: each surviving link is emitted as
- * N_SEGMENTS + 1 surface-projected curve points.
+ * Hermite sub-segment count per link — interpolated from the TS
+ * constant LINK_N_SEGMENTS (single source of truth; decision 8 in the
+ * hatch-lines spec). Each surviving link is emitted as N_SEGMENTS + 1
+ * curve points — the two stipple endpoints plus N_SEGMENTS - 1
+ * interior Hermite samples. The curve's shape is fixed by the
+ * chain-window tangents and LINK_TANGENT_SCALE and does not depend on
+ * this value (decision 11 in the hatch-lines spec).
  */
-const N_SEGMENTS: u32 = 4u;
+const N_SEGMENTS: u32 = ${LINK_N_SEGMENTS}u;
 
 /** Curve points per link (N_SEGMENTS + 1). */
 const STRIDE: u32 = N_SEGMENTS + 1u;
+
+/**
+ * Scale of the Hermite segment endpoint tangent magnitudes, relative to
+ * the mean incident chord length of the endpoint's chain window.
+ * Higher values round the joints more broadly; lower values hug the
+ * chords. Part of the window-pure tangent rule (decision 11 in the
+ * hatch-lines spec).
+ */
+const LINK_TANGENT_SCALE: f32 = 1.0;
 
 /** Newton iterations per curve-point projection. */
 const LINK_NEWTON_ITERS: i32 = 2;
@@ -128,6 +174,14 @@ const LINK_NEWTON_ALPHA: f32 = 1.0;
  * visible after the inter-dispatch ordering within the compute pass).
  */
 @group(0) @binding(8) var<storage, read> owners_in: array<u32>;
+
+/**
+ * Links buffer alias for the dedup+subdiv entry — read-only view of the
+ * same GPU buffer the scan writes. The scan performs the final write to
+ * the buffer, so every read in this entry (the own slot and, for the
+ * chain-window successor, the target's slot) is race-free.
+ */
+@group(0) @binding(7) var<storage, read> links_in: array<u32>;
 
 /**
  * Subdivided curve points, written by link_dedup_subdiv_cs only — one
@@ -231,12 +285,51 @@ fn link_cs(@builtin(global_invocation_id) gid: vec3u) {
     links_out[i] = best_j;
 
     // Owner election: the smallest source index targeting best_j wins.
-    // The dedup+subdiv dispatch then clears every other suitor's link
-    // and emits the surviving curve (decision 9 in the hatch-lines
-    // spec).
+    // The dedup+subdiv dispatch evaluates this election to gate its
+    // curve emission (decision 9 in the hatch-lines spec); links itself
+    // is not written again.
     if (best_j != UINT_MAX) {
         atomicMin(&owners_elect[best_j], i);
     }
+}
+
+/**
+ * Averaged chain tangent at a chain vertex, computed purely from the
+ * vertex's three-point window. Both adjacent segments evaluate this
+ * with the same three stipple points, so the tangent vectors match and
+ * the chain of curve segments is C1 (decision 11 in the hatch-lines
+ * spec). Direction: the normalized sum of the two incident unit chord
+ * directions — unit chords are averaged before normalizing, so uneven
+ * stipple spacing cannot overshoot. Magnitude: LINK_TANGENT_SCALE times
+ * the mean incident chord length. Guards are window-pure, so C1
+ * survives them: one chord degenerate → follow the other; chords
+ * near-antiparallel (hairpin) → the window's through-direction; a fully
+ * degenerate window → zero tangent (the Hermite reduces to a plain
+ * interpolation).
+ */
+fn windowTangent(pred: vec3f, v: vec3f, succ: vec3f) -> vec3f {
+    let d_in = v - pred;
+    let d_out = succ - v;
+    let l_in = length(d_in);
+    let l_out = length(d_out);
+    if (l_in < COINCIDENT_EPS) {
+        return LINK_TANGENT_SCALE * d_out;
+    }
+    if (l_out < COINCIDENT_EPS) {
+        return LINK_TANGENT_SCALE * d_in;
+    }
+    let sum = d_in / l_in + d_out / l_out;
+    let sum_len = length(sum);
+    let mag = LINK_TANGENT_SCALE * 0.5 * (l_in + l_out);
+    if (sum_len < 1e-3) {
+        let through = succ - pred;
+        let l_through = length(through);
+        if (l_through < COINCIDENT_EPS) {
+            return vec3f(0.0);
+        }
+        return mag * through / l_through;
+    }
+    return mag * sum / sum_len;
 }
 
 @compute @workgroup_size(64)
@@ -246,37 +339,85 @@ fn link_dedup_subdiv_cs(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    let j = links_out[i];
-
     // Dedup: i's edge survives only when it won its target's owner
     // election. Break mutual 2-cycles (i→j and j→i both survived):
     // owners_in[i] == j means j's edge targets i and also survived.
-    // Keep the smaller-index edge, drop the larger.
+    // Keep the smaller-index edge, drop the larger. The predicate gates
+    // curve emission; links itself is not mutated (the scan made the
+    // final write), so the chain-window reads below are race-free.
+    let j = links_in[i];
     var keep = false;
     if (j != UINT_MAX && owners_in[j] == i) {
         if (!(owners_in[i] == j && i > j)) {
             keep = true;
         }
     }
-    links_out[i] = select(UINT_MAX, j, keep);
 
-    // Subdiv: emit the subdivided, surface-projected curve for
-    // surviving links; zero the slice otherwise. Every slice is
-    // rewritten each frame — the buffer persists across frames and
-    // keeps rendering while time is paused.
     let base = i * STRIDE;
-    if (keep) {
-        let p_i = points_in[i].pos.xyz;
-        let p_j = points_in[j].pos.xyz;
-        for (var k: u32 = 0u; k <= N_SEGMENTS; k = k + 1u) {
-            let t = f32(k) / f32(N_SEGMENTS);
-            let sample = mix(p_i, p_j, t);
-            let projected = projectToSurface(sample, params.time, LINK_NEWTON_ITERS, LINK_NEWTON_ALPHA);
-            curves_out[base + k] = vec4f(projected, 1.0);
-        }
-    } else {
+    if (!keep) {
         for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
             curves_out[base + k] = vec4f(0.0);
+        }
+        return;
+    }
+
+    let p_i = points_in[i].pos.xyz;
+    let p_j = points_in[j].pos.xyz;
+
+    // Chain-window tangent at the start vertex p_i. Predecessor along
+    // the chain: the elected source targeting i. Its edge was dropped
+    // when it is the larger index of a mutual pair — then i is a chain
+    // start and the tangent is one-sided.
+    var has_pred = false;
+    var pred = vec3f(0.0);
+    let a = owners_in[i];
+    if (a != UINT_MAX && !(owners_in[a] == i && a > i)) {
+        has_pred = true;
+        pred = points_in[a].pos.xyz;
+    }
+    // One-sided fallback tangent: the link chord itself,
+    // LINK_TANGENT_SCALE-scaled. The same chord vector serves both
+    // chain-end cases — the start of the first segment (pointing toward
+    // the far endpoint) and the end of the last segment (pointing
+    // outward past the far endpoint).
+    let chord_tangent = LINK_TANGENT_SCALE * (p_j - p_i);
+    let t_i = select(chord_tangent, windowTangent(pred, p_i, p_j), has_pred);
+
+    // Chain-window tangent at the end vertex p_j. Successor along the
+    // chain: j's raw scan target k. The chain continues only when that
+    // edge survived dedup (owners_in[k] == j); k == i is the degenerate
+    // double-back window (mutual pair or dropped back-pointer). Every
+    // failing case leaves a one-sided tangent.
+    var has_succ = false;
+    var succ = vec3f(0.0);
+    let k = links_in[j];
+    if (k != UINT_MAX && k != i && owners_in[k] == j) {
+        has_succ = true;
+        succ = points_in[k].pos.xyz;
+    }
+    let t_j = select(chord_tangent, windowTangent(p_i, p_j, succ), has_succ);
+
+    // Sample the Hermite segment; the endpoints are the stipple points
+    // themselves (written exactly, so adjacent segments join
+    // seamlessly) and interior samples are Newton-projected onto the
+    // surface. Every slice is rewritten each frame — the buffer
+    // persists across frames and keeps rendering while time is paused.
+    for (var s: u32 = 0u; s <= N_SEGMENTS; s = s + 1u) {
+        if (s == 0u) {
+            curves_out[base + s] = vec4f(p_i, 1.0);
+        } else if (s == N_SEGMENTS) {
+            curves_out[base + s] = vec4f(p_j, 1.0);
+        } else {
+            let t = f32(s) / f32(N_SEGMENTS);
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+            let h10 = t3 - 2.0 * t2 + t;
+            let h01 = -2.0 * t3 + 3.0 * t2;
+            let h11 = t3 - t2;
+            let sample = h00 * p_i + h10 * t_i + h01 * p_j + h11 * t_j;
+            let projected = projectToSurface(sample, params.time, LINK_NEWTON_ITERS, LINK_NEWTON_ALPHA);
+            curves_out[base + s] = vec4f(projected, 1.0);
         }
     }
 }

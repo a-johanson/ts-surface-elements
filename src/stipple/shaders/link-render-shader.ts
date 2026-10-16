@@ -19,6 +19,7 @@
  *
  * The fragment shader paints a solid color.
  */
+import { LINK_N_SEGMENTS } from "./link-shader.js";
 import { SDF_COMMON } from "./sdf-common.js";
 
 export const LINK_RENDER_SHADER = /* wgsl */ `
@@ -31,11 +32,12 @@ struct LinkRenderUniform {
 };
 
 /**
- * Curve subdivision count per link — must match the N_SEGMENTS
- * constant in the link shader (the WGSL value is the source of truth;
- * this mirror resolves the instance → point/sub-segment mapping).
+ * Hermite sub-segment count per link — interpolated from the TS
+ * constant LINK_N_SEGMENTS (single source of truth, defined in
+ * link-shader.ts; decision 8 in the hatch-lines spec). Resolves the
+ * instance → point/sub-segment mapping.
  */
-const N_SEGMENTS: u32 = 4u;
+const N_SEGMENTS: u32 = ${LINK_N_SEGMENTS}u;
 
 /** Curve points per link (N_SEGMENTS + 1). */
 const STRIDE: u32 = N_SEGMENTS + 1u;

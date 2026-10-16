@@ -16,9 +16,8 @@
  */
 
 import { viewProjection } from "./camera.js";
-import { LINK_N_SEGMENTS } from "./link-pipeline.js";
 import type { CameraConfig } from "./point-render-pipeline.js";
-import { LINK_RENDER_SHADER } from "./shaders/index.js";
+import { LINK_N_SEGMENTS, LINK_RENDER_SHADER } from "./shaders/index.js";
 
 /**
  * Size of the link render uniform buffer in bytes: `mat4x4f` (64) +

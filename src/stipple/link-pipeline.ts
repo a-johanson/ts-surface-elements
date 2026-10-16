@@ -15,17 +15,18 @@
  *     {@link LinkPipeline.linksBuffer}, and elects each target's owner
  *     via `atomicMin` (after the dispatch, `owners[j]` is the smallest
  *     source index targeting `j`).
- *  3. **Dedup + subdiv** — one invocation per point drops the link of
- *     every source that lost its target's owner election, so each point
- *     keeps at most one incoming edge (decision 9 in the hatch-lines
- *     spec) and the surviving graph is a union of paths and cycles —
- *     additionally breaking mutual 2-cycles (i→j and j→i that both
- *     survived dedup) by dropping the larger-index edge, race-free,
- *     using only the stable `owners` buffer and the own `links` slot —
- *     then subdivides each surviving link into `N_SEGMENTS` steps,
- *     Newton-projects each sample onto the surface, and writes the
- *     curve points into {@link LinkPipeline.linkCurves}. Dropped or
- *     absent links zero their slice.
+ *  3. **Dedup + subdiv** — one invocation per point evaluates the
+ *     edge-survival predicate — owner election plus the mutual 2-cycle
+ *     break, dropping the larger-index edge of each pair (decision 9 in
+ *     the hatch-lines spec) — to decide whether the point's link
+ *     survived; `links` itself is not mutated, it stays the raw scan
+ *     output so the chain-window reads below are race-free (decision
+ *     11). For surviving links it samples a cubic Hermite segment
+ *     between the two stipple endpoints with C1 chain-window tangents
+ *     (Step 2c in the hatch-lines spec), Newton-projects the interior
+ *     samples onto the surface, and writes the curve points into
+ *     {@link LinkPipeline.linkCurves}. Dropped or absent links zero
+ *     their slice.
  *
  * WebGPU orders dispatches within a compute pass, so each stage's
  * writes are visible to the next without explicit barriers.
@@ -38,7 +39,7 @@
  */
 
 import type { PointBuffers } from "./point-buffers.js";
-import { LINK_SHADER } from "./shaders/index.js";
+import { LINK_N_SEGMENTS, LINK_SHADER } from "./shaders/index.js";
 import type { GridBuffers } from "./spatial-grid-pipeline.js";
 
 /** Workgroup size — must match `@workgroup_size(64)` in the WGSL. */
@@ -55,16 +56,7 @@ const LINK_PARAMS_BUFFER_BYTES = 8;
 /** Size of one link entry in bytes (one `u32` neighbor index). */
 const LINK_ENTRY_BYTES = 4;
 
-/**
- * Curve subdivision count per link.
- *
- * Must match the `N_SEGMENTS` constant in the link shader — the WGSL
- * value is the source of truth (decision 8 in the hatch-lines spec);
- * this mirror sizes the curve buffer and the render instance count.
- */
-export const LINK_N_SEGMENTS = 4;
-
-/** Curve points per link (`N_SEGMENTS + 1`). */
+/** Curve points per link (`LINK_N_SEGMENTS + 1`). */
 const LINK_CURVE_STRIDE = LINK_N_SEGMENTS + 1;
 
 /** Size of one curve point in bytes (one `vec4f`). */
@@ -86,8 +78,11 @@ export class LinkPipeline {
     /**
      * Per-point link buffer (not ping-ponged): the best neighbor index
      * per point, or `UINT_MAX` when no valid neighbor exists. The scan
-     * stage writes every entry; the dedup + subdiv stage then drops
-     * losing entries and emits the matching curve slice. Pre-filled
+     * stage writes every entry and is the buffer's final writer — it
+     * stays the raw scan output, and consumers (the subdivision's
+     * chain-window fetches and the render's interim coarse cull)
+     * evaluate the survival predicate from `links` + `owners`
+     * themselves (decisions 9 and 11 in the hatch-lines spec). Pre-filled
      * with `UINT_MAX` for determinism before the first dispatch.
      *
      * Internal working state, exposed readonly for the link render's
@@ -292,11 +287,11 @@ export class LinkPipeline {
      * (depending on `readFromA`) — this must match the buffer relax most
      * recently wrote — plus, for the scan, the shared normals buffer and
      * the spatial grid rebuilt from that same buffer. The dedup+subdiv
-     * stage drops losing links and writes the subdivided,
-     * surface-projected curve points into the shared curve buffer.
-     * Should be called after the shading pass (which refreshes the
-     * normals buffer from the post-relax positions) and before the
-     * render pass.
+     * stage evaluates the survival predicate without mutating `links`
+     * and writes the Hermite-sampled, surface-projected curve points
+     * into the shared curve buffer. Should be called after the shading
+     * pass (which refreshes the normals buffer from the post-relax
+     * positions) and before the render pass.
      *
      * @param encoder - The command encoder to record into.
      * @param time - Current animation time in seconds.

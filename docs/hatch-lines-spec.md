@@ -104,24 +104,30 @@ acceptable with the stale grid, the second rebuild can be dropped. See
 ### 2. Single compute pass: scan → dedup → subdivide + project
 
 The link compute does the neighbor scan, the dedup decision, and the
-curve subdivision in a single pass of three dispatches (see decision 9
-for the dispatch breakdown). The subdivision runs in the third dispatch
-— **after** the dedup decision — so dropped links never emit curve
+curve emission in a single pass of three dispatches (see decision 9 for
+the dispatch breakdown). The subdivision runs in the third dispatch —
+**after** the dedup decision — so dropped links never emit curve
 points: the scan finds the best neighbor `j` for point `i` and records
-it in the `links` buffer; the third dispatch (dedup+subdiv) then drops
-losing links and, for surviving links, subdivides `lerp(p_i, p_j, t)`
-for `t ∈ [0, 1]` in `N_SEGMENTS` steps, Newton-projects each sample
-onto the SDF surface, and writes `N_SEGMENTS + 1` `vec4f` positions
-per point (`.xyz` = position, `.w` = validity flag) into `linkCurves`;
-dropped or absent links zero their slice, so every slice is rewritten
-each frame (the buffer persists across frames and keeps rendering while
-paused).
+it in the `links` buffer; the third dispatch (dedup+subdiv) then
+evaluates the survival predicate and, for surviving links, samples a
+cubic Hermite segment between the two stipple endpoints with C1
+chain-window tangents (decision 11), Newton-projects each interior
+sample onto the SDF surface, and writes `N_SEGMENTS + 1` `vec4f`
+positions per point (`.xyz` = position, `.w` = validity flag) into
+`linkCurves`; dropped or absent links zero their slice, so every slice
+is rewritten each frame (the buffer persists across frames and keeps
+rendering while paused). The `links` buffer is never mutated after the
+scan — it stays the raw scan output, which is what makes the
+subdivision's cross-link chain-window reads race-free (decision 11).
 
 **Historical note.** This decision originally placed the subdivision
 inline in the scan dispatch and eliminated the `u32` index buffer;
 both were overtaken by decision 9 (owner election + dedup), which needs
 the `u32` `links` buffer as working state and requires curve emission
 to happen after the dedup decision so deduped-out edges never render.
+Step 2c later replaced the chord subdivision (`lerp` + project) with C1
+Hermite sampling and removed the in-place clearing of losing `links`
+entries (decision 11).
 
 **Step 1 exception.** Step 1 (the initial validation step) writes a
 simple `u32` index per point and renders a flat line-list — no
@@ -130,10 +136,10 @@ neighbor-finding logic produces visually sensible connections. Step 2
 moves the curve buffer in alongside the (now internal) `u32` index
 buffer.
 
-**Cost.** `N_SEGMENTS` Newton projections per surviving link (~4
-`map()` + gradient evals each); dropped links only zero their slice.
-For `N_SEGMENTS = 4` and 6K points this is ~24K SDF evaluations —
-negligible compared to the shading pass's per-point visibility trace
+**Cost.** `N_SEGMENTS − 1` Newton projections per surviving link
+(~4 `map()` + gradient evals each — the endpoints are the stipple
+points and are written exactly); dropped links only zero their slice.
+Negligible compared to the shading pass's per-point visibility trace
 (one `rayClearance` per point since Step 1c).
 
 ### 3. Principal direction: orthogonal to the light's tangent projection
@@ -241,29 +247,21 @@ connection-finding logic.
 
 ### 8. Compile-time WGSL constants
 
-All tunable parameters are compile-time constants defined **directly in
-WGSL** (e.g. `const N_SEGMENTS: u32 = 4u;`). Their values are **not**
-interpolated into the WGSL string from TypeScript — the WGSL source
-contains the literal values. The TS side documents the same values in the
-table below for reference, but the WGSL is the single source of truth at
-runtime. Changing a value requires editing the WGSL source and
-recompiling. These can be promoted to uniform buffer fields later if
-runtime tuning is needed.
+Shader constants are compile-time WGSL `const` definitions, not uniform
+buffer fields — no runtime plumbing is added for values the shaders
+never need to change while running. Which side owns a constant follows
+from where the value is needed:
 
-| Constant | Default | Description |
-|---|---|---|
-| `N_SEGMENTS` | `4` | Curve subdivision count per link |
-| `DISTANCE_WEIGHT` | `1.5` | Scoring: alignment-vs-distance tradeoff (`score = alignment - weight * dist`) |
-| `LINK_HALF_WIDTH` | `0.015` | Quad half-width in world units (camera-facing quad rendering) |
-| `LINK_COLOR` | `vec3f(0.6, 0.8, 1.0)` | Line fragment color (soft blue) |
-| `LINK_ALPHA` | `0.4` | Line fragment base opacity |
-| `LINK_NEWTON_ITERS` | `3` | Newton iterations per curve-point projection |
-| `LINK_NEWTON_ALPHA` | `0.7` | Newton step size (conservative for smin blend regions) |
-| `LINK_RADIUS` | `= RELAX_RADIUS` | Search radius for neighbor scan (same as cell size) |
-| `LINK_TAN_EPS` | `1e-4` | Threshold below which the light is considered parallel to the normal (`L_tan ≈ 0`) — no principal direction, no link |
-| `COINCIDENT_EPS` | `1e-7` | Skip neighbors closer than this (link direction `diff / dist` undefined at zero distance; same threshold as the relax shader's coincident guard) |
-
-These can be promoted to uniforms later if runtime tuning is needed.
+- **Needed only in WGSL** — define it directly in the shader source
+  with its literal value (e.g. `const DISTANCE_WEIGHT: f32 = 1.5;`).
+  The WGSL is the single source of truth and changing the value is a
+  one-line shader edit. No TS mirror, no interpolation, no uniform —
+  this is the preferred, lowest-friction case.
+- **Also needed on the TypeScript side** (sizing a buffer, computing a
+  draw's instance count, anything a pipeline constructor must know) —
+  define it once in TypeScript and interpolate the value into the WGSL
+  string. The TS definition is the single source of truth, so the two
+  sides cannot drift; never duplicate the value as a literal in WGSL.
 
 ### 9. Target dedup: at most one incoming edge per point (owner election)
 
@@ -287,19 +285,23 @@ no extra sort machinery. Three dispatches inside one compute pass:
    links, `atomicMin(&owners[best_j], i)` — after the dispatch,
    `owners[j]` is the smallest source index targeting `j`.
 3. The **dedup+subdiv** dispatch evaluates, per point, whether `i`'s
-   edge survived the election (`owners[links[i]] == i`) and clears
-   `links[i]` to `UINT_MAX` when it did not. It **additionally breaks
-   mutual 2-cycles**: when `owners[j] == i` (i's edge survived) **and**
-   `owners[i] == j` (j's surviving edge targets i) **and** `i > j`,
-   clear `links[i] = UINT_MAX`. This reads only the stable `owners`
-   buffer (written by the prior scan+elect dispatch) plus the own
-   `links[i]` slot (read-before-write), so it is race-free within the
+   edge survived the election (`owners[links[i]] == i`) and suppresses
+   `i`'s curve emission when it did not — since Step 2c it does **not**
+   clear `links[i]` to `UINT_MAX` anymore: `links` stays the raw scan
+   output so the subdivision's chain-window reads are race-free
+   (decision 11). It **additionally breaks mutual 2-cycles**: when
+   `owners[j] == i` (i's edge survived) **and** `owners[i] == j` (j's
+   surviving edge targets i) **and** `i > j`, the edge is dropped (in
+   Step 1b–2b by clearing `links[i]`; since Step 2c by skipping the
+   curve emission — the predicate itself is unchanged). This reads only
+   the stable `owners` buffer (written by the prior scan+elect
+   dispatch) plus the raw `links` slots, so it is race-free within the
    dispatch — no new pass, buffer, or dispatch. Both i and j evaluate
    the predicate; exactly the larger index drops, so one segment of
    each mutual pair survives. It then emits the render-facing geometry
-   (decision 2): surviving links are subdivided into `N_SEGMENTS`
-   surface-projected segments written to `linkCurves`; dropped or
-   absent links zero their slice.
+   (decision 2): surviving links are emitted as `N_SEGMENTS + 1`
+   Hermite-sampled, surface-projected curve points (decision 11)
+   written to `linkCurves`; dropped or absent links zero their slice.
 
 All three run inside `LinkPipeline.dispatch` (one compute pass, three
 dispatches — WebGPU orders dispatches within a pass, so each stage's
@@ -307,8 +309,9 @@ writes are visible to the next), so `main.ts` is unchanged. Winner
 criterion: smallest source index (deterministic). Mutual links (2-cycles
 i↔j) are removed by the fused mutual-break in the dedup+subdiv
 dispatch — no separate chain-filtering pass is needed. The `links`
-buffer is internal working state; since Step 2 the render consumes the
-curve buffer instead (decision 5).
+buffer is internal working state — the raw scan output since Step 2c
+(decision 11); since Step 2 the render consumes the curve buffer
+instead (decision 5).
 
 **Cost.** Two extra N-sized dispatches plus one atomic per point —
 ~120 KB traffic, no contention hot spots. Negligible next to the
@@ -330,6 +333,104 @@ and whatever graph that produces renders as-is, including single-link
 fragments and long polylines. The mutual-pair case is still handled
 (decision 9), since it is cheap, race-free, and stable; general chain
 reshaping is not.
+
+### 11. C1 chain-window Hermite subdivision (Step 2c)
+
+Step 2's curve was the chord polyline `lerp(p_i, p_j, t)` Newton-
+projected at `N_SEGMENTS + 1` samples — it follows the surface but is
+angular: consecutive chords meet at sharp turning angles inside a link
+and, worse, at the joints where one link's curve hands off to the next
+(the incoming and outgoing tangents at a joint were unrelated, since
+the two links were chosen independently). Step 2c replaces the
+subdivision with cubic Hermite segments whose endpoint tangents are
+**chain-window averages**, making the rendered chain of curve segments
+C1 (tangent-continuous; curvature may still jump at joints — the
+desired wavy-but-not-rubber-hose character).
+
+**Chain windows.** The link graph is a union of paths and cycles
+(decision 9); write its stipple vertices in chain order as `q_0 … q_n`
+(each `q_m` is `points[idx_m]`, with `idx_{m+1} = links[idx_m]` along
+the chain). Segment `σ_m = (q_m, q_{m+1})` — in implementation terms,
+the surviving link of the point `idx_m` — computes:
+
+- the tangent at its start vertex `q_m` from the window
+  `{q_{m-1}, q_m, q_{m+1}}`,
+- the tangent at its end vertex `q_{m+1}` from the window
+  `{q_m, q_{m+1}, q_{m+2}}`.
+
+Both adjacent segments evaluate the tangent at their shared vertex
+from the same three stipple points, and the tangent rule is a **pure
+function of that window** — so both compute identical tangent vectors
+and the chain is C1 (parametrically, since the magnitude rule is also
+window-pure).
+
+**Tangent rule** (window-pure; robust to the uneven stipple spacing
+produced by the luminance density modulation):
+
+```wgsl
+d_in  = v - pred;  d_out = succ - v;              // incident chords
+u_in  = d_in / |d_in|;  u_out = d_out / |d_out|;  // unit directions
+dir   = normalize(u_in + u_out);                  // averaged direction
+mag   = LINK_TANGENT_SCALE * (|d_in| + |d_out|) / 2
+t     = mag * dir
+```
+
+Unit chords are averaged *before* normalizing, so bunched knots cannot
+overshoot (the failure mode that would force centripetal
+parameterization in a plain Catmull-Rom). `LINK_TANGENT_SCALE` (see the
+decision 8 table) rounds the joints more broadly as it grows and hugs
+the chords as it shrinks. Guards are window-pure, so C1 survives them:
+one incident chord shorter than `COINCIDENT_EPS` → follow the other;
+near-antiparallel chords (hairpin) → the window's through-direction
+`normalize(succ − pred)`; a fully degenerate window → zero tangent (the
+Hermite reduces to a plain interpolation). Chain ends (no valid
+predecessor/successor) use the one-sided chord tangent
+`LINK_TANGENT_SCALE · (q_{m+1} − q_m)` — the same vector serves the
+start of the first segment and the end of the last.
+
+**Race-free windows inside the subdiv dispatch.** The window vertices
+come from stipple-point positions, not from neighbor curve slices, so
+no invocation depends on concurrently written curve data — except one:
+the end-vertex window needs `q_{m+2} = points[links[idx_{m+1}]]`, a
+*different* invocation's `links` slot. This is race-free because
+`links` is never mutated after the scan: the dedup dispatch used to
+clear losing entries in place (Step 1b–2b); Step 2c removes that write
+and moves the survival predicate to the consumers — the dispatch itself
+still evaluates it to gate curve emission, and the link render's
+interim coarse cull (Step 2b) reads `links[i]` only for surviving
+links, where the raw value equals the post-dedup value anyway.
+Validation of the window candidates uses only finalized `links` +
+`owners` state:
+
+- predecessor of `q_m`: `a = owners[i]`; valid iff `a != UINT_MAX` and
+  not mutual-dropped (`!(owners[a] == i && a > i)`) — else chain start,
+  one-sided.
+- successor of `q_{m+1}`: `k = links[j]` (`j = links[i]`, the own raw
+  slot); valid iff `k != UINT_MAX && k != i && owners[k] == j` — the
+  `k == i` guard rejects the degenerate double-back window (mutual pair
+  or dropped back-pointer, where the window would average to a zero
+  tangent), and `owners[k] == j` rejects a successor that lost its
+  target's election — else chain end, one-sided.
+
+**Sampling and projection.** The Hermite segment is evaluated at
+`N_SEGMENTS + 1` parameter values `s ∈ {0, 1/N, …, 1}`; the endpoints
+(`s = 0, 1`) are the stipple points themselves and are written exactly
+(both adjacent segments write the identical endpoint position, so
+segments join seamlessly), while interior samples are Newton-projected
+via `projectToSurface`. `N_SEGMENTS` is a pure tessellation knob — the
+curve's *shape* is fixed by the windows and `LINK_TANGENT_SCALE`,
+independent of the sample count (Step 2's concern that higher
+subdivision revealed tighter corners no longer applies). Cost is
+`N_SEGMENTS − 1` projections per surviving link — below Step 2's
+`N_SEGMENTS + 1` (the endpoints are free).
+
+**Not addressed here.** Vertices stay pinned to the stipple points, so
+chain-level zigzag (noisy picks making the chain itself wander) is
+untouched — the *rendering* through the joints is smooth, the chain
+shape is exactly what the picks produced. Smoothing the
+principal-direction field before the scan (or best-continuation
+election, see *Switch points*) remains the lever for that, if
+curve-level smoothness proves insufficient.
 
 ## Architecture & data flow
 
@@ -416,21 +517,21 @@ pass.end();
 
 | Buffer | Size | Usage | Owner / writer |
 |---|---|---|---|
-| `linksBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (internal working state: scan writes best-neighbor indices; dedup+subdiv reads and drops losers) |
+| `linksBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (internal: raw scan output — best-neighbor index or `UINT_MAX`, never mutated after the scan; consumers evaluate the survival predicate from `links` + `owners`) |
 | `ownersBuffer` | `point_count * 4` B | `STORAGE` | link-pipeline (internal: clear + atomicMin election + read in dedup+subdiv, once per frame) |
 | `linkCurves` | `point_count * (N_SEGMENTS + 1) * 16` B | `STORAGE` | link-pipeline (compute, once per frame) |
 | `linkRenderUniform` | `80` B (`mat4x4f` + `vec3f` eye + pad) | `UNIFORM \| COPY_DST` | link-render-pipeline (CPU write per frame) |
 
-With `N_SEGMENTS = 4` and `POINT_COUNT` between `6 * 1024` and
-`16 * 1024`, `linkCurves` is `POINT_COUNT * 5 * 16` B ≈ 480 KB –
-1.25 MB — trivial.
+With `N_SEGMENTS = 8` and `POINT_COUNT` between `6 * 1024` and
+`16 * 1024`, `linkCurves` is `POINT_COUNT * 9 * 16` B ≈ 0.86 MB –
+2.25 MB — trivial.
 
 ## Module structure
 
 | File | Responsibility |
 |---|---|
 | `src/stipple/link-pipeline.ts` | Owns the link compute pass: shader module, compute pipelines, params uniform, ping-pong read bind groups (A/B) for the scan and the dedup+subdiv stage, the render-facing output buffer (`linksBuffer` in Step 1, `linkCurves` from Step 2), and the internal working buffers (`linksBuffer` from Step 2, `ownersBuffer`). |
-| `src/stipple/shaders/link-shader.ts` | WGSL compute shader. Includes `SDF_COMMON`, duplicates `GridParams` (same as relax/shading — WGSL has no cross-module struct import). Exports `LINK_SHADER` (one module, one entry point per stage). Constants are defined directly in the WGSL (see decision 8). |
+| `src/stipple/shaders/link-shader.ts` | WGSL compute shader. Includes `SDF_COMMON`, duplicates `GridParams` (same as relax/shading — WGSL has no cross-module struct import). Exports `LINK_SHADER` (one module, one entry point per stage) and `LINK_N_SEGMENTS` (the TS-owned sub-segment count, interpolated into the WGSL — decision 8's TS-owned rule). Constants needed only in WGSL are defined directly in the shader source (see decision 8). |
 | `src/stipple/link-render-pipeline.ts` | Owns the link render pipeline: shader module, render pipeline, uniform buffer, and a single bind group (curve buffer, plus the `links` and `shading` buffers for the Step 2b interim visibility cull — nothing ping-ponged since Step 2). |
 | `src/stipple/shaders/link-render-shader.ts` | WGSL vertex/fragment shader. Step 1: `line-list` topology, reads point buffer + links buffer. Step 2: reads `linkCurves` buffer. Step 3: camera-facing quads. Step 4: occlusion culling. |
 
@@ -851,6 +952,14 @@ or mutual-link pairs reappear (dedup still effective — check with
 both occluded are culled again by the Step 2b interim endpoint check;
 mid-segment and single-endpoint occlusion remain until Step 4.
 
+**Superseded (Step 2c).** The chord subdivision (`lerp` + project) and
+the in-place clearing of losing `links` entries are replaced by C1
+Hermite sampling with chain-window tangents — see Step 2c and
+decision 11. The `N_SEGMENTS` TS mirror becomes the interpolated,
+single-source `LINK_N_SEGMENTS` constant (decision 8's TS-owned rule). The
+buffer layout, render pipeline, and instance mapping are otherwise
+unchanged.
+
 ### Step 2b — Interim endpoint-visibility cull
 
 **Status:** completed.
@@ -897,6 +1006,70 @@ per-curve-point `rayClearance` traces replace this check and drop the
 Back-side lines disappear again as in Step 1. Rotate the camera while
 time is paused — culling updates live. Step 2's surface-following
 behavior unchanged.
+
+### Step 2c — C1 Hermite subdivision with chain-window tangents
+
+**Status:** completed.
+
+**Goal:** fix the joint kinks. Step 2's curves follow the surface, but
+the rendered polyline is angular — consecutive chords meet at sharp
+turning angles, and at each joint the incoming and outgoing tangents
+are unrelated because the two links were chosen independently. The fix
+replaces the chord subdivision with cubic Hermite segments whose
+endpoint tangents are averaged over each endpoint vertex's chain
+window, making the chain of curve segments C1 (decision 11).
+
+**Mechanism.** The subdiv dispatch computes each endpoint tangent from
+the endpoint vertex's three-point stipple window — the predecessor via
+`owners`, the successor via the raw `links` slot of the target, both
+validated against the dedup rules with one-sided chord-tangent
+fallbacks — and samples the resulting Hermite segment, Newton-projecting
+the interior samples (the endpoints are the stipple points, written
+exactly, so adjacent segments join seamlessly). Because the tangent at
+a shared vertex is a pure function of that vertex's window, adjacent
+segments compute identical tangent vectors → C1 with no cross-link
+write, extra dispatch, or extra buffer. `links` is no longer cleared
+in place — it stays the raw scan output, which is what makes the
+chain-window read `links[links[i]]` race-free; the survival predicate
+moves to the consumers (the dispatch still evaluates it to gate curve
+emission; the render's interim cull reads `links[i]` only for
+surviving links, where the raw value equals the post-dedup value).
+See decision 11 for the full specification.
+
+**Changes:**
+- `shaders/link-shader.ts`: the subdiv dispatch drops the `links`
+  write-back; adds the chain-window fetches, the window-pure tangent
+  helpers, and Hermite sampling + `projectToSurface` for interior
+  samples. New WGSL constant `LINK_TANGENT_SCALE` (decision 8 table).
+  The `links_out` read/write binding gains a read-only alias
+  (`links_in`, same buffer, binding 7) for the subdiv entry, mirroring
+  the `owners_in` pattern. `N_SEGMENTS` is interpolated from the TS
+  constant `LINK_N_SEGMENTS`, defined and exported here (decision 8's
+  TS-owned rule).
+- `shaders/link-render-shader.ts`: `N_SEGMENTS` is interpolated from
+  the same `LINK_N_SEGMENTS` constant (removing the manual mirror).
+- `link-pipeline.ts` / `link-render-pipeline.ts`: `LINK_N_SEGMENTS` is
+  imported from the shader layer (via the `shaders` barrel) instead of
+  defined in `link-pipeline.ts`; no functional change (buffer sizes,
+  bind groups, dispatch order unchanged).
+- `link-render-shader.ts` / `link-render-pipeline.ts`: otherwise
+  unchanged — the interim cull reads `links[i]` only after the `.w`
+  validity check, i.e. only for surviving links, whose raw `links`
+  value equals the post-dedup value.
+- `docs/hatch-lines-spec.md`: decisions 2, 8, 9 updated; decision 11
+  added.
+
+**Verify:** `npm run lint` (TS files touched), then `npm run dev`.
+Joints between consecutive links are tangent-continuous — no more
+kinks at stipple points; the polyline reads as smooth strokes threading
+the stipple field. Curvature can still change abruptly at joints (C1,
+not C2) — acceptable. Chain ends terminate naturally at stipple
+points. If joints look over- or under-rounded, tune `LINK_TANGENT_SCALE`
+in the WGSL (higher = rounder). If the curve still reads faceted
+between joints, raise `LINK_N_SEGMENTS` (shape does not change — only
+tessellation fidelity; buffer, compute, and render stay in sync by
+construction). No fans/stars or mutual-link pairs reappear (dedup still
+effective — check with `DRAW_POINTS = false`).
 
 ### Step 3 — Camera-facing quad rendering with soft AA
 
@@ -1017,6 +1190,7 @@ checkpoint to:
 | 1d | Points visibly cluster in shadowed regions and spread out in lit regions. Clustering is view-independent (tracks the light, not the camera — pause time and orbit to confirm). Hatch lines appear denser in dark regions. No point collapse in deep shadow. |
 | 2 | Lines curve along the surface in high-curvature regions instead of cutting through. No visible penetration of the SDF surface. No fans/stars or mutual pairs reappear (dedup still effective). |
 | 2b | Back-side lines disappear again as in Step 1 (both endpoints occluded → culled). Culling updates live while paused and orbiting. Segments with one occluded endpoint or mid-segment occlusion still draw until Step 4. |
+| 2c | Joint kinks are gone — consecutive curve segments meet with matching tangents. Chain ends terminate naturally at stipple points. `LINK_TANGENT_SCALE` visibly controls joint rounding; `LINK_N_SEGMENTS` changes tessellation fidelity but not shape (buffer, compute, and render stay in sync by construction). |
 | 3 | Lines have visible width with smooth anti-aliased edges. Width foreshortens with viewing angle. Billboard behavior correct when rotating. |
 | 4 | Lines on the far side of the shape are culled. Soft fade near silhouette edges. No lines visible through the surface. |
 | 5 | No gaps at segment joints. No doubled-alpha seams. Correct from multiple viewing angles. |
@@ -1040,8 +1214,10 @@ checkpoint to:
   the line through the target wins (smoother polylines through kinks
   than an arbitrary index tie-break).
 - **Runtime-tunable parameters** — promote `DISTANCE_WEIGHT`,
-  `LINK_HALF_WIDTH`, `LINK_COLOR`, `LINK_ALPHA`, `N_SEGMENTS` to uniform
-  buffer fields (or a GUI) for live experimentation.
+  `LINK_HALF_WIDTH`, `LINK_COLOR`, `LINK_ALPHA`, `LINK_TANGENT_SCALE` to
+  uniform buffer fields (or a GUI) for live experimentation
+  (`N_SEGMENTS` is structural — decision 8 — but could join as a
+  uniform if the curve buffer is sized for its maximum).
 - **Variable segment count** — allocate a fixed maximum segment count
   per link but use fewer segments for short links (scaled by distance).
   Wastes some buffer space but avoids over-tessellating short links.
