@@ -9,18 +9,29 @@
  * `sortedValues`; empty cells (`cellStart == UINT_MAX`) are skipped. This
  * reduces the inner loop from O(n) to O(1) neighbor cells × O(points/cell).
  *
- * Pairwise force model: a Euclidean distance d_E cutoff gates the force,
+ * Pairwise force model: a per-neighbor effective radius gates the force,
  * and a linear-decay envelope modulates its magnitude:
  *
- *  - d_E > radius → skip
+ *  - luminance-driven density modulation (Step 1d): the effective radius
+ *    is computed per neighbor `j` from the neighbor's view-independent
+ *    luminance in the shared shading buffer — `r_eff_j = radius ·
+ *    mix(MIN_RADIUS_SCALE, 1.0, lum_j)`, written by the reproject pass
+ *    earlier in the same frame. Dark neighbors repel within a smaller
+ *    shell, so points can pack close around them and migrate into unlit
+ *    regions — density encodes brightness. Since `r_eff_j ≤ radius = cell
+ *    size`, the 27-cell neighborhood search always covers the full
+ *    interaction range.
+ *  - d_E > r_eff_j → skip
  *  - d_E < COINCIDENT_EPS (including bit-identical d_E == 0) → sign-based
  *    kick along a tangent basis vector instead of the normal repulsion
  *    (diff/d_E is undefined at d_E == 0); antisymmetric under i↔j swap, so
  *    the two points separate on the tangent plane, projectToSurface
  *    re-projects, and the next substep's normal repulsion resumes
  *  - pair midpoint deep inside the surface with opposing normals → skip
- *    (the points likely sit on opposite sides of a thin wall)
- *  - decay  (1 - d_E / radius)
+ *    (the points likely sit on opposite sides of a thin wall) — this
+ *    predicate and the coincident kick are geometric, not spacing
+ *    controls, so they keep the original `radius`
+ *  - decay  (1 - d_E / r_eff_j)
  *  - direction (p_i - p_j) / d_E
  *
  * The accumulated force is projected onto the tangent plane at `p_i` and
@@ -74,6 +85,7 @@ const UINT_MAX: u32 = 0xFFFFFFFFu;
 @group(0) @binding(5) var<storage, read> sorted_values: array<u32>;
 @group(0) @binding(6) var<storage, read> cell_start: array<u32>;
 @group(0) @binding(7) var<storage, read> cell_count: array<u32>;
+@group(0) @binding(8) var<storage, read> shading_in: array<PointShading>;
 
 const RELAX_NEWTON_ITERS: i32 = 1;
 const RELAX_ALPHA: f32 = 1.0;
@@ -86,6 +98,18 @@ const RELAX_ALPHA: f32 = 1.0;
  * next substep resumes normal repulsion.
  */
 const COINCIDENT_EPS: f32 = 1e-7;
+
+/**
+ * Minimum effective-radius scale at zero luminance (Step 1d). Each
+ * neighbor's repulsion shell is r · mix(MIN_RADIUS_SCALE, 1.0, lum_j):
+ * dark neighbors shrink their shell so points can pack close around them,
+ * lit neighbors keep the full shell — the asymmetry drives net migration
+ * into unlit regions, encoding brightness as density. Must stay ≤ 1: the
+ * effective radius never exceeds the interaction radius (also the grid
+ * cell size), so the 27-cell neighborhood search always covers the full
+ * range.
+ */
+const MIN_RADIUS_SCALE: f32 = 0.45;
 
 @compute @workgroup_size(64)
 fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
@@ -131,7 +155,16 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
                     let p_j = points_in[j].pos.xyz;
                     let diff = p_i - p_j;
                     let d_E = length(diff);
-                    if (d_E > r) {
+
+                    // Luminance-driven density modulation (Step 1d): the
+                    // effective radius is per neighbor j — dark neighbors
+                    // (low luminance) repel within a smaller shell, so
+                    // points pack close around them and migrate into
+                    // unlit regions. r_eff_j ≤ r always, so the 27-cell
+                    // search still covers the full range.
+                    let lum_j = shading_in[j].luminance;
+                    let r_eff_j = r * mix(MIN_RADIUS_SCALE, 1.0, lum_j);
+                    if (d_E > r_eff_j) {
                         continue;
                     }
 
@@ -169,7 +202,7 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
                     // }
                     // force = force + (1.0 - d_path / r) * diff_1 / d_1;
 
-                    force += (1.0 - d_E / r) * diff / d_E;
+                    force += (1.0 - d_E / r_eff_j) * diff / d_E;
                 }
             }
         }

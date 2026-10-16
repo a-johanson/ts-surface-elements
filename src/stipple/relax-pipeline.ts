@@ -6,10 +6,11 @@
  * invocation `i` reads `p_i` and `n_i` (inline), recomputes its grid cell,
  * scans the 27-cell neighborhood via `cellStart` / `cellCount` /
  * `sortedValues`, and for each neighbor `j` accumulates a linear-decay
- * repulsion gated by a Euclidean distance cutoff, projects the force onto
- * the tangent plane at `p_i`, integrates with a direct Euler position
- * step, then Newton-projects the new position back onto the time-animated
- * SDF surface.
+ * repulsion gated by a luminance-modulated per-neighbor effective radius
+ * (dark neighbors shrink their shell, so points pack into unlit regions),
+ * projects the force onto the tangent plane at `p_i`, integrates with a
+ * direct Euler position step, then Newton-projects the new position back
+ * onto the time-animated SDF surface.
  *
  * Ping-pong: the pass reads from one point buffer and writes to the
  * other, depending on `readFromA`. Two static bind-group sets cover both
@@ -19,7 +20,10 @@
  * groups bind the same grid buffer set. The normals buffer is shared
  * (not ping-ponged) and is owned by the reproject pass (per-frame,
  * before relax) and the shading pass (per-frame, after relax) — it
- * always matches whichever buffer relax reads. There is no density
+ * always matches whichever buffer relax reads. The shading buffer is
+ * likewise shared (not ping-ponged): its `luminance` field is written by
+ * the reproject pass earlier in the same frame and read here for the
+ * per-neighbor density modulation. There is no density
  * texture — points are on the surface by construction (seeded there,
  * re-projected every frame by reproject and relax).
  */
@@ -43,6 +47,12 @@ const RELAX_PARAMS_BUFFER_BYTES = 16;
  * reproject pipeline (written per-frame before relax), and the shading
  * pipeline (written per-frame after relax, plus once at bootstrap by
  * the seed pipeline).
+ *
+ * The shading buffer is likewise allocated once by {@link PointBuffers}
+ * and shared: this pipeline reads its `luminance` field for the
+ * per-neighbor density modulation, the reproject pipeline writes it
+ * per-frame before relax, and the shading pass writes the `clearance`
+ * field after relax.
  */
 export class RelaxPipeline {
     private readonly device: GPUDevice;
@@ -60,7 +70,7 @@ export class RelaxPipeline {
      *
      * @param device - The GPU device.
      * @param points - The ping-pong point buffer pair plus shared normals
-     *   buffer.
+     *   and shading buffers.
      * @param grid - The spatial grid buffers (params, sorted values, cell
      *   start/count). Rebuilt once per frame by `SpatialGridPipeline` from
      *   whichever buffer relax reads; not ping-ponged.
@@ -112,6 +122,7 @@ export class RelaxPipeline {
                 { binding: 5, resource: { buffer: grid.sortedValues } },
                 { binding: 6, resource: { buffer: grid.cellStart } },
                 { binding: 7, resource: { buffer: grid.cellCount } },
+                { binding: 8, resource: { buffer: points.shadingBuffer } },
             ],
         });
         this.relaxBindGroupBtoA = device.createBindGroup({
@@ -126,6 +137,7 @@ export class RelaxPipeline {
                 { binding: 5, resource: { buffer: grid.sortedValues } },
                 { binding: 6, resource: { buffer: grid.cellStart } },
                 { binding: 7, resource: { buffer: grid.cellCount } },
+                { binding: 8, resource: { buffer: points.shadingBuffer } },
             ],
         });
     }
@@ -157,7 +169,9 @@ export class RelaxPipeline {
      * Reads from one point buffer (depending on `readFromA`) and writes to
      * the other. The shared normals buffer is read (not written) by this
      * pass; it is refreshed per-frame by the reproject pass (before relax)
-     * and the shading pass (after relax).
+     * and the shading pass (after relax). The shared shading buffer's
+     * `luminance` field is also read (not written) — it is written by the
+     * reproject pass earlier in the same frame.
      *
      * The caller must flip `readFromA` after each dispatch to implement
      * the ping-pong swap.

@@ -644,7 +644,7 @@ Run `npm run lint` (the step touches TS files).
 
 ### Step 1d — Luminance-driven density modulation in the relax kernel
 
-**Status:** not started.
+**Status:** completed.
 
 **Goal:** make points pack more densely in unlit (low-luminance) regions
 and spread out in lit regions, so that hatch lines — which connect
