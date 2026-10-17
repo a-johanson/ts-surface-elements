@@ -9,13 +9,14 @@
  * is billboarded around the segment axis so the line has consistent
  * world-space width that foreshortens with viewing angle, with a soft
  * `fwidth`-based anti-aliased edge (decision 6 in the hatch-lines
- * spec). The vertex shader culls links with invalid curve slices and
- * — as the interim coarse visibility cull from Step 2b in the
- * hatch-lines spec — links whose stipple endpoints are both fully
- * occluded (per-segment occlusion replaces this in Step 4).
+ * spec). Occlusion (Step 4 in the hatch-lines spec) is resolved from
+ * the per-curve-point clearance the link compute's clearance stage
+ * bakes into the curve buffer's `.w` fields — refreshed every frame,
+ * including while time is paused, so culling and the geometric
+ * retraction of crossing segments stay view-dependent.
  *
- * The curve, links, and shading buffers are not ping-ponged, so a
- * single bind group covers them.
+ * The curve buffer is not ping-ponged, so a single bind group covers
+ * the uniform and the curve data.
  */
 
 import { viewProjection } from "./camera.js";
@@ -48,19 +49,15 @@ export class LinkRenderPipeline {
      *
      * @param device - The GPU device.
      * @param linkCurves - The shared curve buffer written by the link
-     *   compute pass.
-     * @param links - The internal post-dedup links buffer (the target
-     *   stipple point per link, for the coarse visibility cull).
-     * @param shading - The shared shading buffer (per-point center-ray
-     *   clearance for the coarse visibility cull).
+     *   compute pass — `.xyz` positions plus per-curve-point occlusion
+     *   clearance in `.w`, refreshed every frame by the clearance
+     *   stage.
      * @param config - Static camera configuration (FOV, up).
      * @param format - The canvas texture format.
      */
     public constructor(
         device: GPUDevice,
         linkCurves: GPUBuffer,
-        links: GPUBuffer,
-        shading: GPUBuffer,
         config: CameraConfig,
         format: GPUTextureFormat,
     ) {
@@ -119,8 +116,6 @@ export class LinkRenderPipeline {
             entries: [
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
                 { binding: 1, resource: { buffer: linkCurves } },
-                { binding: 2, resource: { buffer: links } },
-                { binding: 3, resource: { buffer: shading } },
             ],
         });
     }

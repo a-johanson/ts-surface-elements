@@ -496,25 +496,31 @@ curve-level smoothness proves insufficient.
 The link stages are inserted into the per-frame pipeline after shading and
 before the render pass:
 
-```
+``
 reproject (+ per-point luminance, Step 1c) → grid build → relax (substeps)
    → shading (normals refresh + center-ray visibility clearance)
    │
    ▼
-grid rebuild (from post-relax buffer)          ← NEW (reuses SpatialGridPipeline)
+grid rebuild (from post-relax buffer)          (playing frames only; reuses SpatialGridPipeline)
    │
    ▼
-link compute (scan → dedup → subdivide + project)  ← NEW — writes linkCurves buffer
+link compute (owner clear → scan+elect → dedup+subdiv)
+   │                                            (playing frames only)
    │  reads: points[readFromA], normalsBuffer, grid buffers
-   │  writes: linkCurves (not ping-ponged)
-   │  internally: owner clear → scan+elect (atomicMin) →
-   │  dedup+subdiv (fused mutual-break + curve emission)
+   │  writes: linkCurves (not ping-ponged; .w = validity placeholder)
    │  (one compute pass, 3 dispatches — decisions 2 and 9)
    │
    ▼
+link clearance (per-curve-point rayClearance toward the eye)
+   │                                            (every frame — view-dependent)
+   │  reads: linkCurves, normalsBuffer, links, owners
+   │  writes: linkCurves .w (occlusion clearance; 0.0 for dropped links)
+   │  (decision 7)
+   │
+   ▼
 render pass:
-   link render (line-list from Step 2; camera-facing
-   quads from Step 3)                           ← NEW — drawn first
+   link render (camera-facing quads with capsule SDF;
+   clearance cull + soft occlusion fade)        ← drawn first
    point render (existing)                      — drawn on top
 ```
 
@@ -522,8 +528,10 @@ The grid rebuild reads from the same buffer relax most recently wrote
 (`readFromA` after the substep loop), so cell assignments match the final
 relaxed positions. The link compute reads the same buffer plus the fresh
 grid and the shared normals buffer (written by the shading pass). The
-`linkCurves` buffer is written once per frame and read by the link render
-inside the same render pass as the point render.
+`linkCurves` buffer is written by the dedup+subdiv dispatch on playing
+frames (positions + validity placeholder), has its `.w` clearance
+refreshed by the clearance dispatch every frame, and is read by the link
+render inside the same render pass as the point render.
 
 The relax substeps additionally read the shared `shadingBuffer` for
 per-neighbor luminance to modulate point density (Step 1d). Since
@@ -533,10 +541,12 @@ same-frame values rather than last frame's. The buffer is not
 ping-ponged, so the binding is the same for both relax read bind groups
 (A/B).
 
-While time is paused, the grid rebuild and link compute are skipped
-(positions, normals, and animation time are unchanged, so the links from
-the last playing frame stay valid); the link render still runs every
-frame since its visibility handling is view-dependent.
+While time is paused, the grid rebuild and the link compute pass are
+skipped (positions, normals, and animation time are unchanged, so the
+links and curve geometry from the last playing frame stay valid); the
+clearance dispatch and the link render still run every frame since both
+are view-dependent — the clearance traces keep the line occlusion
+tracking the camera against the frozen curve geometry.
 
 ### Placement in the frame loop (`src/main.ts`)
 

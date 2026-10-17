@@ -154,8 +154,12 @@ function getCanvas(): HTMLCanvasElement {
  *    frame since no link input changes while paused.
  * 4. Dispatches the shading compute pass to refresh the normals buffer
  *    and compute the per-point center-ray visibility clearance from the
- *    relaxed positions. Always runs since it is view-dependent — the
- *    camera stays interactive while time is paused.
+ *    relaxed positions, and dispatches the link compute's clearance
+ *    stage, which traces each curve point's occlusion clearance toward
+ *    the eye into the curve buffer. Both are view-dependent, so they
+ *    always run — the camera stays interactive while time is paused,
+ *    and the link render's occlusion culling and soft fade stay live
+ *    against the frozen curve geometry.
  * 5. Begins a render pass that draws the SDF debug view (grayscale
  *    Lambert), then the link curves, and then — when {@link DRAW_POINTS}
  *    is enabled — the stipple points on top.
@@ -251,19 +255,29 @@ function startFrameLoop(
         const shadingReadsA = readFromA;
         shading.dispatch(encoder, eye, time, shadingReadsA);
 
-        // The link passes run only on frames where the simulation
-        // stepped: while paused the post-relax positions, normals, and
-        // animation time are unchanged, so the links computed on the last
-        // playing frame are still valid. The link render below still runs
-        // every frame — its occlusion culling is view-dependent.
+        // The link scan/dedup/subdiv passes run only on frames where
+        // the simulation stepped: while paused the post-relax
+        // positions, normals, and animation time are unchanged, so the
+        // links computed on the last playing frame are still valid. The
+        // clearance pass below and the link render run every frame —
+        // both are view-dependent.
         if (playedThisFrame) {
             // --- Compute pass: spatial grid rebuild (from post-relax
             // positions, for the link pass) ---
             spatialGrid.dispatch(encoder, shadingReadsA);
 
-            // --- Compute pass: link (best-neighbor scan) ---
-            link.dispatch(encoder, time, shadingReadsA);
+            // --- Compute pass: link (best-neighbor scan → dedup →
+            // curve emission) ---
+            link.dispatch(encoder, eye, time, shadingReadsA);
         }
+
+        // --- Compute pass: link clearance (per-curve-point occlusion,
+        // view-dependent) — every frame, including paused frames, so
+        // the link render's occlusion culling and fade keep tracking
+        // the camera against the frozen curve geometry. On playing
+        // frames it follows the link pass and sees the freshly written
+        // curve slices.
+        link.dispatchClearance(encoder, eye, time);
 
         // Render reads the same buffer shading just read (the point
         // renderer; the link renderer reads the curve buffer instead).
@@ -337,8 +351,6 @@ async function bootstrap(): Promise<void> {
     const linkRender = new LinkRenderPipeline(
         gpu.device,
         link.linkCurves,
-        link.linksBuffer,
-        points.shadingBuffer,
         cameraConfig,
         gpu.format,
     );

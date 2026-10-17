@@ -39,21 +39,15 @@
  * miter geometry, no SDF union of two segments, no extra varyings.
  * Chain ends terminate with a rounded cap too — no special handling.
  *
- * Two offscreen culls apply in the vertex shader:
- *
- *  - a link with no neighbor (or dropped by dedup) has an invalid
- *    curve slice — the validity flag `.w == 0.0` on either endpoint;
- *  - the interim coarse visibility cull (Step 2b in the hatch-lines
- *    spec): a link whose stipple endpoints are both fully occluded
- *    (non-positive center-ray clearance in the shading buffer) draws
- *    nothing. Per-segment occlusion replaces this in Step 4.
+ * Occlusion (Step 4 in the hatch-lines spec) is resolved per curve
+ * point and geometrically: the link compute's clearance stage stores,
+ * in each curve point's `.w`, the occlusion clearance of a
+ * `rayClearance` trace toward the eye (> 0 visible, < 0 occluded, 0.0
+ * dropped or absent link — its whole slice is zeroed).
  */
 import { LINK_N_SEGMENTS } from "./link-shader.js";
-import { SDF_COMMON } from "./sdf-common.js";
 
 export const LINK_RENDER_SHADER = /* wgsl */ `
-${SDF_COMMON}
-
 struct LinkRenderUniform {
     view_proj: mat4x4f,
     eye: vec3f,
@@ -122,8 +116,6 @@ const PARALLEL_EPS2: f32 = 1e-7;
 
 @group(0) @binding(0) var<uniform> u: LinkRenderUniform;
 @group(0) @binding(1) var<storage, read> curves: array<vec4f>;
-@group(0) @binding(2) var<storage, read> links: array<u32>;
-@group(0) @binding(3) var<storage, read> shading: array<PointShading>;
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4f,
@@ -131,6 +123,7 @@ struct VertexOut {
     @location(1) @interpolate(flat) seg_center: vec3f,
     @location(2) @interpolate(flat) seg_dir_v: vec3f,
     @location(3) @interpolate(flat) half_len_v: f32,
+    @location(4) @interpolate(flat) clearance: f32,
 };
 
 // Two-triangle quad covering the segment. corner.x is the side
@@ -152,6 +145,7 @@ fn offscreen() -> VertexOut {
     out.seg_center = vec3f(0.0);
     out.seg_dir_v = vec3f(0.0);
     out.half_len_v = 0.0;
+    out.clearance = -1.0;
     return out;
 }
 
@@ -165,19 +159,10 @@ fn link_vs(
     let e0 = curves[i * STRIDE + s];
     let e1 = curves[i * STRIDE + s + 1u];
 
-    // Invalid curve slice (no neighbor or dropped by dedup).
-    if (e0.w == 0.0 || e1.w == 0.0) {
-        return offscreen();
-    }
-
-    // Coarse visibility (interim until per-segment clearance arrives
-    // in Step 4): draw only when at least one endpoint's stipple dot
-    // is visible to the camera. The validity check above guarantees a
-    // surviving link, so j is a valid point index here.
-    let j = links[i];
-    let clearance_i = shading[i].clearance;
-    let clearance_j = shading[j].clearance;
-    if (clearance_i <= 0.0 && clearance_j <= 0.0) {
+    let c0 = e0.w;
+    let c1 = e1.w;
+    let c_hi = max(c0, c1);
+    if (c_hi <= 0.0) {
         return offscreen();
     }
 
@@ -265,6 +250,7 @@ fn link_vs(
     out.seg_center = center;
     out.seg_dir_v = seg_dir;
     out.half_len_v = half_len;
+    out.clearance = 1.0;
     return out;
 }
 

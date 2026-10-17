@@ -3,9 +3,12 @@
  * direction, canonicalized by target, plus per-link curve emission as
  * sampled cubic Hermite segments with C1 chain-window tangents.
  *
- * One module, three entry points, dispatched in order within a single
- * compute pass by `LinkPipeline` (WebGPU orders dispatches within a
- * pass, so each stage's writes are visible to the next):
+ * One module, four entry points. The first three are dispatched in
+ * order within a single compute pass by `LinkPipeline` (WebGPU orders
+ * dispatches within a pass, so each stage's writes are visible to the
+ * next) on frames where the simulation stepped; the fourth runs every
+ * frame (its input — the eye — changes with the camera even while
+ * time is paused):
  *
  *  1. `link_owner_clear_cs` — clears the `owners` buffer to `UINT_MAX`.
  *  2. `link_cs` — one invocation per point `i`. The 27-cell neighborhood
@@ -57,10 +60,28 @@
  *     are Newton-projected onto the surface; the endpoints are the
  *     stipple points themselves and are written exactly, so adjacent
  *     segments join seamlessly. Writes `STRIDE` curve points to
- *     `curves_out` (`.xyz` = position, `.w` = 1.0); dropped or absent
- *     links zero their slice — every slice is rewritten each frame,
- *     since the buffer persists across frames and keeps rendering while
- *     time is paused.
+ *     `curves_out` (`.xyz` = position, `.w` = validity placeholder —
+ *     1.0 valid, 0.0 dropped or absent link — overwritten by the
+ *     clearance stage below); dropped or absent links zero their
+ *     slice — every slice is rewritten each playing frame, since the
+ *     buffer persists across frames and keeps rendering while time is
+ *     paused.
+ *  4. `link_clearance_cs` — one invocation per point, dispatched every
+ *     frame (view-dependent). Evaluates the same edge-survival
+ *     predicate as stage 3 (from the finalized `links` + `owners`
+ *     state) and, for surviving links, traces one `rayClearance` per
+ *     curve point toward the eye — origin biased along the surface
+ *     normal, back-facing points short-circuited to an explicitly
+ *     occluded value and writes the clearance into `.w`, replacing the
+ *     validity placeholder. Endpoint normals come from the shared
+ *     normals buffer (the endpoints are the stipple points, so the
+ *     traced clearance is identical to the stipple dots' clearance);
+ *     interior samples get a fresh `sdfGradient` normal. Dropped or
+ *     absent links reset their slice's `.w` to 0.0 — a sentinel that
+ *     is both "invalid" and "fully occluded", which renders nothing.
+ *     Because this stage runs every frame, the link render's
+ *     occlusion culling and soft fade stay view-dependent while time
+ *     is paused.
  *
  * `GridParams` is duplicated here (WGSL has no cross-module struct
  * import) — it matches the layout in `cell-index-shader.ts` and
@@ -89,8 +110,10 @@ export const LINK_SHADER = /* wgsl */ `
 ${SDF_COMMON}
 
 struct LinkParams {
+    eye: vec3f,
     time: f32,
     point_count: u32,
+    _pad: u32,
 };
 
 struct GridParams {
@@ -184,11 +207,12 @@ const LINK_NEWTON_ALPHA: f32 = 1.0;
 @group(0) @binding(7) var<storage, read> links_in: array<u32>;
 
 /**
- * Subdivided curve points, written by link_dedup_subdiv_cs only — one
- * vec4f per curve point: .xyz = surface-projected position, .w =
- * validity flag (1.0 valid, 0.0 dropped or absent link). The other
- * entry points do not statically use it, so it is absent from their
- * derived bind group layouts.
+ * Subdivided curve points, written by link_dedup_subdiv_cs (positions
+ * plus a validity placeholder in the .w component) and by
+ * link_clearance_cs (per-curve-point occlusion clearance in .w, toward
+ * the eye: > 0 visible, < 0 occluded, 0.0 dropped or absent link). The
+ * other entry points do not statically use it, so it is absent from
+ * their derived bind group layouts.
  */
 @group(0) @binding(9) var<storage, read_write> curves_out: array<vec4f>;
 
@@ -332,6 +356,42 @@ fn windowTangent(pred: vec3f, v: vec3f, succ: vec3f) -> vec3f {
     return mag * sum / sum_len;
 }
 
+/**
+ * Edge-survival predicate for point i's scan output: the raw
+ * links_in[i] survives when it won its target's owner election and
+ * is not the larger-index edge of a mutual 2-cycle (decision 9 in the
+ * hatch-lines spec). Shared by the dedup+subdiv and clearance entry
+ * points; reads only the finalized links + owners state, so it is
+ * race-free within either dispatch.
+ */
+fn linkSurvives(i: u32) -> bool {
+    let j = links_in[i];
+    if (j == UINT_MAX || owners_in[j] != i) {
+        return false;
+    }
+    return !(owners_in[i] == j && i > j);
+}
+
+/**
+ * Occlusion clearance of a surface point toward the eye — the same
+ * center-ray trace the shading pass performs for the stipple points:
+ * origin biased along the surface normal, back-facing points
+ * short-circuited to an explicitly occluded value, rayClearance
+ * toward the eye. Non-positive results mean the surface occludes the
+ * point from the camera; positive results saturate at
+ * CLEARANCE_THRESHOLD (the ray's closest unobstructed approach).
+ */
+fn surfaceClearance(p: vec3f, n: vec3f, eye: vec3f, time: f32) -> f32 {
+    let p_biased = p + n * SHADOW_BIAS;
+    let to_eye = eye - p_biased;
+    let dist_eye = length(to_eye);
+    let eye_dir = to_eye / dist_eye;
+    if (dot(n, eye_dir) <= 0.0) {
+        return -1.0;
+    }
+    return rayClearance(p_biased, eye_dir, dist_eye, time);
+}
+
 @compute @workgroup_size(64)
 fn link_dedup_subdiv_cs(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
@@ -340,27 +400,19 @@ fn link_dedup_subdiv_cs(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     // Dedup: i's edge survives only when it won its target's owner
-    // election. Break mutual 2-cycles (i→j and j→i both survived):
-    // owners_in[i] == j means j's edge targets i and also survived.
-    // Keep the smaller-index edge, drop the larger. The predicate gates
-    // curve emission; links itself is not mutated (the scan made the
-    // final write), so the chain-window reads below are race-free.
-    let j = links_in[i];
-    var keep = false;
-    if (j != UINT_MAX && owners_in[j] == i) {
-        if (!(owners_in[i] == j && i > j)) {
-            keep = true;
-        }
-    }
-
+    // election and is not the dropped larger index of a mutual 2-cycle
+    // (linkSurvives). The predicate gates curve emission; links itself
+    // is not mutated (the scan made the final write), so the
+    // chain-window reads below are race-free.
     let base = i * STRIDE;
-    if (!keep) {
+    if (!linkSurvives(i)) {
         for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
             curves_out[base + k] = vec4f(0.0);
         }
         return;
     }
 
+    let j = links_in[i];
     let p_i = points_in[i].pos.xyz;
     let p_j = points_in[j].pos.xyz;
 
@@ -419,6 +471,44 @@ fn link_dedup_subdiv_cs(@builtin(global_invocation_id) gid: vec3u) {
             let projected = projectToSurface(sample, params.time, LINK_NEWTON_ITERS, LINK_NEWTON_ALPHA);
             curves_out[base + s] = vec4f(projected, 1.0);
         }
+    }
+}
+
+@compute @workgroup_size(64)
+fn link_clearance_cs(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.point_count) {
+        return;
+    }
+
+    let base = i * STRIDE;
+    if (!linkSurvives(i)) {
+        // Dropped or absent link: the subdiv stage zeroed the whole
+        // slice (positions included); keep the .w sentinel at 0.0 —
+        // "invalid", which renders nothing.
+        for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
+            curves_out[base + k].w = 0.0;
+        }
+        return;
+    }
+
+    let j = links_in[i];
+    for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
+        let p = curves_out[base + k].xyz;
+        // Endpoints are the stipple points themselves: reuse the
+        // shading pass's stored normals so the traced clearance is
+        // identical to the stipple dots' clearance (same position,
+        // same normal, same trace). Interior samples get a fresh
+        // surface normal.
+        var n: vec3f;
+        if (k == 0u) {
+            n = normals_in[i].xyz;
+        } else if (k == N_SEGMENTS) {
+            n = normals_in[j].xyz;
+        } else {
+            n = normalize(sdfGradient(p, params.time));
+        }
+        curves_out[base + k].w = surfaceClearance(p, n, params.eye, params.time);
     }
 }
 `;
