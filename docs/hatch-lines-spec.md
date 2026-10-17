@@ -27,9 +27,10 @@ Add two new pipeline stages after the existing shading pass:
    path to that neighbor into surface-projected segments, and writes the
    curve points to a storage buffer.
 
-2. A **link render pass** that draws the curve segments as camera-facing
-   quads with soft anti-aliased edges and per-segment occlusion culling,
-   composited under the existing stipple points.
+2. A **link render pass** that draws the curve segments as screen-space
+   stroke quads (geometry built in 2D pixel coordinates) with soft
+   anti-aliased edges and per-segment occlusion culling, composited
+   under the existing stipple points.
 
 The feature is always on (no feature gate); lines are drawn before the
 point render so points sit on top.
@@ -198,88 +199,148 @@ render-facing output is the curve buffer. From Step 2, the
 dedup+subdiv dispatch also reads the same ping-pong-selected point
 buffer (for `p_i`/`p_j`), so it carries A/B bind groups of its own.
 
-### 6. Rendering: capsule-SDF camera-facing quads (Step 3+)
+### 6. Rendering: screen-space capsule stroke quads (Step 3+)
 
-From Step 3 onward, each sub-segment is rendered as a **camera-facing
-quad** (billboarded around the segment axis). The vertex shader computes:
-
-```wgsl
-let seg_dir = normalize(p1 - p0);
-let view_dir = normalize(eye - center);
-let side = normalize(cross(seg_dir, view_dir));
-```
-
-where `center = 0.5 * (p0 + p1)`. `side` is guarded against the
-parallel-segment degeneracy (when `seg_dir ∥ view_dir`, `cross → 0`
-and `normalize(0) → NaN`, which the rasterizer turns into huge garbage
-triangles and a GPU freeze): the shader picks an arbitrary
-perpendicular to `seg_dir` via `cross(seg_dir, alt)` in that case, and
-the foreshortened segment renders as its rounded cap. A `clip_c.w <= 0`
-guard additionally pushes segments whose center lands behind the camera
-offscreen (the axis-extended quad would otherwise straddle `w = 0` and
-rasterize as slivers).
-
-**Line shape — capsule SDF.** The fragment shader does not use a side
-coordinate. It evaluates a 2D segment distance field: the distance from
-the fragment's world position to the closest point on the segment
-centerline (clamped to the endpoints), minus `LINK_HALF_WIDTH` — a
-signed distance whose zero contour is a **capsule** (rectangle with
-semicircular rounded caps). Anti-aliased via `fwidth(sdist)` (same
-pattern as the point shader's disc SDF), giving a ~1px soft edge
-independent of zoom and world-space location (the screen derivative
-tracks the actual pixel rate). `LINK_ALPHA = 1.0` — the line interior
-is fully opaque; only the ~1px AA edge blends. This opacity is what
-makes the mitering trick work (decision 11 / Step 5).
-
-**Quad sizing — world-space line width plus a screen-space AA
-corridor.** The line keeps a world-space half-width
-(`LINK_HALF_WIDTH`) so it foreshortens with viewing angle and depth
-(same philosophy as the point renderer's `POINT_RADIUS_WORLD`). The
-quad, however, is oversized to always leave enough screen-pixel room
-for the AA band, even at extreme zoom-out — and to fit the capsule's
-rounded caps along the axis (otherwise the caps are clipped and
-adjacent segments show hairline gaps at joints; see decision 11).
-The quad half-extent is:
+From Step 3 onward, each sub-segment is rendered as a **screen-space
+stroke quad**: the stroke geometry is built entirely in 2D pixel
+coordinates (*stroke space* — one unit per canvas pixel, sharing NDC's
+y-up orientation; the difference from the framebuffer's y-down
+orientation is an isometry and does not affect distances). The vertex
+stage perspective-projects the two endpoint curve points to pixel
+coordinates, extrudes the quad as the bounding box of the 2D capsule
+around the projected segment, and outputs it with a **constant clip
+`w` and depth — the segment center's**:
 
 ```wgsl
-let quad_half = LINK_HALF_WIDTH + AA_PIXELS * wpp;
+out.clip_pos = vec4f(ndcFromPx(frag_px) * w_c, z_c, w_c);
 ```
 
-where `wpp` is world-units-per-pixel at the segment center, measured
-by transforming the `side` direction (as a direction, `w=0`) through
-the view-projection, linearizing at the center's clip-space `w`, and
+so interpolation across the quad is exactly linear in screen space and
+the interpolated stroke position tracks each fragment's true screen
+position. The per-instance stroke geometry — projected endpoints
+`p0_px` / `p1_px` and per-endpoint pixel radii `r0_px` / `r1_px` —
+travels as flat varyings; the fragment position `frag_px` interpolates
+in stroke pixels.
+
+**Line shape — 2D capsule SDF in stroke pixels.** The fragment shader
+evaluates a 2D segment distance field: the distance from the fragment's
+pixel position to the closest point on the projected segment (clamped
+to the endpoints), minus a stroke radius interpolated between the two
+endpoint radii by the clamped closest-point parameter — a signed
+distance whose zero contour is a **capsule** in screen space (tapered
+body, semicircular rounded caps). Anti-aliased via `fwidth(sdist) *
+AA_WIDTH` (same pattern as the point shader's disc SDF; `AA_WIDTH`
+matches the point shader's so line and dot edges have consistent
+softness), giving a ~1px soft edge independent of zoom and viewing
+angle. `LINK_ALPHA = 1.0` — the line interior is fully opaque; only
+the ~1px AA edge blends. This opacity is what makes the mitering trick
+work (decision 11 / Step 5).
+
+**Stroke width — world-space half-width, projected to pixels.** The
+line keeps a world-space half-width (`LINK_HALF_WIDTH`, sized relative
+to `POINT_RADIUS_WORLD` — lines read thinner than the dots they
+connect; same philosophy as the point renderer), but converts it to a
+pixel stroke radius **at each endpoint's own depth**. The projected
+cross-section radius of a 3D tube is exactly proportional to the
+inverse projective depth — the pixel displacement per world unit along
+a view-perpendicular direction is a depth-independent pixel scale
+divided by clip `w`:
+
+```wgsl
+let r_px = LINK_HALF_WIDTH * px_scale / clip.w;
+```
+
+`px_scale` is measured by transforming a view-perpendicular direction
+`perp = normalize(cross(view_dir, up))` (as a direction, `w = 0`; axis
+fallback when `abs(view_dir.y) > 0.9`) through the view-projection and
 scaling to pixels:
 
 ```wgsl
-let side_clip = u.view_proj * vec4f(side, 0.0);
-let px_delta = (side_clip.xy / clip_c.w) * (0.5 * canvas_size);
-let wpp = 1.0 / length(px_delta);
+let perp_clip = u.view_proj * vec4f(perp, 0.0);
+let px_scale = length(perp_clip.xy * (0.5 * canvas_size));
 ```
 
-This is robust against camera orientations that zero out individual
-projection matrix elements (looking along a world axis made an earlier
-`view_proj[0][0]` / `view_proj[1][1]` division blow up → `quad_half
-→ ∞` → huge triangles → GPU freeze). Because `side ⊥ view_dir` by
-construction (in both the normal and the parallel-segment fallback
-cases), `side` lives in the camera's xy plane, so `side_clip.xy` is
-always non-zero → `wpp` is always finite. No cap is needed: the
-padding self-regulates (`quad_half / wpp → AA_PIXELS` as `wpp`
-grows), so the quad stays `~AA_PIXELS` pixels on screen at any zoom —
-at extreme zoom-out the line goes sub-pixel and the AA band takes
-over, giving a stable minimum stroke that never flickers.
+A view-perpendicular reference direction is used — not the projected
+segment itself — because the projected segment's on-screen length
+collapses to zero exactly in the near-parallel case this shader must
+survive, while `perp` lies in the camera's xy plane, so `perp_clip.xy`
+is always non-zero and `px_scale` always finite. The radius tapers
+linearly along the segment body (interpolated by the clamped
+closest-point parameter) and is held constant within each rounded cap
+— the stroke reads with the same pixel width its 3D tube would
+project: shrinking with distance, and collapsing toward its rounded
+cap as the segment turns parallel to the view.
 
-The quad extends along the segment axis by `quad_half` beyond each
-endpoint (so the rounded caps fit) and across by `±quad_half` (line
-width + AA corridor on each side).
+**Quad sizing — pixels throughout.** The quad half-extent is:
 
-**Uniform.** The link render uniform grows to include `canvas_size:
-vec2f` (for the `wpp` computation): `mat4x4f` view-projection (64) +
+```wgsl
+let quad_half = max(r0_px, r1_px) + AA_PIXELS;
+```
+
+It extends along the projected axis by `quad_half` beyond each endpoint
+(so the rounded caps fit) and across by `±quad_half` (the larger
+endpoint radius plus the AA margin on each side). At extreme zoom-out
+the stroke radius collapses sub-pixel and the padding takes over — the
+stroke settles to a stable ~`AA_PIXELS`-pixel minimum width that never
+flickers.
+
+**Why screen space — continuity at grazing angles.** Each capsule's
+rounded cap extends the stroke radius past the shared endpoint in
+*every* screen direction, so consecutive sub-segments always overlap at
+their joints and the union renders as a rounded, welded miter with no
+hairline gaps — at any viewing angle. Shared curve points also share a
+projected depth, so neighboring capsules agree on the joint's stroke
+radius from both sides. A world-space capsule cannot do this: its
+along-axis reach past the shared endpoint foreshortens by the sine of
+the angle to the view, starving exactly those joint overlaps when a
+segment is viewed near-parallel (and its view-compressed distance
+field blows the `fwidth`-derived AA band up by the same factor, fading
+the caps out). The near-parallel case degenerates gracefully instead:
+the projected segment collapses, the capsule becomes a disc, and
+consecutive discs overlap into a continuous blob along the collapsed
+chain.
+
+**Guards.** The vertex shader pushes a sub-segment offscreen when:
+
+- **Occluded** (Step 4) — `max(e0.w, e1.w) <= 0.0`: neither endpoint
+  curve point has positive clearance toward the eye.
+- **Behind the camera** — `clip0.w <= 0 || clip1.w <= 0`: an endpoint
+  with non-positive clip `w` divides by a negative `w` and projects to
+  a mirrored, garbage screen position. This also covers the segment
+  center, whose clip `w` is the affine midpoint of the endpoints'.
+- **Eye on the segment** — `dist_eye < EYE_EPS`: this close, the view
+  direction (and with it the perpendicular basis) is numerically
+  undefined — position differences at scene scale are noise-dominated —
+  and the stroke would enclose the camera.
+- **Collapsed projection** — `dot(px1 - px0, px1 - px0) <
+  DEGENERATE_PX2` (coincident curve points or a view-parallel
+  segment): the 2D basis falls back to a fixed axis, both radii
+  flatten to the larger one, and the fragment's distance field
+  degenerates to a plain point distance (disc).
+
+**Uniform.** 96 B layout: `mat4x4f` view-projection (64) +
 `vec3f` eye (16-aligned) + `vec2f` canvas_size (8) + pad (4) = 96 B.
+`canvas_size` converts between NDC and pixel coordinates and scales
+the pixel measurements; `eye` provides the view direction for the
+view-perpendicular pixel scale.
+
+**Historical note.** Step 3 originally rendered **world-space
+camera-facing quads** — billboarded around the segment axis
+(`side = normalize(cross(seg_dir, view_dir))`, guarded against the
+parallel-segment degeneracy), with the capsule SDF evaluated against
+world-space positions and the quad oversized to
+`LINK_HALF_WIDTH + AA_PIXELS * wpp`, where `wpp` was a measured
+world-units-per-pixel factor. It was replaced by the screen-space
+approach above: the world-space capsule's along-axis reach past a
+shared endpoint foreshortens by the sine of the angle to the view,
+starving the joint overlaps near grazing angles, and its
+view-compressed distance field blows the `fwidth`-derived AA band up
+by the same factor, fading the caps out.
 
 **Step 1 and Step 2 use a simple `line-list`** with native `line-list`
-topology — no quads, no billboard math. This is the minimal path to
-verify the connections look right. Step 3 upgrades to the capsule-SDF
-camera-facing quads described here.
+topology — no quads, no projection math. This is the minimal path to
+verify the connections look right. Step 3 upgrades to the screen-space
+capsule stroke quads described here.
 
 ### 7. Occlusion: per-segment ray clearance (Step 4)
 
@@ -519,9 +580,9 @@ link clearance (per-curve-point rayClearance toward the eye)
    │
    ▼
 render pass:
-   link render (camera-facing quads with capsule SDF;
-   clearance cull + soft occlusion fade)        ← drawn first
-   point render (existing)                      — drawn on top
+   link render (screen-space stroke quads, 2D capsule SDF;
+   clearance cull)                             ← drawn first
+   point render (existing)                     — drawn on top
 ```
 
 The grid rebuild reads from the same buffer relax most recently wrote
@@ -556,14 +617,18 @@ After the shading dispatch and before the render pass:
 shading.dispatch(encoder, eye, time, shadingReadsA);
 
 // Grid rebuild + link compute run only on frames where the simulation
-// stepped; while paused the links cannot change.
+// stepped; while paused the links cannot change. The clearance pass
+// and the link render run every frame — both are view-dependent.
 if (playedThisFrame) {
     // --- Grid rebuild from post-relax positions (for link pass) ---
     spatialGrid.dispatch(encoder, shadingReadsA);
 
     // --- Link compute: find connections → dedup → subdivide + project ---
-    link.dispatch(encoder, time, shadingReadsA);
+    link.dispatch(encoder, eye, time, shadingReadsA);
 }
+
+// --- Link clearance: per-curve-point occlusion, every frame ---
+link.dispatchClearance(encoder, eye, time);
 
 // --- Render pass: link render (under) + point render (top) ---
 const pass = encoder.beginRenderPass({ /* ... */ });
@@ -601,8 +666,8 @@ With `N_SEGMENTS = 8` and `POINT_COUNT` between `6 * 1024` and
 |---|---|
 | `src/stipple/link-pipeline.ts` | Owns the link compute pass: shader module, compute pipelines, params uniform, ping-pong read bind groups (A/B) for the scan and the dedup+subdiv stage, the render-facing output buffer (`linksBuffer` in Step 1, `linkCurves` from Step 2), and the internal working buffers (`linksBuffer` from Step 2, `ownersBuffer`). |
 | `src/stipple/shaders/link-shader.ts` | WGSL compute shader. Includes `SDF_COMMON`, duplicates `GridParams` (same as relax/shading — WGSL has no cross-module struct import). Exports `LINK_SHADER` (one module, one entry point per stage) and `LINK_N_SEGMENTS` (the TS-owned sub-segment count, interpolated into the WGSL — decision 8's TS-owned rule). Constants needed only in WGSL are defined directly in the shader source (see decision 8). |
-| `src/stipple/link-render-pipeline.ts` | Owns the link render pipeline: shader module, render pipeline (`triangle-list` topology, instanced 6-vertex quads), the 96 B uniform buffer (`mat4x4f` view-projection + `vec3f` eye + `vec2f` canvas_size + pad), and a single bind group (curve buffer, plus the `links` and `shading` buffers for the Step 2b interim visibility cull — nothing ping-ponged since Step 2). |
-| `src/stipple/shaders/link-render-shader.ts` | WGSL vertex/fragment shader. Step 1: `line-list` topology, reads point buffer + links buffer. Step 2: reads `linkCurves` buffer. Step 3: capsule-SDF camera-facing quads (oversized axis-extended quad, signed-distance fragment, `fwidth` AA, grazing-angle guards — see decision 6). Step 4: occlusion culling. |
+| `src/stipple/link-render-pipeline.ts` | Owns the link render pipeline: shader module, render pipeline (`triangle-list` topology, instanced 6-vertex quads), the 96 B uniform buffer (`mat4x4f` view-projection + `vec3f` eye + `vec2f` canvas_size + pad), and a single bind group (uniform + curve buffer — nothing ping-ponged). |
+| `src/stipple/shaders/link-render-shader.ts` | WGSL vertex/fragment shader. Step 1: `line-list` topology, reads point buffer + links buffer. Step 2: reads `linkCurves` buffer. Step 3: screen-space capsule stroke quads (2D pixel-coordinate geometry, projected 2D capsule SDF fragment, `fwidth` AA, degeneracy guards — see decision 6). Step 4: occlusion culling. |
 
 All new shaders are re-exported through `src/stipple/shaders/index.ts`.
 
@@ -1139,47 +1204,66 @@ tessellation fidelity; buffer, compute, and render stay in sync by
 construction). No fans/stars or mutual-link pairs reappear (dedup still
 effective — check with `DRAW_POINTS = false`).
 
-### Step 3 — Camera-facing quad rendering with soft AA
+### Step 3 — Screen-space stroke-quad rendering with soft AA
 
 **Status:** completed.
 
-**Goal:** replace the crude `line-list` with billboarded quads for
-artistic control over line width and anti-aliasing.
+**Goal:** replace the crude `line-list` with quads for artistic control
+over line width and anti-aliasing.
 
 **Changes:**
 - `link-render-shader.ts`: switch from `line-list` to `triangle-list`
   with `draw(6, pointCount * N_SEGMENTS)` (6 vertices = 2 triangles per
-  quad, instanced per sub-segment). The line shape is a **capsule SDF**
-  in the fragment shader — the signed distance to the segment
-  centerline (clamped to endpoints) minus `LINK_HALF_WIDTH`, AA'd via
-  `fwidth(sdist)` (same pattern as the point shader's disc SDF, ~1px
-  edge, zoom- and location-independent). The vertex shader computes
-  `seg_dir`, `view_dir`, `side` as in decision 6 and sizes the quad to
-  `quad_half = LINK_HALF_WIDTH + AA_PIXELS * wpp`, where `wpp` is
-  world-units-per-pixel measured by transforming the `side` direction
-  through the view-projection (robust against camera orientations that
-  zero out projection matrix elements — see decision 6). The quad
-  extends along the segment axis by `quad_half` beyond each endpoint
-  so the capsule's rounded caps fit (see Step 5). Three grazing-angle
-  guards in the vertex shader: `side` NaN guard (parallel-segment
-  fallback perpendicular), `clip_c.w <= 0` behind-camera guard, and
-  the direction-transform `wpp` itself. `LINK_ALPHA = 1.0` (opaque
+  quad, instanced per sub-segment). The stroke geometry is built
+  entirely in 2D pixel coordinates (stroke space): the vertex shader
+  perspective-projects the two endpoint curve points to pixel
+  coordinates, converts the world-space half-width `LINK_HALF_WIDTH`
+  to a per-endpoint pixel stroke radius via the inverse projective
+  depth (`px_scale` measured along a view-perpendicular direction —
+  see decision 6), and extrudes the quad as the bounding box of the
+  2D capsule around the projected segment
+  (`quad_half = max(r0_px, r1_px) + AA_PIXELS`, extended along the
+  projected axis so the rounded caps fit — see Step 5). The quad is
+  output with the segment center's constant clip `w` and depth, so
+  interpolation is exactly linear in screen space. The fragment
+  shader evaluates the 2D segment distance field in stroke pixels
+  against the depth-tapered radius, AA'd via `fwidth(sdist) *
+  AA_WIDTH` (same pattern as the point shader's disc SDF, ~1px edge,
+  zoom- and angle-independent). Four guards in the vertex shader:
+  occlusion cull (`max(e0.w, e1.w) <= 0.0` — Step 4), behind-camera
+  (`clip.w <= 0` on either endpoint), eye-on-segment
+  (`dist_eye < EYE_EPS`), and collapsed projection
+  (`DEGENERATE_PX2` — fixed fallback axis, radii flattened to the
+  larger one, disc-shaped distance field). `LINK_ALPHA = 1.0` (opaque
   interior; only the AA edge blends). New WGSL-only constants
   (`LINK_HALF_WIDTH`, `LINK_COLOR`, `LINK_ALPHA`, `AA_WIDTH`,
-  `AA_PIXELS`, `DEGENERATE_EPS2`, `PARALLEL_EPS2`) — see decision 8.
+  `AA_PIXELS`, `DEGENERATE_PX2`, `EYE_EPS`) — see decision 8.
 - `link-render-pipeline.ts`: topology `triangle-list`; blend state
   `src-alpha` / `one-minus-src-alpha` (same as point renderer). Uniform
-  grows 80 → 96 B to add `vec2f canvas_size` (for the `wpp`
-  computation); `writeUniform` writes `canvas.width` / `canvas.height`.
-  No ping-pong bind groups needed (curve buffer is shared).
+  grows 80 → 96 B to add `vec2f canvas_size` (NDC ↔ pixel coordinate
+  conversion and the pixel-scale measurement); `writeUniform` writes
+  `canvas.width` / `canvas.height`. No ping-pong bind groups needed
+  (curve buffer is shared).
 
-**Verify:** Lines have visible world-space width that foreshortens
-with viewing angle, with ~1px zoom-independent AA edges. At extreme
-zoom-out the line settles to a stable `~AA_PIXELS`-pixel minimum
-stroke (no sub-pixel flicker). Rotating through all camera
-orientations (including looking along ±x / ±y) produces no freeze, no
-"stretched sheets," no slivers. Lines still follow the surface
-curvature (from Step 2).
+**Historical note.** Step 3 originally rendered **world-space
+camera-facing quads** — billboarded around the segment axis with a
+world-space capsule SDF and a quad oversized by a measured
+world-units-per-pixel factor (`wpp`). It was replaced by the
+screen-space approach (see decision 6): the world-space capsule's
+along-axis reach past a shared endpoint foreshortens with the view
+angle, starving the joint overlaps near grazing angles, and its
+view-compressed distance field blew the `fwidth`-derived AA band up by
+the same factor, fading the caps out.
+
+**Verify:** Lines read with the pixel width their 3D tube would
+project — shrinking with distance, collapsing toward the rounded cap
+as the segment turns parallel to the view — with ~1px zoom-independent
+AA edges. At extreme zoom-out the stroke settles to a stable
+`~AA_PIXELS`-pixel minimum width (no sub-pixel flicker). Rotating
+through all camera orientations produces no freeze and no garbage
+geometry; near-parallel sub-segments collapse gracefully to
+overlapping discs, so chains stay continuous at grazing angles. Lines
+still follow the surface curvature (from Step 2).
 
 ### Step 4 — Per-segment occlusion
 
@@ -1227,16 +1311,16 @@ no additional code beyond what Step 3 already shipped.
 sub-segments of the same curve meet.
 
 **Approach (supersedes the overlap / miter-bisector plan):** the
-Step 3 line shape is a capsule (rectangle with semicircular rounded
-caps — decision 6), and the quad extends along the segment axis by
-`quad_half` beyond each endpoint to fit those caps. Because adjacent
-sub-segments share endpoints exactly (the Hermite subdivision writes
-identical endpoints — decision 11), the rounded caps of neighboring
-segments overlap at each joint. With `LINK_ALPHA = 1.0` (opaque
-interior, only the ~1px AA edge blends), the overlap is invisible —
-opaque over opaque produces no darkening and no doubled alpha — and
-the union of the two capsules renders as a **rounded miter /
-bent-sausage join** with no hairline gaps:
+Step 3 line shape is a capsule (tapered body with semicircular rounded
+caps — decision 6), and the quad extends along the projected segment
+axis by `quad_half` (in stroke pixels) beyond each endpoint to fit
+those caps. Because adjacent sub-segments share endpoints exactly (the
+Hermite subdivision writes identical endpoints — decision 11), the
+rounded caps of neighboring segments overlap at each joint. With
+`LINK_ALPHA = 1.0` (opaque interior, only the ~1px AA edge blends),
+the overlap is invisible — opaque over opaque produces no darkening
+and no doubled alpha — and the union of the two capsules renders as a
+**rounded miter / bent-sausage join** with no hairline gaps:
 
 - Collinear segments: the two opposite-half-disc caps form a full
   disc → seamless.
@@ -1253,7 +1337,11 @@ no extra dispatch. The earlier "extend each quad by `LINK_HALF_WIDTH`
 along the axis" and "miter joint bisector" alternatives are
 superseded: Step 3's axis extension (by `quad_half`, not
 `LINK_HALF_WIDTH`) already provides the overlap, and the opacity
-makes it seamless.
+makes it seamless. Screen-space rendering strengthens this further:
+each cap extends the stroke radius past the shared endpoint in
+*every* screen direction (decision 6), so the overlap survives grazing
+angles where a world-space capsule's along-axis reach would
+foreshorten away.
 
 **Verify:** Look closely at segment joints (zoom in). No gaps, no
 dark seams, no doubled alpha. Rounded miters at bends; rounded caps
@@ -1284,7 +1372,7 @@ checkpoint to:
 | 2 | Lines curve along the surface in high-curvature regions instead of cutting through. No visible penetration of the SDF surface. No fans/stars or mutual pairs reappear (dedup still effective). |
 | 2b | Back-side lines disappear again as in Step 1 (both endpoints occluded → culled). Culling updates live while paused and orbiting. Segments with one occluded endpoint or mid-segment occlusion still draw until Step 4. |
 | 2c | Joint kinks are gone — consecutive curve segments meet with matching tangents. Chain ends terminate naturally at stipple points. `LINK_TANGENT_SCALE` visibly controls joint rounding; `LINK_N_SEGMENTS` changes tessellation fidelity but not shape (buffer, compute, and render stay in sync by construction). |
-| 3 | Lines have visible world-space width that foreshortens with viewing angle, with ~1px zoom-independent AA edges. At extreme zoom-out the line settles to a stable `~AA_PIXELS`-pixel minimum stroke (no sub-pixel flicker). Rotating through all camera orientations (including looking along ±x / ±y) produces no freeze, no "stretched sheets," no slivers. Capsule shape with rounded caps visible at chain ends. |
+| 3 | Lines read with the pixel width their 3D tube would project — shrinking with distance, collapsing toward the rounded cap as the segment turns parallel to the view — with ~1px zoom-independent AA edges. At extreme zoom-out the stroke settles to a stable `~AA_PIXELS`-pixel minimum width (no sub-pixel flicker). Rotating through all camera orientations produces no freeze, no garbage geometry, and no gaps at grazing-angle joints (near-parallel sub-segments collapse to overlapping discs). Capsule shape with rounded caps visible at chain ends. |
 | 4 | Lines on the far side of the shape are culled. Soft fade near silhouette edges. No lines visible through the surface. |
 | 5 | No gaps at segment joints. No doubled-alpha seams (opaque interior, `LINK_ALPHA = 1`). Rounded miters at bends; rounded caps at chain ends. Correct from multiple viewing angles. |
 | 6 | `npm run lint` clean. AGENTS.md updated. Full frame loop runs without errors. |
