@@ -1,15 +1,18 @@
 /**
  * Link render pipeline — draws the link curves connecting stipple
- * points to their best-aligned neighbors as chains of straight 1px
- * line segments following the surface.
+ * points to their best-aligned neighbors as chains of camera-facing
+ * quads following the subdivided, surface-projected curve.
  *
- * Each instance draws one `line-list` sub-segment between two adjacent
- * curve points of the subdivided, surface-projected curve written by
- * the link compute pass. The vertex shader culls links with invalid
- * curve slices and — as the interim coarse visibility cull from
- * Step 2b in the hatch-lines spec — links whose stipple endpoints are
- * both fully occluded (per-segment occlusion replaces this in
- * Step 4).
+ * Each instance draws one `triangle-list` quad (two triangles, six
+ * vertices) between two adjacent curve points of the subdivided,
+ * surface-projected curve written by the link compute pass. The quad
+ * is billboarded around the segment axis so the line has consistent
+ * world-space width that foreshortens with viewing angle, with a soft
+ * `fwidth`-based anti-aliased edge (decision 6 in the hatch-lines
+ * spec). The vertex shader culls links with invalid curve slices and
+ * — as the interim coarse visibility cull from Step 2b in the
+ * hatch-lines spec — links whose stipple endpoints are both fully
+ * occluded (per-segment occlusion replaces this in Step 4).
  *
  * The curve, links, and shading buffers are not ping-ponged, so a
  * single bind group covers them.
@@ -21,11 +24,13 @@ import { LINK_N_SEGMENTS, LINK_RENDER_SHADER } from "./shaders/index.js";
 
 /**
  * Size of the link render uniform buffer in bytes: `mat4x4f` (64) +
- * `vec3f` eye (12) + `f32` pad (4). The eye is written from Step 1 but
- * only consumed by the vertex shader once the renderer switches to
- * camera-facing quads.
+ * `vec3f` eye (12, 16-aligned) + `vec2f` canvas_size (8) + `f32` pad
+ * (4) = 96 (rounded to the struct's 16-byte alignment). The eye drives
+ * the camera-facing quad billboard computation; the canvas size drives
+ * the world-units-per-pixel estimate that sizes the quad padding so
+ * the AA band always has screen-pixel room.
  */
-const UNIFORM_BUFFER_BYTES = 80;
+const UNIFORM_BUFFER_BYTES = 96;
 
 /**
  * Manages the link render pipeline, uniform buffer, and bind group.
@@ -96,7 +101,7 @@ export class LinkRenderPipeline {
                 ],
             },
             primitive: {
-                topology: "line-list",
+                topology: "triangle-list",
             },
         });
 
@@ -121,13 +126,16 @@ export class LinkRenderPipeline {
     }
 
     /**
-     * Writes the view-projection matrix and eye position into the
-     * uniform buffer.
+     * Writes the view-projection matrix, eye position, and canvas
+     * backing-store size into the uniform buffer. The eye drives the
+     * camera-facing quad billboard computation; the canvas size drives
+     * the world-units-per-pixel estimate that sizes the quad padding
+     * so the AA band always has screen-pixel room.
      *
      * @param eye - Camera eye position [x, y, z].
      * @param target - Look-at target point [x, y, z].
      * @param canvas - The canvas whose backing-store size determines the
-     *   projection aspect ratio.
+     *   projection aspect ratio and the AA-padding scale.
      */
     private writeUniform(
         eye: readonly [number, number, number],
@@ -143,12 +151,14 @@ export class LinkRenderPipeline {
         f32[16] = eye[0];
         f32[17] = eye[1];
         f32[18] = eye[2];
+        f32[20] = canvas.width;
+        f32[21] = canvas.height;
         this.device.queue.writeBuffer(this.uniformBuffer, 0, buffer);
     }
 
     /**
-     * Draws all link curve segments as instanced lines into the given
-     * render pass.
+     * Draws all link curve segments as instanced camera-facing quads
+     * into the given render pass.
      *
      * Must be called *inside* an active `GPURenderPassEncoder`, before
      * the point render so points sit on top of the lines.
@@ -159,7 +169,7 @@ export class LinkRenderPipeline {
      * @param canvas - The canvas whose size determines the projection
      *   aspect.
      * @param pointCount - Number of stipple points; each contributes
-     *   `LINK_N_SEGMENTS` sub-segment instances.
+     *   `LINK_N_SEGMENTS` quad instances.
      */
     public render(
         pass: GPURenderPassEncoder,
@@ -171,6 +181,6 @@ export class LinkRenderPipeline {
         this.writeUniform(eye, target, canvas);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, this.bindGroup);
-        pass.draw(2, pointCount * LINK_N_SEGMENTS);
+        pass.draw(6, pointCount * LINK_N_SEGMENTS);
     }
 }
