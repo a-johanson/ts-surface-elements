@@ -34,7 +34,7 @@ struct ReprojectParams {
 @group(0) @binding(1) var<storage, read_write> points: array<Point>;
 @group(0) @binding(2) var<storage, read_write> normals_out: array<vec4f>;
 
-const REPROJECT_NEWTON_ITERS: i32 = 16;
+const REPROJECT_NEWTON_ITERS: i32 = 3;
 const REPROJECT_ALPHA: f32 = 0.5;
 
 @compute @workgroup_size(64)
