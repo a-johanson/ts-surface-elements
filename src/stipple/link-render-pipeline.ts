@@ -1,15 +1,17 @@
 /**
  * Link render pipeline — draws the link curves connecting stipple
- * points to their best-aligned neighbors as chains of camera-facing
- * quads following the subdivided, surface-projected curve.
+ * points to their best-aligned neighbors as chains of screen-space
+ * stroke quads following the subdivided, surface-projected curve.
  *
  * Each instance draws one `triangle-list` quad (two triangles, six
  * vertices) between two adjacent curve points of the subdivided,
  * surface-projected curve written by the link compute pass. The quad
- * is billboarded around the segment axis so the line has consistent
- * world-space width that foreshortens with viewing angle, with a soft
- * `fwidth`-based anti-aliased edge (decision 6 in the hatch-lines
- * spec). Occlusion (Step 4 in the hatch-lines spec) is resolved from
+ * is extruded in screen space around the projected segment and shaded
+ * with a 2D capsule distance field sized from the line's world-space
+ * half-width, so the line reads with the screen width its 3D tube
+ * would project (shrinking with depth) while consecutive sub-segments
+ * weld into a continuous stroke at every viewing angle, with a soft
+ * `fwidth`-based anti-aliased edge. Occlusion (Step 4 in the
  * the per-curve-point clearance the link compute's clearance stage
  * bakes into the curve buffer's `.w` fields — refreshed every frame,
  * including while time is paused, so culling and the geometric
@@ -26,10 +28,11 @@ import { LINK_N_SEGMENTS, LINK_RENDER_SHADER } from "./shaders/index.js";
 /**
  * Size of the link render uniform buffer in bytes: `mat4x4f` (64) +
  * `vec3f` eye (12, 16-aligned) + `vec2f` canvas_size (8) + `f32` pad
- * (4) = 96 (rounded to the struct's 16-byte alignment). The eye drives
- * the camera-facing quad billboard computation; the canvas size drives
- * the world-units-per-pixel estimate that sizes the quad padding so
- * the AA band always has screen-pixel room.
+ * (4) = 96 (rounded to the struct's 16-byte alignment). The eye
+ * provides the view direction for the world-units-per-pixel estimate
+ * that converts the stroke's world-space half-width to pixels; the
+ * canvas size drives that estimate and the screen-space projection of
+ * the stroke geometry.
  */
 const UNIFORM_BUFFER_BYTES = 96;
 
@@ -122,10 +125,11 @@ export class LinkRenderPipeline {
 
     /**
      * Writes the view-projection matrix, eye position, and canvas
-     * backing-store size into the uniform buffer. The eye drives the
-     * camera-facing quad billboard computation; the canvas size drives
-     * the world-units-per-pixel estimate that sizes the quad padding
-     * so the AA band always has screen-pixel room.
+     * backing-store size into the uniform buffer. The eye provides the
+     * view direction for the world-units-per-pixel estimate that
+     * converts the stroke's world-space half-width to pixels; the
+     * canvas size drives that estimate and the screen-space projection
+     * of the stroke geometry.
      *
      * @param eye - Camera eye position [x, y, z].
      * @param target - Look-at target point [x, y, z].
@@ -152,8 +156,8 @@ export class LinkRenderPipeline {
     }
 
     /**
-     * Draws all link curve segments as instanced camera-facing quads
-     * into the given render pass.
+     * Draws all link curve segments as instanced screen-space stroke
+     * quads into the given render pass.
      *
      * Must be called *inside* an active `GPURenderPassEncoder`, before
      * the point render so points sit on top of the lines.

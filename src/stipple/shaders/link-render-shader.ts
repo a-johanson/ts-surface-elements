@@ -1,6 +1,6 @@
 /**
  * Link render shader — draws each surviving link as a chain of
- * `N_SEGMENTS` camera-facing quads following the subdivided,
+ * `N_SEGMENTS` screen-space stroke quads following the subdivided,
  * surface-projected curve written by the link compute pass
  * (`triangle-list` topology, one quad per sub-segment instance).
  *
@@ -8,42 +8,55 @@
  * `s = inst % N_SEGMENTS`; the endpoints are the adjacent curve points
  * `curves[i * STRIDE + s]` and `curves[i * STRIDE + s + 1]`.
  *
- * Each quad is billboarded around the segment axis (decision 6 in the
- * hatch-lines spec): the across-axis side vector is
- * `side = normalize(cross(seg_dir, view_dir))`. The line itself keeps
- * a world-space half-width (`LINK_HALF_WIDTH`) so it foreshortens with
- * viewing angle and depth — the same philosophy as the point
- * renderer's `POINT_RADIUS_WORLD`. The quad, however, is oversized in
- * world space to always leave enough screen-pixel room for the
- * anti-alias band, even at extreme zoom-out (the quad half-extent is
- * `LINK_HALF_WIDTH + AA_PIXELS * world_per_pixel`, so the AA fade
- * never gets clipped and the line never goes sub-pixel).
+ * The stroke is built entirely in screen space. The vertex stage
+ * perspective-projects the two endpoint curve points to pixel
+ * coordinates and extrudes the quad as the bounding box of the 2D
+ * capsule around the projected segment — the larger endpoint stroke
+ * radius plus the AA margin on every side. The fragment stage evaluates
+ * a 2D segment distance field (clamped closest point on the projected
+ * segment) against a per-point stroke radius: the world-space
+ * half-width (`LINK_HALF_WIDTH`) converted to pixels at each endpoint's
+ * own depth and interpolated linearly along the projected segment —
+ * the projected cross-section radius of the 3D tube is exactly
+ * proportional to the inverse projective depth — and clamped to a
+ * constant within each rounded cap. The stroke therefore reads with
+ * the same pixel width its 3D tube would project — shrinking with
+ * distance, and collapsing toward its rounded cap as the segment turns
+ * parallel to the view — the same philosophy as the point renderer's
+ * world-space `POINT_RADIUS_WORLD`.
  *
- * The line shape is a 2D segment distance field evaluated in the
- * fragment shader: the signed distance to the segment centerline
- * (clamped to the endpoints) minus `LINK_HALF_WIDTH` — a capsule SDF
- * whose iso-zero contour is a rectangle with semicircular rounded
- * caps. Anti-aliased via `fwidth` on the signed distance — same
- * pattern as the point shader's disc SDF, giving a ~1px soft edge
- * independent of zoom and world-space location.
+ * Screen-space evaluation is what keeps the chain continuous at
+ * grazing angles. Each capsule's rounded cap extends the stroke radius
+ * past the shared endpoint in *every* screen direction, so consecutive
+ * sub-segments always overlap at their joints and — with
+ * `LINK_ALPHA = 1` (opaque interior, only the ~1px AA edge blends) —
+ * the union renders as a rounded, welded miter with no hairline gaps,
+ * at any viewing angle. Shared curve points also share a projected
+ * depth, so neighboring capsules agree on the joint's stroke radius
+ * from both sides. Chain ends terminate with a rounded cap too —
+ * no special handling. A world-space capsule cannot do this: its
+ * along-axis reach past the shared endpoint foreshortens by the sine
+ * of the angle to the view, which starves exactly those joint overlaps
+ * when a segment is viewed near-parallel (and its view-compressed
+ * distance field also blows the `fwidth`-derived AA band up by the
+ * same factor, fading the caps out). Here the near-parallel case
+ * degenerates gracefully instead: the projected segment collapses, the
+ * capsule becomes a disc, and consecutive discs overlap into a
+ * continuous blob along the collapsed chain.
  *
- * The quad extends along the segment axis by `LINK_HALF_WIDTH` plus
- * the AA corridor beyond each endpoint, so the rounded caps fit
- * entirely inside the quad (the previous axis-clipped quad chopped
- * them off). Because adjacent sub-segments share their endpoints
- * exactly (the Hermite subdivision writes identical endpoints), the
- * rounded caps of neighboring segments overlap at each joint and —
- * with `LINK_ALPHA = 1` (opaque interior, only the ~1px AA edge
- * blends) — the union renders as a rounded miter / bent-sausage join
- * with no hairline gaps. This covers Step 5 (mitering) for free: no
- * miter geometry, no SDF union of two segments, no extra varyings.
- * Chain ends terminate with a rounded cap too — no special handling.
+ * Each quad carries a constant clip-space `w` and depth (the segment
+ * center's), so interpolation across the quad is exactly linear in
+ * screen space and the interpolated stroke position tracks the
+ * fragment's true screen position. The anti-aliased edge is a
+ * `fwidth`-based ~1px band — independent of viewing angle and zoom,
+ * the same pattern as the point shader's disc SDF.
  *
- * Occlusion (Step 4 in the hatch-lines spec) is resolved per curve
- * point and geometrically: the link compute's clearance stage stores,
- * in each curve point's `.w`, the occlusion clearance of a
- * `rayClearance` trace toward the eye (> 0 visible, < 0 occluded, 0.0
- * dropped or absent link — its whole slice is zeroed).
+ * Occlusion is resolved per curve point and geometrically: the link
+ * compute's clearance stage stores, in each curve point's `.w`, the
+ * occlusion clearance of a `rayClearance` trace toward the eye
+ * (> 0 visible, < 0 occluded, 0.0 dropped or absent link — its whole
+ * slice is zeroed). A sub-segment renders when either of its endpoint
+ * curve points is visible; fully occluded ones are pushed offscreen.
  */
 import { LINK_N_SEGMENTS } from "./link-shader.js";
 
@@ -58,8 +71,7 @@ struct LinkRenderUniform {
 /**
  * Hermite sub-segment count per link — interpolated from the TS
  * constant LINK_N_SEGMENTS (single source of truth, defined in
- * link-shader.ts; decision 8 in the hatch-lines spec). Resolves the
- * instance → point/sub-segment mapping.
+ * link-shader.ts). Resolves the instance → point/sub-segment mapping.
  */
 const N_SEGMENTS: u32 = ${LINK_N_SEGMENTS}u;
 
@@ -68,9 +80,9 @@ const STRIDE: u32 = N_SEGMENTS + 1u;
 
 /**
  * World-space half-width of the line itself — sized relative to
- * POINT_RADIUS_WORLD (lines read thinner than the dots they
- * connect). Tunable. The rendered quad is larger than this to fit the
- * AA band (see AA_PIXELS).
+ * POINT_RADIUS_WORLD (lines read thinner than the dots they connect).
+ * Converted to a pixel stroke radius at each endpoint's own depth.
+ * Tunable.
  */
 const LINK_HALF_WIDTH: f32 = 0.006;
 
@@ -85,50 +97,53 @@ const LINK_ALPHA: f32 = 1.0;
 const AA_WIDTH: f32 = 0.5;
 
 /**
- * Quad padding in pixels added on each side of the line to guarantee
- * the AA fade always has screen-pixel room, even at extreme zoom-out.
- * Covers the AA band plus a margin. At zoom-out where the line itself
- * goes sub-pixel, the quad settles to roughly this many pixels and the
- * line becomes its AA band — a stable minimum stroke width.
+ * Quad padding in pixels added on every side of the stroke to
+ * guarantee the AA fade always has screen-pixel room, even at extreme
+ * zoom-out where the stroke radius itself collapses sub-pixel. Covers
+ * the AA band plus a margin; the stroke then settles to roughly this
+ * many pixels and becomes its AA band — a stable minimum stroke
+ * width.
  */
 const AA_PIXELS: f32 = 2.0;
 
 /**
- * Segment length below which the endpoints are treated as coincident
- * and the segment is rendered as a disc (half_len = 0). The capsule
- * SDF collapses to a disc naturally — the fragment's clamp returns 0,
- * so closest = seg_center and dist = length(world_pos - center) — but
- * seg_dir cannot be computed from the zero vector, so a fallback
- * direction perpendicular to view_dir is picked for the billboard
- * basis. Unsquared comparison (length already took the sqrt).
+ * Projected 2D segment length squared below which the endpoints are
+ * treated as coincident on screen and the stroke renders as a disc.
+ * Covers both coincident curve points and view-parallel segments whose
+ * projection collapses to a point; the distance field degenerates to a
+ * plain point distance instead of dividing by a zero-length axis.
  */
-const DEGENERATE_EPS: f32 = 1e-4;
+const DEGENERATE_PX2: f32 = 1e-6;
 
 /**
- * Length squared of cross(seg_dir, view_dir) below which the segment
- * axis is treated as parallel to the view direction (the segment is
- * foreshortened to a point on screen). normalize(cross) would produce
- * NaN here, which the rasterizer turns into huge garbage triangles
- * spanning the framebuffer — the grazing-angle "stretched sheets" and
- * GPU freeze. Guarded with an explicit if/else fallback instead.
+ * Eye-to-center distance below which the view direction is numerically
+ * undefined — this close, the difference of two world-position f32s at
+ * scene scale is noise-dominated. The camera sits inside the stroke at
+ * that range; the sub-segment is dropped rather than computing a
+ * garbage basis.
  */
-const PARALLEL_EPS2: f32 = 1e-7;
+const EYE_EPS: f32 = 1e-4;
 
 @group(0) @binding(0) var<uniform> u: LinkRenderUniform;
 @group(0) @binding(1) var<storage, read> curves: array<vec4f>;
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4f,
-    @location(0) world_pos: vec3f,
-    @location(1) @interpolate(flat) seg_center: vec3f,
-    @location(2) @interpolate(flat) seg_dir_v: vec3f,
-    @location(3) @interpolate(flat) half_len_v: f32,
-    @location(4) @interpolate(flat) clearance: f32,
+    // Fragment position in stroke space (screen pixels), interpolated.
+    @location(0) frag_px: vec2f,
+    // Per-instance stroke geometry: projected segment endpoints and
+    // per-endpoint stroke radii, in stroke pixels.
+    @location(1) @interpolate(flat) p0_px: vec2f,
+    @location(2) @interpolate(flat) p1_px: vec2f,
+    @location(3) @interpolate(flat) r0_px: f32,
+    @location(4) @interpolate(flat) r1_px: f32,
 };
 
-// Two-triangle quad covering the segment. corner.x is the side
-// offset (-1..+1 -> +/-quad_half across the segment axis);
-// corner.y is the along-axis parameter (-1 -> e0, +1 -> e1).
+// Two-triangle quad covering the projected segment. corner.x is the
+// across-axis offset (-1..+1 -> +/-quad_half perpendicular to the
+// projected axis); corner.y is the along-axis parameter (-1 -> e0,
+// +1 -> e1), extended past the endpoints by the quad padding so the
+// rounded caps fit inside the quad.
 const QUAD_CORNER: array<vec2f, 6> = array<vec2f, 6>(
     vec2f(-1.0, -1.0),
     vec2f( 1.0, -1.0),
@@ -141,12 +156,39 @@ const QUAD_CORNER: array<vec2f, 6> = array<vec2f, 6>(
 fn offscreen() -> VertexOut {
     var out: VertexOut;
     out.clip_pos = vec4f(2.0, 2.0, 2.0, 1.0);
-    out.world_pos = vec3f(0.0);
-    out.seg_center = vec3f(0.0);
-    out.seg_dir_v = vec3f(0.0);
-    out.half_len_v = 0.0;
-    out.clearance = -1.0;
+    out.frag_px = vec2f(0.0);
+    out.p0_px = vec2f(0.0);
+    out.p1_px = vec2f(0.0);
+    out.r0_px = 0.0;
+    out.r1_px = 0.0;
     return out;
+}
+
+// NDC (y-up) to stroke space, and back. Stroke space is screen-scaled
+// (one unit per canvas pixel), so distances evaluated in it are true
+// screen-pixel distances; the orientation difference relative to the
+// framebuffer is an isometry and does not affect them.
+fn pxFromNdc(ndc: vec2f) -> vec2f {
+    return (ndc * 0.5 + vec2f(0.5)) * u.canvas_size;
+}
+
+fn ndcFromPx(px: vec2f) -> vec2f {
+    return (px / u.canvas_size) * 2.0 - vec2f(1.0);
+}
+
+/**
+ * Unsigned distance from a stroke-space point to the projected segment
+ * [a, b], in stroke pixels, plus the clamped closest-point parameter t
+ * (0 at a, 1 at b).
+ */
+fn strokeDistance(p: vec2f, a: vec2f, b: vec2f) -> vec2f {
+    let ab = b - a;
+    let len2 = dot(ab, ab);
+    if (len2 < DEGENERATE_PX2) {
+        return vec2f(length(p - a), 0.0);
+    }
+    let t = clamp(dot(p - a, ab) / len2, 0.0, 1.0);
+    return vec2f(length(p - a - ab * t), t);
 }
 
 @vertex
@@ -159,107 +201,119 @@ fn link_vs(
     let e0 = curves[i * STRIDE + s];
     let e1 = curves[i * STRIDE + s + 1u];
 
-    let c0 = e0.w;
-    let c1 = e1.w;
-    let c_hi = max(c0, c1);
-    if (c_hi <= 0.0) {
+    // Coarse occlusion cull: the sub-segment renders when either
+    // endpoint curve point has positive center-ray clearance toward the
+    // eye (non-positive = occluded, 0.0 = dropped or absent link).
+    if (max(e0.w, e1.w) <= 0.0) {
         return offscreen();
     }
 
     let p0 = e0.xyz;
     let p1 = e1.xyz;
-    let seg_vec = p1 - p0;
-    let seg_len = length(seg_vec);
     let center = 0.5 * (p0 + p1);
-    let view_dir = normalize(u.eye - center);
 
-    // Camera-facing quad (decision 6): side = cross(seg_dir, view_dir).
-    // For a zero-length segment the capsule SDF collapses to a disc
-    // (half_len = 0 → fragment clamp returns 0 → closest = center),
-    // but seg_dir cannot be computed from the zero vector. Pick any
-    // unit vector perpendicular to view_dir as the fallback basis —
-    // the disc faces the camera regardless of which one is chosen.
-    var seg_dir: vec3f;
-    var half_len: f32;
-    if (seg_len < DEGENERATE_EPS) {
-        let alt = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0),
-                         abs(view_dir.y) > 0.9);
-        seg_dir = normalize(cross(view_dir, alt));
-        half_len = 0.0;
-    } else {
-        seg_dir = seg_vec / seg_len;
-        half_len = 0.5 * seg_len;
-    }
-
-    // Clip-space center, used both for the world-units-per-pixel
-    // estimate (AA padding) and for the behind-camera guard below.
+    // Perspective-project the endpoints and the center; everything
+    // downstream is built from the projected geometry.
+    let clip0 = u.view_proj * vec4f(p0, 1.0);
+    let clip1 = u.view_proj * vec4f(p1, 1.0);
     let clip_c = u.view_proj * vec4f(center, 1.0);
 
-    // Behind-camera guard: at grazing angles some segment centers can
-    // land behind the camera plane (clip.w <= 0). Quad corners extended
-    // along the axis then straddle w = 0 and rasterize as slivers
-    // stretching across the screen. Push offscreen instead.
-    if (clip_c.w <= 0.0) {
+    // Behind-camera guard: an endpoint with clip.w <= 0 divides by a
+    // negative w and projects to a mirrored, garbage screen position.
+    // Drop the sub-segment. This also covers the center, whose clip.w
+    // is the affine midpoint of the endpoints'.
+    if (clip0.w <= 0.0 || clip1.w <= 0.0) {
         return offscreen();
     }
 
-    // side = normalize(cross(seg_dir, view_dir)), but guarded: when the
-    // segment axis is (near) parallel to the view direction, cross → 0
-    // and normalize(0) → NaN, which the rasterizer turns into huge
-    // garbage triangles and GPU freezes (the grazing-angle pathology).
-    // Use an explicit if/else so normalize is never called on the zero
-    // vector; in the parallel case pick any vector not parallel to
-    // seg_dir and cross with it for a valid perpendicular — the
-    // foreshortened segment renders as its rounded cap (a small disc).
-    let cross_v = cross(seg_dir, view_dir);
-    var side: vec3f;
-    if (dot(cross_v, cross_v) > PARALLEL_EPS2) {
-        side = normalize(cross_v);
-    } else {
-        let alt = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(seg_dir.y) > 0.9);
-        side = normalize(cross(seg_dir, alt));
+    // Stroke-space endpoints.
+    let px0 = pxFromNdc(clip0.xy / clip0.w);
+    let px1 = pxFromNdc(clip1.xy / clip1.w);
+
+    // Stroke radius per endpoint, in pixels. The projected radius of
+    // the 3D tube's cross-section is exactly proportional to the
+    // inverse projective depth: the pixel displacement per world unit
+    // along a view-perpendicular direction is a depth-independent
+    // pixel scale divided by clip.w. The scale is measured along a
+    // view-perpendicular direction because the projected segment
+    // itself cannot provide it — its on-screen length collapses to
+    // zero exactly in the near-parallel case this shader must survive,
+    // while a view-perpendicular projection is always non-degenerate.
+    // perp is view-perpendicular, hence lies in the camera's xy plane:
+    // its clip-space w is 0 for the standard look-at + perspective
+    // pair, so the conversion is exact rather than first-order.
+    let to_eye = u.eye - center;
+    let dist_eye = length(to_eye);
+    if (dist_eye < EYE_EPS) {
+        // The eye sits on the segment center: the view direction (and
+        // with it the perpendicular basis) is undefined. The stroke
+        // encloses the camera; drop the sub-segment.
+        return offscreen();
     }
+    let view_dir = to_eye / dist_eye;
+    let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0),
+                    abs(view_dir.y) > 0.9);
+    let perp = normalize(cross(view_dir, up));
+    let perp_clip = u.view_proj * vec4f(perp, 0.0);
+    let px_scale = length(perp_clip.xy * (0.5 * u.canvas_size));
+    var r0_px = LINK_HALF_WIDTH * px_scale / clip0.w;
+    var r1_px = LINK_HALF_WIDTH * px_scale / clip1.w;
 
-    // Size the quad so the AA band always has screen-pixel room: add
-    // AA_PIXELS worth of world-space padding on each side. Measure the
-    // world-units-per-pixel along the side direction directly by
-    // transforming side (a direction, w=0) through the view-projection
-    // and linearizing at the center's clip.w.
-    // Because side ⊥ view_dir by construction (both the normal and the
-    // parallel-segment fallback cases), side lives in the camera's xy
-    // plane, so side_clip.xy is always non-zero → wpp is always finite.
-    let side_clip = u.view_proj * vec4f(side, 0.0);
-    let px_delta = (side_clip.xy / clip_c.w) * (0.5 * u.canvas_size);
-    let wpp = 1.0 / length(px_delta);
-    let quad_half = LINK_HALF_WIDTH + AA_PIXELS * wpp;
+    // 2D basis of the projected segment. A collapsed projection
+    // (coincident endpoints or a view-parallel segment) falls back to
+    // a fixed axis, and both radii flatten to the larger one: seen
+    // end-on, the tube's silhouette is dominated by its nearest
+    // cross-section, and the distance field degenerates to that disc
+    // regardless of which basis is chosen.
+    let axis = px1 - px0;
+    var axis_dir: vec2f;
+    if (dot(axis, axis) < DEGENERATE_PX2) {
+        axis_dir = vec2f(1.0, 0.0);
+        let r_max = max(r0_px, r1_px);
+        r0_px = r_max;
+        r1_px = r_max;
+    } else {
+        axis_dir = normalize(axis);
+    }
+    let perp_dir = vec2f(-axis_dir.y, axis_dir.x);
 
-    let c = QUAD_CORNER[vid];
-    let t = (c.y + 1.0) * 0.5;          // -1 -> 0, +1 -> 1
-    // Extend the quad along the segment axis by quad_half beyond each
-    // endpoint so the capsule's rounded caps fit inside the quad
-    // (otherwise the caps are clipped and adjacent segments show
-    // hairline gaps at joints). With LINK_ALPHA = 1 the overlap of
-    // neighboring segments' caps at a shared endpoint is invisible
-    // and renders as a rounded miter — see the header comment.
-    let p = mix(p0, p1, t) + c.y * quad_half * seg_dir;
-    let world = p + c.x * side * quad_half;
+    // Quad half-extent in pixels: the larger endpoint radius plus the
+    // AA margin on every side, so the tapered capsule — rounded caps
+    // included — and its AA fade always fit inside the quad.
+    let quad_half = max(r0_px, r1_px) + AA_PIXELS;
+
+    // Constant clip w and depth (the segment center's) across the
+    // quad: interpolation is then exactly linear in screen space, the
+    // extruded quad is exactly the parallelogram built below, and the
+    // interpolated stroke position matches each fragment's true screen
+    // position.
+    let w_c = clip_c.w;
+    let z_c = clip_c.z;
+
+    let corner = QUAD_CORNER[vid];
+    let t = (corner.y + 1.0) * 0.5;          // -1 -> 0, +1 -> 1
+    let frag_px = mix(px0, px1, t)
+                + corner.y * quad_half * axis_dir
+                + corner.x * quad_half * perp_dir;
 
     var out: VertexOut;
-    out.clip_pos = u.view_proj * vec4f(world, 1.0);
-    out.world_pos = world;
-    out.seg_center = center;
-    out.seg_dir_v = seg_dir;
-    out.half_len_v = half_len;
-    out.clearance = 1.0;
+    out.clip_pos = vec4f(ndcFromPx(frag_px) * w_c, z_c, w_c);
+    out.frag_px = frag_px;
+    out.p0_px = px0;
+    out.p1_px = px1;
+    out.r0_px = r0_px;
+    out.r1_px = r1_px;
     return out;
 }
 
 @fragment
 fn link_fs(in: VertexOut) -> @location(0) vec4f {
-    let d = in.world_pos - in.seg_center;
-    let t = clamp(dot(d, in.seg_dir_v), -in.half_len_v, in.half_len_v);
-    let closest = in.seg_center + t * in.seg_dir_v;
-    let sdist = length(in.world_pos - closest) - LINK_HALF_WIDTH;
+    let dt = strokeDistance(in.frag_px, in.p0_px, in.p1_px);
+    // The stroke radius tapers linearly with depth along the segment
+    // body; the clamped closest-point parameter holds it constant
+    // within each rounded cap, pinning each cap disc to its endpoint's
+    // radius.
+    let sdist = dt.x - mix(in.r0_px, in.r1_px, dt.y);
 
     let half_band = fwidth(sdist) * AA_WIDTH;
     if (sdist > half_band) {
