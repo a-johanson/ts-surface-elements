@@ -56,7 +56,10 @@
  * occlusion clearance of a `rayClearance` trace toward the eye
  * (> 0 visible, < 0 occluded, 0.0 dropped or absent link — its whole
  * slice is zeroed). A sub-segment renders when either of its endpoint
- * curve points is visible; fully occluded ones are pushed offscreen.
+ * curve points is visible: fully occluded ones are pushed offscreen,
+ * and partially occluded ones are trimmed at the point where the
+ * linearly interpolated endpoint clearances reach zero — the estimated
+ * crossing into the occluder's silhouette along the curve.
  */
 import { LINK_N_SEGMENTS } from "./link-shader.js";
 
@@ -184,7 +187,7 @@ fn ndcFromPx(px: vec2f) -> vec2f {
 fn strokeDistance(p: vec2f, a: vec2f, b: vec2f) -> vec2f {
     let ab = b - a;
     let len2 = dot(ab, ab);
-    if (len2 < DEGENERATE_PX2) {
+    if len2 < DEGENERATE_PX2 {
         return vec2f(length(p - a), 0.0);
     }
     let t = clamp(dot(p - a, ab) / len2, 0.0, 1.0);
@@ -201,15 +204,31 @@ fn link_vs(
     let e0 = curves[i * STRIDE + s];
     let e1 = curves[i * STRIDE + s + 1u];
 
-    // Coarse occlusion cull: the sub-segment renders when either
-    // endpoint curve point has positive center-ray clearance toward the
-    // eye (non-positive = occluded, 0.0 = dropped or absent link).
-    if (max(e0.w, e1.w) <= 0.0) {
+    // Discard segment if both clearance values are non-positive
+    let c0 = e0.w;
+    let c1 = e1.w;
+    if c0 <= 0.0 && c1 <= 0.0 {
         return offscreen();
     }
 
-    let p0 = e0.xyz;
-    let p1 = e1.xyz;
+    // Mixed clearance (one endpoint visible, one occluded): trim the
+    // occluded side at the point where the linearly interpolated
+    // clearance reaches zero — the estimated crossing into the
+    // occluder's silhouette along the curve. The cut is made in world
+    // space before projection, so the shortened segment flows through
+    // the unchanged projection, radius, and distance-field stages.
+    var p0 = e0.xyz;
+    var p1 = e1.xyz;
+    let visible0 = c0 > 0.0;
+    let visible1 = c1 > 0.0;
+    if visible0 != visible1 {
+        let t_cut = c0 / (c0 - c1);
+        if visible0 {
+            p1 = mix(p0, p1, t_cut);
+        } else {
+            p0 = mix(p0, p1, t_cut);
+        }
+    }
     let center = 0.5 * (p0 + p1);
 
     // Perspective-project the endpoints and the center; everything
@@ -222,7 +241,7 @@ fn link_vs(
     // negative w and projects to a mirrored, garbage screen position.
     // Drop the sub-segment. This also covers the center, whose clip.w
     // is the affine midpoint of the endpoints'.
-    if (clip0.w <= 0.0 || clip1.w <= 0.0) {
+    if clip0.w <= 0.0 || clip1.w <= 0.0 {
         return offscreen();
     }
 
@@ -244,7 +263,7 @@ fn link_vs(
     // pair, so the conversion is exact rather than first-order.
     let to_eye = u.eye - center;
     let dist_eye = length(to_eye);
-    if (dist_eye < EYE_EPS) {
+    if dist_eye < EYE_EPS {
         // The eye sits on the segment center: the view direction (and
         // with it the perpendicular basis) is undefined. The stroke
         // encloses the camera; drop the sub-segment.
@@ -267,7 +286,7 @@ fn link_vs(
     // regardless of which basis is chosen.
     let axis = px1 - px0;
     var axis_dir: vec2f;
-    if (dot(axis, axis) < DEGENERATE_PX2) {
+    if dot(axis, axis) < DEGENERATE_PX2 {
         axis_dir = vec2f(1.0, 0.0);
         let r_max = max(r0_px, r1_px);
         r0_px = r_max;
@@ -316,7 +335,7 @@ fn link_fs(in: VertexOut) -> @location(0) vec4f {
     let sdist = dt.x - mix(in.r0_px, in.r1_px, dt.y);
 
     let half_band = fwidth(sdist) * AA_WIDTH;
-    if (sdist > half_band) {
+    if sdist > half_band {
         discard;
     }
     let alpha = smoothstep(half_band, -half_band, sdist) * LINK_ALPHA;

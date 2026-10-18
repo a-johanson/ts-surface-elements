@@ -305,7 +305,9 @@ chain.
 **Guards.** The vertex shader pushes a sub-segment offscreen when:
 
 - **Occluded** (Step 4) — `max(e0.w, e1.w) <= 0.0`: neither endpoint
-  curve point has positive clearance toward the eye.
+  curve point has positive clearance toward the eye. A sub-segment with
+  exactly one visible endpoint is not culled — it is trimmed at the
+  interpolated clearance zero-crossing instead (decision 7).
 - **Behind the camera** — `clip0.w <= 0 || clip1.w <= 0`: an endpoint
   with non-positive clip `w` divides by a negative `w` and projects to
   a mirrored, garbage screen position. This also covers the segment
@@ -346,17 +348,27 @@ capsule stroke quads described here.
 
 ### 7. Occlusion: per-segment ray clearance (Step 4)
 
-Occlusion is handled **per sub-segment** using the existing
-`rayClearance` infrastructure. The link compute shader traces from each
-curve point (biased along the local normal) toward the eye and records the
-minimum clearance. The render shader culls or fades segments whose
-clearance is negative (occluded by the surface between the segment and the
-camera).
+Occlusion is resolved **per curve point** using the existing
+`rayClearance` infrastructure. A fourth link-shader stage
+(`link_clearance_cs`), dispatched as its own compute pass **every
+frame** — including while time is paused, since the traces are
+view-dependent — evaluates the edge-survival predicate and, for
+surviving links, traces from each curve point toward the eye (origin
+biased along the surface normal, back-facing points short-circuited to
+an explicitly occluded value) and records the minimum clearance in the
+curve point's `.w`. The render shader resolves occlusion geometrically:
+fully occluded sub-segments (both endpoint clearances non-positive) are
+culled, and partially occluded ones are trimmed at the point where the
+linearly interpolated endpoint clearances reach zero — the estimated
+crossing into the occluder's silhouette along the curve.
 
 This reuses the same `rayClearance` infrastructure the shading pass uses
 for its per-point visibility trace (one center ray per point since
-Step 1c), applied to curve points. The cost is one `rayClearance` trace
-per curve point per frame — for `N_SEGMENTS + 1 = 5` points and 6K
+Step 1c), applied to curve points: same biased origin, same back-face
+guard, and the endpoint curve points — being the stipple points — reuse
+the shading pass's stored normals, so the endpoint traces match the
+stipple dots' apart from the threshold. The cost is one `rayClearance`
+trace per curve point per frame — for `N_SEGMENTS + 1 = 5` points and 6K
 stipple points, that is ~30K traces, about 5× the shading pass's
 per-point visibility traces.
 
@@ -669,7 +681,7 @@ With `N_SEGMENTS = 8` and `POINT_COUNT` between `6 * 1024` and
 | `src/stipple/link-pipeline.ts` | Owns the link compute pass: shader module, compute pipelines, params uniform, ping-pong read bind groups (A/B) for the scan and the dedup+subdiv stage, the render-facing output buffer (`linksBuffer` in Step 1, `linkCurves` from Step 2), and the internal working buffers (`linksBuffer` from Step 2, `ownersBuffer`). |
 | `src/stipple/shaders/link-shader.ts` | WGSL compute shader. Includes `SDF_COMMON`, duplicates `GridParams` (same as relax/shading — WGSL has no cross-module struct import). Exports `LINK_SHADER` (one module, one entry point per stage) and `LINK_N_SEGMENTS` (the TS-owned sub-segment count, interpolated into the WGSL — decision 8's TS-owned rule). Constants needed only in WGSL are defined directly in the shader source (see decision 8). |
 | `src/stipple/link-render-pipeline.ts` | Owns the link render pipeline: shader module, render pipeline (`triangle-list` topology, instanced 6-vertex quads), the 96 B uniform buffer (`mat4x4f` view-projection + `vec3f` eye + `vec2f` canvas_size + pad), and a single bind group (uniform + curve buffer — nothing ping-ponged). |
-| `src/stipple/shaders/link-render-shader.ts` | WGSL vertex/fragment shader. Step 1: `line-list` topology, reads point buffer + links buffer. Step 2: reads `linkCurves` buffer. Step 3: screen-space capsule stroke quads (2D pixel-coordinate geometry, projected 2D capsule SDF fragment, `fwidth` AA, degeneracy guards — see decision 6). Step 4: occlusion culling. |
+| `src/stipple/shaders/link-render-shader.ts` | WGSL vertex/fragment shader. Step 1: `line-list` topology, reads point buffer + links buffer. Step 2: reads `linkCurves` buffer. Step 3: screen-space capsule stroke quads (2D pixel-coordinate geometry, projected 2D capsule SDF fragment, `fwidth` AA, degeneracy guards — see decision 6). Step 4: occlusion culling and geometric trimming of partially occluded sub-segments (decision 7). |
 
 All new shaders are re-exported through `src/stipple/shaders/index.ts`.
 
@@ -1269,45 +1281,103 @@ still follow the surface curvature (from Step 2).
 
 ### Step 4 — Per-segment occlusion
 
-**Goal:** cull or fade line segments that are occluded by the surface
-between the segment and the camera, so lines on the back of the shape
-are not visible through it.
+**Status:** completed.
+
+**Goal:** resolve occlusion per curve point with the existing
+`rayClearance` infrastructure, and make the link render consume the
+clearance — culling fully occluded sub-segments and geometrically
+trimming partially occluded ones — so lines on the back of the shape
+are not visible through the surface.
 
 **Changes:**
-- `link-shader.ts`: after computing each curve point `p_k`, compute the
-  local normal `n_k = normalize(sdfGradient(p_k, time))`, bias by
-  `SHADOW_BIAS`, trace `rayClearance(p_k + n_k * SHADOW_BIAS, eye_dir,
-  dist_eye, threshold_k, time)` toward the eye, and store the clearance
-  in the `.w` component of each curve point (replacing the binary
-  validity flag). The per-curve-point threshold `threshold_k` is the
-  local curve spacing — the longest adjacent sub-segment length, floored
-  at `PROBE_STEP` — so the trace's origin ignore-band covers the curve's
-  own surface neighborhood; the shading pass passes the splat-radius
-  `CLEARANCE_THRESHOLD` for the stipple points instead.
-  Invalid links (no neighbor found) still get `.w = 0.0` — a sentinel
-  that is both "invalid" and "fully occluded", which the render shader
-  treats the same way (push offscreen). Valid but occluded segments get
-  `.w < 0.0`; visible segments get `.w > 0.0`.
-  - **Param change:** the link params uniform grows to include `eye:
-    vec3f` (needed for the clearance trace). Layout: `eye: vec3f, time:
-    f32, point_count: u32, distance_weight: f32, link_radius: f32,
-    _pad: u32` (32 B). `dispatch` gains an `eye` parameter.
-  - **Cost:** `N_SEGMENTS + 1` `rayClearance` traces per point per frame.
-    For `N_SEGMENTS = 4`, 6K points: ~30K traces — about 5× the shading
-    pass's per-point visibility traces (one per point since Step 1c).
-    Acceptable.
+- `link-shader.ts`: adds a fourth entry point `link_clearance_cs` (one
+  invocation per point), beside the shared `linkSurvives` predicate and
+  a `surfaceClearance` helper. The stage evaluates the same
+  edge-survival predicate as the dedup+subdiv stage (from the finalized
+  `links` + `owners` state) and, for surviving links, traces one
+  `rayClearance` per curve point toward the eye and writes the
+  clearance into the curve point's `.w` component (replacing the
+  validity placeholder the subdiv stage wrote — `1.0` for surviving
+  links). The trace is the shading pass's center-ray pattern: origin
+  biased along the surface normal (`rayClearance(p + n * SHADOW_BIAS,
+  eye_dir, dist_eye, threshold_k, time)`), back-facing points
+  short-circuited to an explicitly occluded value (`-1.0`).
+  - **Normals.** The two endpoint curve points are the stipple points
+    themselves, so they reuse the shading pass's stored normals from
+    the shared normals buffer — their traces then match the stipple
+    dots' exactly apart from the threshold (the sign agrees, the
+    magnitude does not, and consumers test sign only). Interior samples
+    get a fresh `normalize(sdfGradient(p, time))`.
+  - **Threshold.** `threshold_k` is the local curve spacing — the
+    longest adjacent sub-segment length (single neighbor at the chain
+    ends), floored at `PROBE_STEP` — so the trace's origin ignore-band
+    covers the curve's own surface neighborhood. The floor also keeps an unobstructed trace at
+    degenerate spacing from returning `0.0`, which is the
+    dropped/absent-link sentinel the renderer culls on.
+  - **Sentinels.** Dropped or absent links reset their slice's `.w` to
+    `0.0` — a value that is both "invalid" and "fully occluded", which
+    renders nothing. Valid curve points get `.w > 0.0` when visible and
+    `.w < 0.0` when occluded.
+  - **Dispatch timing.** The stage is recorded by
+    `dispatchClearance(encoder, eye, time)` as its own single-dispatch
+    compute pass and runs **every frame, including while time is
+    paused** — occlusion is view-dependent, so paused frames must
+    refresh the frozen curve geometry's occlusion against the moving
+    camera; that is what keeps the link render's culling and trimming
+    live while paused. On playing frames it follows the link compute
+    pass in the same command encoder, so it sees the freshly written
+    curve slices. All its reads are shared (non-ping-ponged) buffers —
+    curve positions come from the curve buffer itself, endpoint normals
+    from the shared normals buffer — so a single static bind group
+    (params, normals, links, owners, linkCurves) covers it; no point
+    buffer and no grid buffers.
+  - **Param change:** the link params uniform includes `eye: vec3f`
+    (the trace target). Layout: `eye: vec3f, time: f32, point_count:
+    u32, _pad: u32` (32 B). Both `dispatch` and `dispatchClearance`
+    write it (the writes are idempotent); `dispatch` gains an `eye`
+    parameter.
+  - **Cost:** one `rayClearance` trace per curve point per frame —
+    `N_SEGMENTS + 1 = 5` per link. For 6K points: ~30K traces, about 5×
+    the shading pass's per-point visibility traces (one per point since
+    Step 1c). Interior samples additionally pay one `sdfGradient` (4
+    `map()` evals) for the bias normal; the endpoints' normals are
+    reused and cost nothing. Acceptable.
 - `link-render-shader.ts`: the vertex shader reads `.w` as clearance
-  instead of a binary flag. Push offscreen if `.w <= 0.0` (invalid or
-  fully occluded). Optionally pass clearance as a varying and let the
-  fragment shader apply a soft fade near the occlusion boundary (same
-  `smoothstep` pattern as the point shader's `alpha_clearance`), for a
-  smoother transition than a hard cull.
+  instead of a binary flag and resolves occlusion **geometrically**:
+  - **Fully occluded** — both endpoint clearances non-positive
+    (`c0 <= 0.0 && c1 <= 0.0`): pushed offscreen. This also covers the
+    `0.0` dropped/absent-link sentinel.
+  - **Partially occluded** — exactly one endpoint has positive
+    clearance: the occluded side is trimmed at
+    `t_cut = c0 / (c0 - c1)`, the point where the linearly interpolated
+    endpoint clearances reach zero — the estimated crossing into the
+    occluder's silhouette along the curve. The cut is made in world
+    space **before projection** (clearance is a per-curve-point 3D
+    quantity, so the zero-crossing is a 3D location on the curve whose
+    projection lands on the occluder's silhouette), and the shortened
+    segment then flows through the unchanged projection,
+    per-endpoint-radius, and capsule-SDF stages at zero extra cost —
+    the cut point replaces the occluded endpoint's projection (still
+    three `view_proj` multiplies), and the cut end terminates with the
+    same rounded cap as chain ends. Zero-clearance endpoints degenerate
+    to `t_cut = 0` / `t_cut = 1` (no cut), so a curve point exactly at
+    the visibility boundary stays a welded joint with its neighbors.
+  - There is **no per-fragment fade**: the earlier "soft fade near the
+    occlusion boundary" option (a clearance varying plus a `smoothstep`
+    in the fragment shader) was not taken — the visible/invisible
+    transition is the geometric trim itself.
 - `link-pipeline.ts`: `dispatch` signature becomes `dispatch(encoder,
-  eye, time, readFromA)`. Update params uniform write.
+  eye, time, readFromA)`; new `dispatchClearance(encoder, eye, time)`
+  records the clearance pass; the params uniform write includes the
+  eye.
 
-**Verify:** Rotate the camera. Lines on the far side of the shape should
-disappear (occluded by the surface). Lines near silhouette edges should
-show a soft fade. Lines on the near side should be fully visible.
+**Verify:** Rotate the camera. Lines on the far side of the shape
+disappear (occluded by the surface). Sub-segments crossing the
+silhouette terminate at it with a rounded tip — the occluded stretch is
+not drawn, leaving a visible gap spanning it between the two cut
+points. Lines on the near side are fully visible. Pause time and orbit:
+culling and trimming update live, since the clearance pass runs every
+frame.
 
 ### Step 5 — Mitering / gap elimination
 
@@ -1380,7 +1450,7 @@ checkpoint to:
 | 2b | Back-side lines disappear again as in Step 1 (both endpoints occluded → culled). Culling updates live while paused and orbiting. Segments with one occluded endpoint or mid-segment occlusion still draw until Step 4. |
 | 2c | Joint kinks are gone — consecutive curve segments meet with matching tangents. Chain ends terminate naturally at stipple points. `LINK_TANGENT_SCALE` visibly controls joint rounding; `LINK_N_SEGMENTS` changes tessellation fidelity but not shape (buffer, compute, and render stay in sync by construction). |
 | 3 | Lines read with the pixel width their 3D tube would project — shrinking with distance, collapsing toward the rounded cap as the segment turns parallel to the view — with ~1px zoom-independent AA edges. At extreme zoom-out the stroke settles to a stable `~AA_PIXELS`-pixel minimum width (no sub-pixel flicker). Rotating through all camera orientations produces no freeze, no garbage geometry, and no gaps at grazing-angle joints (near-parallel sub-segments collapse to overlapping discs). Capsule shape with rounded caps visible at chain ends. |
-| 4 | Lines on the far side of the shape are culled. Soft fade near silhouette edges. No lines visible through the surface. |
+| 4 | Lines on the far side of the shape are culled. Sub-segments crossing the silhouette terminate at it with a rounded tip — the occluded stretch is not drawn and no lines are visible through the surface. Culling and trimming update live while paused and orbiting. |
 | 5 | No gaps at segment joints. No doubled-alpha seams (opaque interior, `LINK_ALPHA = 1`). Rounded miters at bends; rounded caps at chain ends. Correct from multiple viewing angles. |
 | 6 | `npm run lint` clean. AGENTS.md updated. Full frame loop runs without errors. |
 
@@ -1426,12 +1496,15 @@ checkpoint to:
   the nicer rendering. If the connections look bad, the scoring function
   or the principal direction definition should be revised before
   proceeding.
-- **`rayClearance` cost in the link compute** — Step 4 adds
-  `N_SEGMENTS + 1` `rayClearance` traces per point per frame. If this
-  is a frame-budget bottleneck, reduce `N_SEGMENTS` or trace only every
-  other curve point (interpolating clearance between traced points).
-- **Curve point normals** — Step 4 computes `sdfGradient` per curve
-  point for the clearance trace bias. This is 4 extra `map()` evals per
-  curve point. If the gradient is too noisy in smin blend regions, use
-  the nearest stipple point's normal instead (cheaper but less accurate
-  for the bias).
+- **`rayClearance` cost in the clearance stage** — Step 4 adds
+  `N_SEGMENTS + 1` `rayClearance` traces per point per frame (every
+  frame, paused frames included). If this is a frame-budget bottleneck,
+  reduce `N_SEGMENTS` or trace only every other curve point
+  (interpolating clearance between traced points).
+- **Interior curve point normals** — Step 4 computes `sdfGradient` per
+  interior curve point for the clearance trace bias (the endpoint curve
+  points are the stipple points and reuse the shading pass's stored
+  normals). This is 4 extra `map()` evals per interior curve point. If
+  the gradient is too noisy in smin blend regions, use the nearest
+  stipple point's normal instead (cheaper but less accurate for the
+  bias).

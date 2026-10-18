@@ -533,7 +533,7 @@ fn link_clearance_cs(@builtin(global_invocation_id) gid: vec3u) {
             spacing = max(length(curves_out[base + k - 1u].xyz - p),
                           length(curves_out[base + k + 1u].xyz - p));
         }
-        let threshold = max(spacing, PROBE_STEP);
+        let threshold = 1.1 * max(spacing, PROBE_STEP);
         curves_out[base + k].w = surfaceClearance(p, n, params.eye, threshold, params.time);
     }
 }
