@@ -15,9 +15,9 @@ import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
 /** Background clear color — black. */
 const CLEAR_COLOR: GPUColorDict = {
-    r: 0,
-    g: 0,
-    b: 0,
+    r: 1,
+    g: 1,
+    b: 1,
     a: 1,
 };
 

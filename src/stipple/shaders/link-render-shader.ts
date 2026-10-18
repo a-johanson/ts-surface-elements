@@ -90,7 +90,7 @@ const STRIDE: u32 = N_SEGMENTS + 1u;
 const LINK_HALF_WIDTH: f32 = 0.006;
 
 /** Link color and base alpha (modulated by the AA edge in the fragment). */
-const LINK_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
+const LINK_COLOR: vec3f = vec3f(0.0, 0.0, 0.0);
 const LINK_ALPHA: f32 = 1.0;
 
 /**

@@ -79,6 +79,6 @@ fn point_fs(in: VertexOut) -> @location(0) vec4f {
         discard;
     }
     let alpha = smoothstep(DOT_RADIUS + half_band, DOT_RADIUS - half_band, d_center);
-    return vec4f(1.0, 1.0, 1.0, alpha);
+    return vec4f(0.0, 0.0, 0.0, alpha);
 }
 `;
