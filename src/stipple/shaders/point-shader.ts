@@ -6,11 +6,12 @@
  * The vertex shader builds the shared tangent basis for each point and
  * offsets the quad corners in world space by `POINT_RADIUS_WORLD`, so
  * quads lie flat on the SDF surface and foreshorten with viewing angle.
- * Points whose center-ray clearance (from the shading buffer) is
- * non-positive — the surface occludes them from the camera — are pushed
- * offscreen so no fragments are rasterized for them.
+ * Back-facing points — normals pointing away from the eye — are pushed
+ * offscreen (a cheap dot-product sign test; no occlusion handling, so
+ * front-facing points always draw, even when another part of the
+ * surface covers them).
  *
- * The fragment shader paints a plain white anti-aliased filled disc at a
+ * The fragment shader paints a plain black anti-aliased filled disc at a
  * fixed radius, independent of luminance, so dots read as a uniform
  * overlay for the hatch lines.
  */
@@ -21,12 +22,13 @@ ${SDF_COMMON}
 
 struct PointUniform {
     view_proj: mat4x4f,
+    eye: vec3f,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: PointUniform;
 @group(0) @binding(1) var<storage, read> points: array<Point>;
-@group(0) @binding(2) var<storage, read> shading: array<PointShading>;
-@group(0) @binding(3) var<storage, read> normals: array<vec4f>;
+@group(0) @binding(2) var<storage, read> normals: array<vec4f>;
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4f,
@@ -50,15 +52,16 @@ fn point_vs(
     var out: VertexOut;
     out.uv = corner[vid];
 
-    // Coarse occlusion cull: non-positive center-ray clearance means the
-    // surface between the point and the camera occludes it.
-    if (shading[iid].clearance <= 0.0) {
+    let p = points[iid].pos.xyz;
+    let n = normals[iid].xyz;
+
+    // Back-face cull: a normal pointing away from the eye (unnormalized
+    // difference — only the sign matters) marks the surface's far side.
+    if (dot(n, u.eye - p) <= 0.0) {
         out.clip_pos = vec4f(2.0, 2.0, 2.0, 1.0);
         return out;
     }
 
-    let p = points[iid].pos.xyz;
-    let n = normals[iid].xyz;
     let frame = tangentFrame(n);
     let c = corner[vid];
     let world = p + (c.x * frame.t1 + c.y * frame.t2) * POINT_RADIUS_WORLD;

@@ -338,9 +338,9 @@ export class LinkPipeline {
      * stage evaluates the survival predicate without mutating `links`
      * and writes the Hermite-sampled, surface-projected curve points
      * (with a validity placeholder in `.w`) into the shared curve
-     * buffer. Should be called after the shading pass (which refreshes
-     * the normals buffer from the post-relax positions), before
-     * {@link dispatchClearance}, and only on frames where the
+     * buffer. Should be called after the normals-refresh pass (which
+     * refreshes the normals buffer from the post-relax positions),
+     * before {@link dispatchClearance}, and only on frames where the
      * simulation stepped — while time is paused the link inputs are
      * unchanged and the last links stay valid.
      *
@@ -386,9 +386,9 @@ export class LinkPipeline {
      * Records the link clearance stage into the given command encoder
      * as its own single-dispatch compute pass. Per point it evaluates
      * the edge survival predicate and, for surviving links, traces one
-     * `rayClearance` per curve point toward the eye — biased origin and
-     * back-face guard exactly as in the shading pass, with endpoint
-     * normals taken from the shared normals buffer — writing the
+     * `rayClearance` per curve point toward the eye — biased origin,
+     * back-face guard, and endpoint normals taken from the shared
+     * normals buffer — writing the
      * clearance into the curve buffer's `.w` fields; dropped or absent
      * links reset theirs to `0.0`.
      *

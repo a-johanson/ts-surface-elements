@@ -77,10 +77,8 @@
  *     its local curve spacing (the longest adjacent sub-segment length,
  *     floored at PROBE_STEP), so the trace's origin ignore-band covers
  *     the curve's own surface neighborhood. Endpoint normals come from
- *     the shared normals buffer (the endpoints are the stipple points,
- *     so their traces match the stipple dots' apart from the threshold —
- *     magnitudes may differ, the sign-based culling does not); interior
- *     samples get a fresh `sdfGradient` normal. Dropped or
+ *     the shared normals buffer; interior samples get a fresh
+ *     `sdfGradient` normal. Dropped or
  *     absent links reset their slice's `.w` to 0.0 — a sentinel that
  *     is both "invalid" and "fully occluded", which renders nothing.
  *     Because this stage runs every frame, the link render's
@@ -377,17 +375,13 @@ fn linkSurvives(i: u32) -> bool {
 }
 
 /**
- * Occlusion clearance of a surface point toward the eye — the same
- * center-ray trace the shading pass performs for the stipple points:
- * origin biased along the surface normal, back-facing points
- * short-circuited to an explicitly occluded value, rayClearance
- * toward the eye. Non-positive results mean the surface occludes the
- * point from the camera; positive results saturate at threshold (the
- * ray's closest unobstructed approach). The caller supplies the
- * threshold: link curve points use their local curve spacing, the
- * stipple points use the splat-radius CLEARANCE_THRESHOLD — so endpoint
- * curve points trace exactly like the dots apart from the threshold,
- * and the stored values agree in sign but not in magnitude.
+ * Occlusion clearance of a surface point toward the eye: origin biased
+ * along the surface normal, back-facing points short-circuited to an
+ * explicitly occluded value, rayClearance toward the eye. Non-positive
+ * results mean the surface occludes the point from the camera; positive
+ * results saturate at threshold (the ray's closest unobstructed
+ * approach). The caller supplies the threshold — each curve point uses
+ * its local curve spacing.
  */
 fn surfaceClearance(p: vec3f, n: vec3f, eye: vec3f, threshold: f32, time: f32) -> f32 {
     let p_biased = p + n * SHADOW_BIAS;
@@ -503,12 +497,9 @@ fn link_clearance_cs(@builtin(global_invocation_id) gid: vec3u) {
     let j = links_in[i];
     for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
         let p = curves_out[base + k].xyz;
-        // Endpoints are the stipple points themselves: reuse the
-        // shading pass's stored normals so the trace matches the
-        // stipple dots' (same position, normal, direction, and trace
-        // distance; only the threshold differs — sign agrees, magnitude
-        // does not, and consumers test sign only). Interior samples get
-        // a fresh surface normal.
+        // Endpoints are the stipple points themselves: reuse their
+        // stored normals from the shared normals buffer. Interior
+        // samples get a fresh surface normal.
         var n: vec3f;
         if (k == 0u) {
             n = normals_in[i].xyz;

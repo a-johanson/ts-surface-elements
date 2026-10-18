@@ -15,7 +15,7 @@
  * buffer is shared (not ping-ponged) and must match whichever point buffer
  * relax reads; since seed writes bufferA, it also seeds the normals from
  * bufferA. Subsequent frames have their normals refreshed by the reproject
- * pass (before relax) and the shading pass (after relax).
+ * pass (before relax) and the normals-refresh pass (after relax).
  */
 import { SDF_COMMON } from "./sdf-common.js";
 

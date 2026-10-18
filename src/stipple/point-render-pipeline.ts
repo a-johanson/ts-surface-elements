@@ -6,14 +6,15 @@
  * The vertex shader builds an orthonormal tangent basis from the
  * pre-computed surface normal at each point and offsets the quad corners
  * in world space by `point_radius_world`, so quads lie flat on the SDF
- * surface and foreshorten with viewing angle. Points whose center-ray
- * clearance (from the shading buffer) is non-positive are pushed
- * offscreen. The fragment shader paints a fixed-size anti-aliased dot,
+ * surface and foreshorten with viewing angle. Back-facing points are
+ * pushed offscreen in the vertex shader (normal·eye-direction sign
+ * test); there is no occlusion handling, so front-facing points always
+ * draw. The fragment shader paints a fixed-size anti-aliased dot,
  * independent of luminance.
  *
  * Two bind groups support the ping-pong buffer pair so the render can
  * read from whichever buffer the relax pass most recently wrote to. The
- * shared normals and shading buffers are non-ping-ponged.
+ * shared normals buffer is non-ping-ponged.
  */
 
 import { viewProjection } from "./camera.js";
@@ -21,9 +22,10 @@ import type { PointBuffers } from "./point-buffers.js";
 import { POINT_SHADER } from "./shaders/index.js";
 
 /**
- * Size of the point uniform buffer in bytes: `mat4x4f` (64).
+ * Size of the point uniform buffer in bytes: `mat4x4f` (64) +
+ * `vec3f` eye (12) padded to 16-byte struct alignment (4) = 80.
  */
-const UNIFORM_BUFFER_BYTES = 64;
+const UNIFORM_BUFFER_BYTES = 80;
 
 /** Static camera configuration — scene-independent lens parameters. */
 export interface CameraConfig {
@@ -115,8 +117,7 @@ export class PointRenderPipeline {
             entries: [
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
                 { binding: 1, resource: { buffer: points.bufferA } },
-                { binding: 2, resource: { buffer: points.shadingBuffer } },
-                { binding: 3, resource: { buffer: points.normalsBuffer } },
+                { binding: 2, resource: { buffer: points.normalsBuffer } },
             ],
         });
 
@@ -126,14 +127,16 @@ export class PointRenderPipeline {
             entries: [
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
                 { binding: 1, resource: { buffer: points.bufferB } },
-                { binding: 2, resource: { buffer: points.shadingBuffer } },
-                { binding: 3, resource: { buffer: points.normalsBuffer } },
+                { binding: 2, resource: { buffer: points.normalsBuffer } },
             ],
         });
     }
 
     /**
-     * Writes the view-projection matrix into the uniform buffer.
+     * Writes the view-projection matrix and eye position into the
+     * uniform buffer.
+     *
+     * Layout (80 bytes): `view_proj: mat4x4f`, `eye: vec3f` + padding.
      *
      * @param eye - Camera eye position [x, y, z].
      * @param target - Look-at target point [x, y, z].
@@ -151,6 +154,7 @@ export class PointRenderPipeline {
         const buffer = new ArrayBuffer(UNIFORM_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
         f32.set(viewProj, 0);
+        f32.set(eye, 16);
         this.device.queue.writeBuffer(this.uniformBuffer, 0, buffer);
     }
 

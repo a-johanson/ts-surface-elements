@@ -19,9 +19,9 @@
  * whichever buffer relax is about to read, so both A→B and B→A bind
  * groups bind the same grid buffer set. The normals buffer is shared
  * (not ping-ponged) and is owned by the reproject pass (per-frame,
- * before relax) and the shading pass (per-frame, after relax) — it
- * always matches whichever buffer relax reads. The shading buffer is
- * likewise shared (not ping-ponged): its `luminance` field is written by
+ * before relax) and the normals-refresh pass (per playing frame, after
+ * relax) — it always matches whichever buffer relax reads. The luminance
+ * buffer is likewise shared (not ping-ponged): it is written by
  * the reproject pass earlier in the same frame and read here for the
  * per-neighbor density modulation. There is no density
  * texture — points are on the surface by construction (seeded there,
@@ -44,15 +44,14 @@ const RELAX_PARAMS_BUFFER_BYTES = 16;
  *
  * The normals buffer is allocated once by {@link PointBuffers} and shared
  * between this pipeline (read for tangent-plane projection), the
- * reproject pipeline (written per-frame before relax), and the shading
- * pipeline (written per-frame after relax, plus once at bootstrap by
- * the seed pipeline).
+ * reproject pipeline (written per-frame before relax), and the
+ * normals-refresh pipeline (written per playing frame after relax, plus
+ * once at bootstrap by the seed pipeline).
  *
- * The shading buffer is likewise allocated once by {@link PointBuffers}
- * and shared: this pipeline reads its `luminance` field for the
- * per-neighbor density modulation, the reproject pipeline writes it
- * per-frame before relax, and the shading pass writes the `clearance`
- * field after relax.
+ * The luminance buffer is likewise allocated once by {@link PointBuffers}
+ * and shared: this pipeline reads it for the per-neighbor density
+ * modulation, and the reproject pipeline writes it per-frame before
+ * relax.
  */
 export class RelaxPipeline {
     private readonly device: GPUDevice;
@@ -69,8 +68,8 @@ export class RelaxPipeline {
      * ping-pong bind groups.
      *
      * @param device - The GPU device.
-     * @param points - The ping-pong point buffer pair plus shared normals
-     *   and shading buffers.
+     * @param points - The ping-pong point buffer pair plus the shared
+     *   normals and luminance buffers.
      * @param grid - The spatial grid buffers (params, sorted values, cell
      *   start/count). Rebuilt once per frame by `SpatialGridPipeline` from
      *   whichever buffer relax reads; not ping-ponged.
@@ -122,7 +121,7 @@ export class RelaxPipeline {
                 { binding: 5, resource: { buffer: grid.sortedValues } },
                 { binding: 6, resource: { buffer: grid.cellStart } },
                 { binding: 7, resource: { buffer: grid.cellCount } },
-                { binding: 8, resource: { buffer: points.shadingBuffer } },
+                { binding: 8, resource: { buffer: points.luminanceBuffer } },
             ],
         });
         this.relaxBindGroupBtoA = device.createBindGroup({
@@ -137,7 +136,7 @@ export class RelaxPipeline {
                 { binding: 5, resource: { buffer: grid.sortedValues } },
                 { binding: 6, resource: { buffer: grid.cellStart } },
                 { binding: 7, resource: { buffer: grid.cellCount } },
-                { binding: 8, resource: { buffer: points.shadingBuffer } },
+                { binding: 8, resource: { buffer: points.luminanceBuffer } },
             ],
         });
     }
@@ -169,8 +168,8 @@ export class RelaxPipeline {
      * Reads from one point buffer (depending on `readFromA`) and writes to
      * the other. The shared normals buffer is read (not written) by this
      * pass; it is refreshed per-frame by the reproject pass (before relax)
-     * and the shading pass (after relax). The shared shading buffer's
-     * `luminance` field is also read (not written) — it is written by the
+     * and the normals-refresh pass (after relax). The shared luminance
+     * buffer is also read (not written) — it is written by the
      * reproject pass earlier in the same frame.
      *
      * The caller must flip `readFromA` after each dispatch to implement

@@ -3,12 +3,12 @@ import { OrbitControls } from "./orbit-controls.js";
 import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
 import { LinkPipeline } from "./stipple/link-pipeline.js";
 import { LinkRenderPipeline } from "./stipple/link-render-pipeline.js";
+import { NormalsRefreshPipeline } from "./stipple/normals-refresh-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
 import { type CameraConfig, PointRenderPipeline } from "./stipple/point-render-pipeline.js";
 import { RelaxPipeline } from "./stipple/relax-pipeline.js";
 import { ReprojectPipeline } from "./stipple/reproject-pipeline.js";
 import { SeedPipeline } from "./stipple/seed-pipeline.js";
-import { ShadingPipeline } from "./stipple/shading-pipeline.js";
 import { type SceneBBox, SpatialGridPipeline } from "./stipple/spatial-grid-pipeline.js";
 import { TimeControls } from "./time-controls.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
@@ -144,22 +144,21 @@ function getCanvas(): HTMLCanvasElement {
  *    `ceil(dt / TARGET_SUBSTEP_DT)` sub-passes (capped at
  *    `MAX_SUBSTEPS`), each flipping the ping-pong direction, so the
  *    per-step Euler integration size stays stable regardless of frame
- *    rate. After the relax substeps, rebuilds the spatial grid from the
- *    post-relax positions and dispatches the link compute pass, which
- *    connects each point to its best-aligned neighbor along the
- *    principal direction and subdivides each link into surface-projected
- *    curve segments. While time is paused, these passes are skipped
+ *    rate. After the relax substeps, dispatches the normals-refresh
+ *    compute pass to recompute the shared normals buffer from the
+ *    post-relax positions, rebuilds the spatial grid from the post-relax
+ *    positions, and dispatches the link compute pass, which connects
+ *    each point to its best-aligned neighbor along the principal
+ *    direction and subdivides each link into surface-projected curve
+ *    segments. While time is paused, these passes are skipped
  *    and their state is left untouched, so they resume exactly where
  *    they left off — paused frames keep the links from the last playing
  *    frame since no link input changes while paused.
- * 4. Dispatches the shading compute pass to refresh the normals buffer
- *    and compute the per-point center-ray visibility clearance from the
- *    relaxed positions, and dispatches the link compute's clearance
- *    stage, which traces each curve point's occlusion clearance toward
- *    the eye into the curve buffer. Both are view-dependent, so they
- *    always run — the camera stays interactive while time is paused,
- *    and the link render's occlusion culling and soft fade stay live
- *    against the frozen curve geometry.
+ * 4. Dispatches the link compute's clearance stage, which traces each
+ *    curve point's occlusion clearance toward the eye into the curve
+ *    buffer. It is view-dependent, so it always runs — the camera stays
+ *    interactive while time is paused, and the link render's occlusion
+ *    culling and soft fade stay live against the frozen curve geometry.
  * 5. Begins a render pass that draws the SDF debug view (grayscale
  *    Lambert), then the link curves, and then — when {@link DRAW_POINTS}
  *    is enabled — the stipple points on top.
@@ -174,7 +173,7 @@ function getCanvas(): HTMLCanvasElement {
  * @param gpu - The WebGPU context.
  * @param reproject - The reproject compute pipeline.
  * @param relax - The relax compute pipeline.
- * @param shading - The shading compute pipeline.
+ * @param normalsRefresh - The normals-refresh compute pipeline.
  * @param link - The link compute pipeline.
  * @param points - The ping-pong point buffer pair.
  * @param debugRender - The debug render pipeline (SDF visualization).
@@ -189,7 +188,7 @@ function startFrameLoop(
     reproject: ReprojectPipeline,
     spatialGrid: SpatialGridPipeline,
     relax: RelaxPipeline,
-    shading: ShadingPipeline,
+    normalsRefresh: NormalsRefreshPipeline,
     link: LinkPipeline,
     points: PointBuffers,
     debugRender: DebugRenderPipeline,
@@ -249,26 +248,20 @@ function startFrameLoop(
                 relax.dispatch(encoder, substepDt, time, readFromA);
                 readFromA = !readFromA;
             }
-        }
 
-        // Shading reads the buffer that relax most recently wrote to.
-        const shadingReadsA = readFromA;
-        shading.dispatch(encoder, eye, time, shadingReadsA);
+            // --- Compute pass: normals refresh (from post-relax
+            // positions, for the link pass) ---
+            // Reads the buffer that relax most recently wrote to; the
+            // grid rebuild and link pass below read the same buffer.
+            normalsRefresh.dispatch(encoder, time, readFromA);
 
-        // The link scan/dedup/subdiv passes run only on frames where
-        // the simulation stepped: while paused the post-relax
-        // positions, normals, and animation time are unchanged, so the
-        // links computed on the last playing frame are still valid. The
-        // clearance pass below and the link render run every frame —
-        // both are view-dependent.
-        if (playedThisFrame) {
             // --- Compute pass: spatial grid rebuild (from post-relax
             // positions, for the link pass) ---
-            spatialGrid.dispatch(encoder, shadingReadsA);
+            spatialGrid.dispatch(encoder, readFromA);
 
             // --- Compute pass: link (best-neighbor scan → dedup →
             // curve emission) ---
-            link.dispatch(encoder, eye, time, shadingReadsA);
+            link.dispatch(encoder, eye, time, readFromA);
         }
 
         // --- Compute pass: link clearance (per-curve-point occlusion,
@@ -278,10 +271,6 @@ function startFrameLoop(
         // frames it follows the link pass and sees the freshly written
         // curve slices.
         link.dispatchClearance(encoder, eye, time);
-
-        // Render reads the same buffer shading just read (the point
-        // renderer; the link renderer reads the curve buffer instead).
-        const renderReadsA = shadingReadsA;
 
         // --- Render pass: debug SDF view + draw links + points ---
         const texture = gpu.context.getCurrentTexture();
@@ -302,7 +291,7 @@ function startFrameLoop(
         }
         linkRender.render(pass, eye, target, gpu.canvas, points.count);
         if (DRAW_POINTS) {
-            pointRender.render(pass, eye, target, gpu.canvas, renderReadsA, points.count);
+            pointRender.render(pass, eye, target, gpu.canvas, readFromA, points.count);
         }
 
         pass.end();
@@ -339,7 +328,7 @@ async function bootstrap(): Promise<void> {
     const reproject = new ReprojectPipeline(gpu.device, points);
     const spatialGrid = new SpatialGridPipeline(gpu.device, points, SCENE_BBOX, RELAX_RADIUS);
     const relax = new RelaxPipeline(gpu.device, points, spatialGrid, RELAX_RADIUS);
-    const shading = new ShadingPipeline(gpu.device, points);
+    const normalsRefresh = new NormalsRefreshPipeline(gpu.device, points);
     const link = new LinkPipeline(gpu.device, points, spatialGrid);
     const debugRender = new DebugRenderPipeline(
         gpu.device,
@@ -373,7 +362,7 @@ async function bootstrap(): Promise<void> {
         reproject,
         spatialGrid,
         relax,
-        shading,
+        normalsRefresh,
         link,
         points,
         debugRender,

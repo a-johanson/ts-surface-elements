@@ -11,10 +11,8 @@
  * It also computes the per-point view-independent luminance
  * (`softShadow`-attenuated Lambert toward the animated light) from the
  * fresh projected position and normal and writes it into the shared
- * shading buffer's `luminance` field. Relax reads this luminance later in
- * the same frame for density modulation, so it never sees cross-frame
- * stale values. Writes are member-wise so the `clearance` field — owned
- * by the shading pass — is untouched.
+ * luminance buffer. Relax reads this luminance later in the same frame
+ * for density modulation, so it never sees cross-frame stale values.
  *
  * This ensures that relax starts with on-surface positions and matching
  * normals even when the SDF has moved since the last frame. Without this
@@ -40,7 +38,7 @@ struct ReprojectParams {
 @group(0) @binding(0) var<uniform> params: ReprojectParams;
 @group(0) @binding(1) var<storage, read_write> points: array<Point>;
 @group(0) @binding(2) var<storage, read_write> normals_out: array<vec4f>;
-@group(0) @binding(3) var<storage, read_write> shading_out: array<PointShading>;
+@group(0) @binding(3) var<storage, read_write> luminance_out: array<f32>;
 
 const REPROJECT_NEWTON_ITERS: i32 = 3;
 const REPROJECT_ALPHA: f32 = 0.5;
@@ -60,14 +58,13 @@ fn reproject_cs(@builtin(global_invocation_id) gid: vec3u) {
     normals_out[i] = vec4f(n, 0.0);
 
     // View-independent luminance (shadow-aware Lambert) for the relax
-    // kernel's density modulation. Member-wise write: the clearance
-    // field is owned by the shading pass.
+    // kernel's density modulation.
     let light = lightDir(time);
     let lambert = max(dot(n, light), 0.0);
     var lum: f32 = 0.0;
     if (lambert > 0.0) {
         lum = softShadow(projected + n * SHADOW_BIAS, light, time) * lambert;
     }
-    shading_out[i].luminance = lum;
+    luminance_out[i] = lum;
 }
 `;

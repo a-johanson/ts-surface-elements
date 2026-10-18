@@ -14,7 +14,7 @@
  *
  *  - luminance-driven density modulation (Step 1d): the effective radius
  *    is computed per neighbor `j` from the neighbor's view-independent
- *    luminance in the shared shading buffer — `r_eff_j = radius ·
+ *    luminance in the shared luminance buffer — `r_eff_j = radius ·
  *    mix(MIN_RADIUS_SCALE, 1.0, lum_j)`, written by the reproject pass
  *    earlier in the same frame. Dark neighbors repel within a smaller
  *    shell, so points can pack close around them and migrate into unlit
@@ -85,7 +85,7 @@ const UINT_MAX: u32 = 0xFFFFFFFFu;
 @group(0) @binding(5) var<storage, read> sorted_values: array<u32>;
 @group(0) @binding(6) var<storage, read> cell_start: array<u32>;
 @group(0) @binding(7) var<storage, read> cell_count: array<u32>;
-@group(0) @binding(8) var<storage, read> shading_in: array<PointShading>;
+@group(0) @binding(8) var<storage, read> luminance_in: array<f32>;
 
 const RELAX_NEWTON_ITERS: i32 = 1;
 const RELAX_ALPHA: f32 = 1.0;
@@ -162,7 +162,7 @@ fn relax_cs(@builtin(global_invocation_id) gid: vec3u) {
                     // points pack close around them and migrate into
                     // unlit regions. r_eff_j ≤ r always, so the 27-cell
                     // search still covers the full range.
-                    let lum_j = shading_in[j].luminance;
+                    let lum_j = luminance_in[j];
                     let r_eff_j = r * mix(MIN_RADIUS_SCALE, 1.0, lum_j);
                     if (d_E > r_eff_j) {
                         continue;

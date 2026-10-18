@@ -13,20 +13,15 @@
  * Shared WGSL block: time-animated SDF scene, gradient, normal, surface
  * projection, and ray-march.
  *
- * Interpolated into the seed, reproject, relax, shading, debug-render, and
- * point-render shaders. Contains only functions, structs, and compile-time
- * constants — no bindings.
+ * Interpolated into the seed, reproject, relax, normals-refresh,
+ * debug-render, and point-render shaders. Contains only functions,
+ * structs, and compile-time constants — no bindings.
  *
  * - `Point` — the per-point storage layout (pos only, 16 bytes). Surface
  *   normals live in a separate shared buffer, written by the seed pass
- *   (once, at bootstrap at t=0), by the reproject pass (every frame, before
- *   relax), and by the shading pass (every frame, after relax).
- * - `PointShading` — the per-point shading record (16 bytes: luminance,
- *   center-ray clearance, two spare slots): `luminance` carries the
- *   point's view-independent luminance (written by the reproject pass);
- *   `clearance` carries the center-ray occlusion clearance (see
- *   `rayClearance`), written by the shading pass and read by the point
- *   renderer and the link renderer.
+ *   (once, at bootstrap at t=0), by the reproject pass (every playing
+ *   frame, before relax), and by the normals-refresh pass (every playing
+ *   frame, after relax).
  * - `POINT_RADIUS_WORLD` / `tangentFrame(n)` — the canonical splat radius
  *   and tangent-basis construction used by the point renderer to offset
  *   its quad corners onto the tangent plane, so quads lie flat on the
@@ -37,7 +32,7 @@
  * - `sdfGradient(p, time)` — tetrahedron-pattern gradient (4 taps); used by
  *   Newton projection so the magnitude is the true distance-field gradient.
  * - `calcNormal(p, time)` — normalized gradient; used by the debug render
- *   for Lambert shading.
+ *   for Lambert shading and by the normals-refresh pass.
  * - `projectToSurface(p, time, iters, alpha)` — Newton-Raphson steps
  *   `p -= alpha * (f(p) / |∇f|²) * ∇f` until `|f(p)| < SURF_EPS` or the
  *   iteration budget is exhausted. For a true distance field (`|∇f| ≈ 1`)
@@ -62,10 +57,8 @@
  *   clearance saturates there), and the origin's own surface is excluded
  *   by gating recording on travel distance — samples within `threshold`
  *   of the origin are not recorded, since within that band the only
- *   surface is the one the point sits on. Callers pass the scale
- *   appropriate to their primitive: the splat-radius
- *   `CLEARANCE_THRESHOLD` for stipple points, the local curve spacing
- *   for link curve points.
+ *   surface is the one the point sits on. The link clearance stage
+ *   passes each curve point's local curve spacing.
  * - `softShadow(ro, rd, time)` — penumbra estimation: sphere-
  *   traces `map()` toward the light and returns a `[0, 1]` factor (1 =
  *   fully lit, 0 = fully occluded). At each step it triangulates the
@@ -78,13 +71,6 @@
 export const SDF_COMMON = /* wgsl */ `
 struct Point {
     pos: vec4f,
-};
-
-struct PointShading {
-    luminance: f32,
-    clearance: f32,
-    _pad0: f32,
-    _pad1: f32,
 };
 
 struct TangentFrame {
@@ -108,11 +94,6 @@ const SHADOW_W: f32 = 0.4;
 const SHADOW_MAX_STEPS: u32 = 128;
 
 const POINT_RADIUS_WORLD: f32 = 0.03;
-// The stipple points' clearance scale for rayClearance: the positive
-// clearance of an unobstructed trace saturates here, and surface samples
-// within this band of the trace origin are ignored — within the splat
-// radius of a stipple point, the only surface is the one it sits on.
-const CLEARANCE_THRESHOLD: f32 = 1.5 * POINT_RADIUS_WORLD;
 
 fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     var t = 0.0;

@@ -10,7 +10,7 @@
  * tail re-projection assumes), writes the projected position back
  * in-place, writes the matching surface normal into the shared
  * normals buffer, and computes the per-point view-independent luminance
- * into the shared shading buffer — ahead of relax, so the relax kernel's
+ * into the shared luminance buffer — ahead of relax, so the relax kernel's
  * density modulation reads fresh same-frame values.
  *
  * This ensures relax starts with on-surface positions and matching
@@ -45,12 +45,11 @@ const REPROJECT_PARAMS_BUFFER_BYTES = 16;
  * Manages the reproject compute pipeline, its params uniform, and the
  * ping-pong read bind groups.
  *
- * The normals and shading buffers are allocated once by
+ * The normals and luminance buffers are allocated once by
  * {@link PointBuffers} and shared: the normals buffer between this
  * pipeline (written before relax), the seed pipeline (written once at
- * bootstrap), and the shading pipeline (written after relax); the
- * shading buffer's luminance field is written here, its clearance field
- * by the shading pass.
+ * bootstrap), and the normals-refresh pipeline (written after relax);
+ * the luminance buffer is written here.
  */
 export class ReprojectPipeline {
     private readonly device: GPUDevice;
@@ -66,8 +65,8 @@ export class ReprojectPipeline {
      * both ping-pong bind groups.
      *
      * @param device - The GPU device.
-     * @param points - The ping-pong point buffer pair plus shared
-     *   normals and shading buffers.
+     * @param points - The ping-pong point buffer pair plus the shared
+     *   normals and luminance buffers.
      */
     public constructor(device: GPUDevice, points: PointBuffers) {
         this.device = device;
@@ -102,7 +101,7 @@ export class ReprojectPipeline {
                 { binding: 0, resource: { buffer: this.paramsBuffer } },
                 { binding: 1, resource: { buffer: points.bufferA } },
                 { binding: 2, resource: { buffer: points.normalsBuffer } },
-                { binding: 3, resource: { buffer: points.shadingBuffer } },
+                { binding: 3, resource: { buffer: points.luminanceBuffer } },
             ],
         });
 
@@ -113,7 +112,7 @@ export class ReprojectPipeline {
                 { binding: 0, resource: { buffer: this.paramsBuffer } },
                 { binding: 1, resource: { buffer: points.bufferB } },
                 { binding: 2, resource: { buffer: points.normalsBuffer } },
-                { binding: 3, resource: { buffer: points.shadingBuffer } },
+                { binding: 3, resource: { buffer: points.luminanceBuffer } },
             ],
         });
     }
