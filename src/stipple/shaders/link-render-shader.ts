@@ -87,7 +87,7 @@ const STRIDE: u32 = N_SEGMENTS + 1u;
  * Converted to a pixel stroke radius at each endpoint's own depth.
  * Tunable.
  */
-const LINK_HALF_WIDTH: f32 = 0.006;
+const LINK_HALF_WIDTH: f32 = 0.003;
 
 /** Link color and base alpha (modulated by the AA edge in the fragment). */
 const LINK_COLOR: vec3f = vec3f(0.0, 0.0, 0.0);

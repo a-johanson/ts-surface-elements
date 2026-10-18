@@ -42,8 +42,8 @@
  *   `p -= alpha * (f(p) / |∇f|²) * ∇f` until `|f(p)| < SURF_EPS` or the
  *   iteration budget is exhausted. For a true distance field (`|∇f| ≈ 1`)
  *   and `alpha = 1`, each step lands on the surface in one go; smaller
- *   `alpha` guards against overshoot in `smin` blend regions where the
- *   field is not a perfect distance function.
+ *   `alpha` guards against overshoot where the field is not a perfect
+ *   distance function, e.g. across `min` seams between scene primitives.
  * - `rayMarch(ro, rd, time)` — sphere-traces `map()` along `rd` from `ro`
  *   up to `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance,
  *   or `-1.0` on miss. Shared by the debug render (per-fragment SDF
@@ -233,6 +233,11 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
+fn sdTorus(p: vec3f, major: f32, minor: f32) -> f32 {
+    let q = vec2f(length(p.xz) - major, p.y);
+    return length(q) - minor;
+}
+
 // fn sdCapsule(p: vec3f, a: vec3f, b: vec3f, r: f32) -> f32 {
 //     let ab = b - a;
 //     let ap = p - a;
@@ -240,73 +245,32 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
 //     return length(ap - ab * t) - r;
 // }
 
-fn sdSegment2D(p: vec2f, a: vec2f, b: vec2f) -> f32 {
-    let ab = b - a;
-    let ap = p - a;
-    let t = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
-    return length(ap - ab * t);
-}
-
-fn sdTube(
-    p: vec3f,
-    a: vec3f,
-    b: vec3f,
-    r_a: f32,
-    r_b: f32,
-    w_a: f32,
-    w_b: f32,
-) -> f32 {
-    let ab = b - a;
-    let len = length(ab);
-    let dir = ab / len;
-    let ap = p - a;
-    let t = dot(ap, dir);
-    let rho = length(ap - dir * t);
-    let p2d = vec2f(rho, t);
-    let d_medial = sdSegment2D(p2d, vec2f(r_a, 0.0), vec2f(r_b, len));
-    let w = (w_b - w_a) * t / len + w_a;
-    return d_medial - w;
-}
-
 fn opTwist(p: vec3f, freq: f32, offset: f32) -> vec3f {
-    let c = cos(freq * p.y + offset);
-    let s = sin(freq * p.y + offset);
-    return vec3f(c*p.x - s*p.z, p.y, s*p.x + c*p.z);
+    let angle = freq * p.x + offset;
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec3f(p.x, c * p.y - s * p.z, s * p.y + c * p.z);
 }
 
 fn lightDir(time: f32) -> vec3f {
-    const SWAY_AMPLITUDE: f32 = 0.3 * PI;
-    const SWAY_FREQ: f32 = 0.5;
-    const SWAY_OFFSET: f32 = 0.25 * PI;
-    let theta = SWAY_AMPLITUDE * sin(SWAY_FREQ * time) + SWAY_OFFSET;
-    return normalize(vec3f(sin(theta), 0.5, cos(theta)));
+    return normalize(vec3f(0.8, 2.0, 1.0));
 }
 
 fn map(p_in: vec3f, time: f32) -> f32 {
-    const TUBE_COUNT: f32 = 3.0;
-    const R_BASE: f32 = 0.6;
-    const R_TUBE: f32 = 0.75;
-    const F_TWIST = 0.9;
-    const F_SWAY = 1.0;
-    const F_CONTRACT = F_SWAY;
+    const TORUS_MAJOR: f32 = 1.25;
+    const TORUS_MINOR: f32 = 0.35;
+    const LINK_SHIFT: f32 = 0.82;
+    const TWIST_RATE: f32 = 0.3;
+    const F_TWIST: f32 = 0.9;
+    const TWIST_MID: f32 = -0.5 * LINK_SHIFT;
 
-    var min_dist = 1.0e20;
+    let rate = TWIST_RATE * sin(F_TWIST * time);
+    let p = opTwist(p_in, rate, -rate * TWIST_MID);
 
-    let p = opTwist(p_in, 0.2 * sin(F_TWIST * time), 0.0);
-
-    for (var i: f32 = 0.0; i < TUBE_COUNT; i += 1.0) {
-        let alpha = i * TAU / TUBE_COUNT;
-        let c = R_BASE * cos(alpha);
-        let s = R_BASE * sin(alpha);
-        let a = vec3f(0.1 * c, -2.0, 0.1 * s);
-        let theta = 0.3 * i;
-        let s_b = 0.85 * sin(theta + F_SWAY * time) + 1.9;
-        let h_b = 0.8 * sin(theta + PI + F_CONTRACT * time);
-        let b = vec3f(s_b * c, 1.0 + h_b, s_b * s);
-        let r_b = (0.3 * sin(theta + F_CONTRACT * time) + 0.6) * R_TUBE;
-        min_dist = smin(min_dist, sdTube(p, a, b, R_TUBE, r_b, 1.1 * R_TUBE, 0.15), 0.2);
-    }
-    return min_dist;
+    let d_a = sdTorus(p, TORUS_MAJOR, TORUS_MINOR);
+    let p_b = vec3f(p.x + LINK_SHIFT, p.z, -p.y);
+    let d_b = sdTorus(p_b, TORUS_MAJOR, TORUS_MINOR);
+    return min(d_a, d_b);
 }
 
 fn sdfGradient(p: vec3f, time: f32) -> vec3f {
