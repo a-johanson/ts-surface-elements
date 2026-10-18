@@ -31,9 +31,9 @@
  *     {@link dispatchClearance} as its own compute pass *every* frame
  *     (playing and paused). It evaluates the same survival predicate
  *     and, for surviving links, traces one `rayClearance` per curve
- *     point toward the eye — exactly as the shading pass does for the
- *     stipple points — writing the clearance into the curve points'
- *     `.w` component (dropped or absent links reset it to `0.0`).
+ *     point toward the eye, with each curve point's local curve spacing as the
+ *     clearance threshold — writing the clearance into the curve
+ *     points' `.w` component (dropped or absent links reset it to `0.0`).
  *     Occlusion is view-dependent, so the traces must refresh even on
  *     paused frames — that is what keeps the link render's culling and
  *     soft fade tracking the camera while the curve geometry is frozen.

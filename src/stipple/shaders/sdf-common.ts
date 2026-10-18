@@ -48,19 +48,24 @@
  *   up to `MAX_DIST` with `MAX_STEPS` iterations. Returns the hit distance,
  *   or `-1.0` on miss. Shared by the debug render (per-fragment SDF
  *   visualization).
- * - `rayClearance(ro, rd, max_dist, time)` — sphere-traces `map()` along
- *   `rd` from `ro` over `[0, max_dist]` and returns the minimum signed
- *   clearance between the ray and the SDF surface. Negative values are
- *   penetrations (the ray crossed into the surface); small positive
- *   values are grazes (the ray passed close without hitting). Combines a
- *   signed `map()` sample with a `softShadow`-style triangulated
- *   closest-approach estimate between consecutive unbounding spheres, so
- *   the minimum is tracked accurately even when the surface passes
- *   closest to the ray between sample positions. The origin's own
- *   surface is excluded by gating recording on travel distance:
- *   samples within the splat radius (`CLEARANCE_THRESHOLD`) of the
- *   origin are not recorded, since within that band the only surface is
- *   the one the point sits on.
+ * - `rayClearance(ro, rd, max_dist, threshold, time)` — sphere-traces
+ *   `map()` along `rd` from `ro` over `[0, max_dist]` and returns the
+ *   minimum signed clearance between the ray and the SDF surface.
+ *   Negative values are penetrations (the ray crossed into the surface);
+ *   small positive values are grazes (the ray passed close without
+ *   hitting). Combines a signed `map()` sample with a `softShadow`-style
+ *   triangulated closest-approach estimate between consecutive
+ *   unbounding spheres, so the minimum is tracked accurately even when
+ *   the surface passes closest to the ray between sample positions.
+ *   `threshold` is the caller's clearance scale, playing two roles: an
+ *   unobstructed trace returns exactly `threshold` (the positive
+ *   clearance saturates there), and the origin's own surface is excluded
+ *   by gating recording on travel distance — samples within `threshold`
+ *   of the origin are not recorded, since within that band the only
+ *   surface is the one the point sits on. Callers pass the scale
+ *   appropriate to their primitive: the splat-radius
+ *   `CLEARANCE_THRESHOLD` for stipple points, the local curve spacing
+ *   for link curve points.
  * - `softShadow(ro, rd, time)` — penumbra estimation: sphere-
  *   traces `map()` toward the light and returns a `[0, 1]` factor (1 =
  *   fully lit, 0 = fully occluded). At each step it triangulates the
@@ -103,6 +108,10 @@ const SHADOW_W: f32 = 0.4;
 const SHADOW_MAX_STEPS: u32 = 128;
 
 const POINT_RADIUS_WORLD: f32 = 0.03;
+// The stipple points' clearance scale for rayClearance: the positive
+// clearance of an unobstructed trace saturates here, and surface samples
+// within this band of the trace origin are ignored — within the splat
+// radius of a stipple point, the only surface is the one it sits on.
 const CLEARANCE_THRESHOLD: f32 = 1.5 * POINT_RADIUS_WORLD;
 
 fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
@@ -118,17 +127,23 @@ fn rayMarch(ro: vec3f, rd: vec3f, time: f32) -> f32 {
     return -1.0;
 }
 
-fn rayClearance(ro: vec3f, rd: vec3f, max_dist: f32, time: f32) -> f32 {
+fn rayClearance(
+    ro: vec3f,
+    rd: vec3f,
+    max_dist: f32,
+    threshold: f32,
+    time: f32,
+) -> f32 {
     if max_dist <= SURF_EPS {
-        return CLEARANCE_THRESHOLD;
+        return threshold;
     }
 
     var t = min(PROBE_STEP, max_dist);
-    var min_dist = CLEARANCE_THRESHOLD;
+    var min_dist = threshold;
 
     // Ignore the initial positive threshold band until the ray has
-    // traveled at least the desired clearance — within the splat radius
-    // of the origin, the only surface is the origin's own.
+    // traveled at least the threshold — within that band of the origin,
+    // the only surface is the origin's own.
     var tracking = false;
 
     // Previous sample's signed distance, for the softShadow-style
@@ -160,7 +175,7 @@ fn rayClearance(ro: vec3f, rd: vec3f, max_dist: f32, time: f32) -> f32 {
             min_dist = min(min_dist, closest_approach);
 
             prev_dist = dist;
-        } else if t >= CLEARANCE_THRESHOLD {
+        } else if t >= threshold {
             // The ray has escaped the initial surface neighborhood.
             tracking = true;
         }

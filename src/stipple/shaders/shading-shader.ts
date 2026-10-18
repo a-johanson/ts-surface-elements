@@ -62,8 +62,9 @@ fn shading_cs(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    // Center-ray occlusion clearance; non-positive means occluded.
-    let clearance = rayClearance(p_biased, eye_dir, dist_eye, time);
+    // Center-ray occlusion clearance; non-positive means occluded. The
+    // threshold is the stipple points' splat-radius scale.
+    let clearance = rayClearance(p_biased, eye_dir, dist_eye, CLEARANCE_THRESHOLD, time);
     shading_out[i].clearance = clearance;
 }
 `;

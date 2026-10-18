@@ -67,8 +67,10 @@ point render so points sit on top.
 - `tangentFrame(n)` is available in `SDF_COMMON` and returns an
   orthonormal tangent basis.
 - `projectToSurface(p, time, iters, alpha)` is available in `SDF_COMMON`.
-- `rayClearance(ro, rd, max_dist, time)` is available in `SDF_COMMON` and
-  returns the minimum signed clearance between a ray and the SDF surface.
+- `rayClearance(ro, rd, max_dist, threshold, time)` is available in
+  `SDF_COMMON` and returns the minimum signed clearance between a ray and
+  the SDF surface; `threshold` caps the reported positive clearance and
+  sets the origin ignore-band (callers pass their primitive's scale).
 - The shading buffer's `luminance` field holds the view-independent
   per-point luminance (`lit * lambert`), written by the reproject pass
   (Step 1c).
@@ -1275,8 +1277,13 @@ are not visible through it.
 - `link-shader.ts`: after computing each curve point `p_k`, compute the
   local normal `n_k = normalize(sdfGradient(p_k, time))`, bias by
   `SHADOW_BIAS`, trace `rayClearance(p_k + n_k * SHADOW_BIAS, eye_dir,
-  dist_eye, time)` toward the eye, and store the clearance in the `.w`
-  component of each curve point (replacing the binary validity flag).
+  dist_eye, threshold_k, time)` toward the eye, and store the clearance
+  in the `.w` component of each curve point (replacing the binary
+  validity flag). The per-curve-point threshold `threshold_k` is the
+  local curve spacing — the longest adjacent sub-segment length, floored
+  at `PROBE_STEP` — so the trace's origin ignore-band covers the curve's
+  own surface neighborhood; the shading pass passes the splat-radius
+  `CLEARANCE_THRESHOLD` for the stipple points instead.
   Invalid links (no neighbor found) still get `.w = 0.0` — a sentinel
   that is both "invalid" and "fully occluded", which the render shader
   treats the same way (push offscreen). Valid but occluded segments get

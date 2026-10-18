@@ -73,10 +73,14 @@
  *     curve point toward the eye — origin biased along the surface
  *     normal, back-facing points short-circuited to an explicitly
  *     occluded value and writes the clearance into `.w`, replacing the
- *     validity placeholder. Endpoint normals come from the shared
- *     normals buffer (the endpoints are the stipple points, so the
- *     traced clearance is identical to the stipple dots' clearance);
- *     interior samples get a fresh `sdfGradient` normal. Dropped or
+ *     validity placeholder. Each curve point's clearance threshold is
+ *     its local curve spacing (the longest adjacent sub-segment length,
+ *     floored at PROBE_STEP), so the trace's origin ignore-band covers
+ *     the curve's own surface neighborhood. Endpoint normals come from
+ *     the shared normals buffer (the endpoints are the stipple points,
+ *     so their traces match the stipple dots' apart from the threshold —
+ *     magnitudes may differ, the sign-based culling does not); interior
+ *     samples get a fresh `sdfGradient` normal. Dropped or
  *     absent links reset their slice's `.w` to 0.0 — a sentinel that
  *     is both "invalid" and "fully occluded", which renders nothing.
  *     Because this stage runs every frame, the link render's
@@ -378,10 +382,14 @@ fn linkSurvives(i: u32) -> bool {
  * origin biased along the surface normal, back-facing points
  * short-circuited to an explicitly occluded value, rayClearance
  * toward the eye. Non-positive results mean the surface occludes the
- * point from the camera; positive results saturate at
- * CLEARANCE_THRESHOLD (the ray's closest unobstructed approach).
+ * point from the camera; positive results saturate at threshold (the
+ * ray's closest unobstructed approach). The caller supplies the
+ * threshold: link curve points use their local curve spacing, the
+ * stipple points use the splat-radius CLEARANCE_THRESHOLD — so endpoint
+ * curve points trace exactly like the dots apart from the threshold,
+ * and the stored values agree in sign but not in magnitude.
  */
-fn surfaceClearance(p: vec3f, n: vec3f, eye: vec3f, time: f32) -> f32 {
+fn surfaceClearance(p: vec3f, n: vec3f, eye: vec3f, threshold: f32, time: f32) -> f32 {
     let p_biased = p + n * SHADOW_BIAS;
     let to_eye = eye - p_biased;
     let dist_eye = length(to_eye);
@@ -389,7 +397,7 @@ fn surfaceClearance(p: vec3f, n: vec3f, eye: vec3f, time: f32) -> f32 {
     if (dot(n, eye_dir) <= 0.0) {
         return -1.0;
     }
-    return rayClearance(p_biased, eye_dir, dist_eye, time);
+    return rayClearance(p_biased, eye_dir, dist_eye, threshold, time);
 }
 
 @compute @workgroup_size(64)
@@ -496,10 +504,11 @@ fn link_clearance_cs(@builtin(global_invocation_id) gid: vec3u) {
     for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
         let p = curves_out[base + k].xyz;
         // Endpoints are the stipple points themselves: reuse the
-        // shading pass's stored normals so the traced clearance is
-        // identical to the stipple dots' clearance (same position,
-        // same normal, same trace). Interior samples get a fresh
-        // surface normal.
+        // shading pass's stored normals so the trace matches the
+        // stipple dots' (same position, normal, direction, and trace
+        // distance; only the threshold differs — sign agrees, magnitude
+        // does not, and consumers test sign only). Interior samples get
+        // a fresh surface normal.
         var n: vec3f;
         if (k == 0u) {
             n = normals_in[i].xyz;
@@ -508,7 +517,24 @@ fn link_clearance_cs(@builtin(global_invocation_id) gid: vec3u) {
         } else {
             n = normalize(sdfGradient(p, params.time));
         }
-        curves_out[base + k].w = surfaceClearance(p, n, params.eye, params.time);
+        // Clearance threshold: the local curve spacing — the longest of
+        // the adjacent sub-segments (single neighbor at the chain ends),
+        // so the trace's origin ignore-band covers the curve's own
+        // surface neighborhood around this sample. Floored at
+        // PROBE_STEP: a degenerate zero spacing would make an
+        // unobstructed trace return 0.0 — the dropped/absent-link
+        // sentinel the renderer culls on.
+        var spacing: f32;
+        if (k == 0u) {
+            spacing = length(curves_out[base + 1u].xyz - p);
+        } else if (k == N_SEGMENTS) {
+            spacing = length(curves_out[base + k - 1u].xyz - p);
+        } else {
+            spacing = max(length(curves_out[base + k - 1u].xyz - p),
+                          length(curves_out[base + k + 1u].xyz - p));
+        }
+        let threshold = max(spacing, PROBE_STEP);
+        curves_out[base + k].w = surfaceClearance(p, n, params.eye, threshold, params.time);
     }
 }
 `;
