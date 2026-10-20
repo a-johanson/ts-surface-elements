@@ -239,19 +239,11 @@ fn lightDir(time: f32) -> vec3f {
 
 fn map(p_in: vec3f, time: f32) -> f32 {
     const TORUS_MAJOR: f32 = 1.25;
-    const TORUS_MINOR: f32 = 0.35;
-    const LINK_SHIFT: f32 = 0.82;
-    const TWIST_RATE: f32 = 0.3;
-    const F_TWIST: f32 = 0.9;
-    const TWIST_MID: f32 = -0.5 * LINK_SHIFT;
-
-    let rate = TWIST_RATE * sin(F_TWIST * time);
-    let p = opTwist(p_in, rate, -rate * TWIST_MID);
-
-    let d_a = sdTorus(p, TORUS_MAJOR, TORUS_MINOR);
-    let p_b = vec3f(p.x + LINK_SHIFT, p.z, -p.y);
-    let d_b = sdTorus(p_b, TORUS_MAJOR, TORUS_MINOR);
-    return min(d_a, d_b);
+    const TORUS_MINOR: f32 = 0.75;
+    let r_inc = 0.15 * (1.0 + sin(time));
+    let p_torus = vec3f(p_in.x, (1.0 - (0.4 * r_inc)) * p_in.y - r_inc, p_in.z);
+    let torus = sdTorus(p_torus, TORUS_MAJOR, TORUS_MINOR + r_inc);
+    return torus;
 }
 
 fn sdfGradient(p: vec3f, time: f32) -> vec3f {

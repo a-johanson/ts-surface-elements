@@ -74,7 +74,7 @@ import { SDF_COMMON } from "./sdf-common.js";
  * fixed by the direction field and `HATCH_STEP_SIZE`, this value only
  * sets the stroke length.
  */
-export const HATCH_N_SEGMENTS_HALF = 10;
+export const HATCH_N_SEGMENTS_HALF = 2;
 
 export const HATCH_SHADER = /* wgsl */ `
 ${SDF_COMMON}
@@ -91,7 +91,7 @@ struct HatchParams {
  * together with N_SEGMENTS_HALF it sets the stroke length
  * (2 * N_SEGMENTS_HALF * HATCH_STEP_SIZE).
  */
-const HATCH_STEP_SIZE: f32 = 0.02;
+const HATCH_STEP_SIZE: f32 = 0.01;
 
 /**
  * Below this tangent-projection magnitude the light is considered
