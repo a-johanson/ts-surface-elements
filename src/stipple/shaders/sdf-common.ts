@@ -14,7 +14,7 @@
  * projection, and ray-march.
  *
  * Interpolated into the seed, reproject, relax, normals-refresh,
- * debug-render, and point-render shaders. Contains only functions,
+ * debug-render, point-render, and hatch shaders. Contains only functions,
  * structs, and compile-time constants — no bindings.
  *
  * - `Point` — the per-point storage layout (pos only, 16 bytes). Surface
@@ -57,8 +57,8 @@
  *   clearance saturates there), and the origin's own surface is excluded
  *   by gating recording on travel distance — samples within `threshold`
  *   of the origin are not recorded, since within that band the only
- *   surface is the one the point sits on. The link clearance stage
- *   passes each curve point's local curve spacing.
+ *   surface is the one the point sits on. The hatch clearance stage
+ *   passes each stroke point's local stroke spacing.
  * - `softShadow(ro, rd, time)` — penumbra estimation: sphere-
  *   traces `map()` toward the light and returns a `[0, 1]` factor (1 =
  *   fully lit, 0 = fully occluded). At each step it triangulates the

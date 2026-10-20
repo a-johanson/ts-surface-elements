@@ -1,8 +1,8 @@
 import { FrameCapture } from "./frame-capture.js";
 import { OrbitControls } from "./orbit-controls.js";
 import { DebugRenderPipeline } from "./stipple/debug-render-pipeline.js";
-import { LinkPipeline } from "./stipple/link-pipeline.js";
-import { LinkRenderPipeline } from "./stipple/link-render-pipeline.js";
+import { HatchPipeline } from "./stipple/hatch-pipeline.js";
+import { HatchRenderPipeline } from "./stipple/hatch-render-pipeline.js";
 import { NormalsRefreshPipeline } from "./stipple/normals-refresh-pipeline.js";
 import { PointBuffers } from "./stipple/point-buffers.js";
 import { type CameraConfig, PointRenderPipeline } from "./stipple/point-render-pipeline.js";
@@ -146,21 +146,20 @@ function getCanvas(): HTMLCanvasElement {
  *    per-step Euler integration size stays stable regardless of frame
  *    rate. After the relax substeps, dispatches the normals-refresh
  *    compute pass to recompute the shared normals buffer from the
- *    post-relax positions, rebuilds the spatial grid from the post-relax
- *    positions, and dispatches the link compute pass, which connects
- *    each point to its best-aligned neighbor along the principal
- *    direction and subdivides each link into surface-projected curve
- *    segments. While time is paused, these passes are skipped
- *    and their state is left untouched, so they resume exactly where
- *    they left off — paused frames keep the links from the last playing
- *    frame since no link input changes while paused.
- * 4. Dispatches the link compute's clearance stage, which traces each
- *    curve point's occlusion clearance toward the eye into the curve
+ *    post-relax positions, then dispatches the hatch compute pass,
+ *    which grows a surface-projected hatch stroke from every point by
+ *    integrating the principal direction field forward and backward.
+ *    While time is paused, these passes are skipped and their state is
+ *    left untouched, so they resume exactly where they left off —
+ *    paused frames keep the strokes from the last playing frame since
+ *    no hatch input changes while paused.
+ * 4. Dispatches the hatch compute's clearance stage, which traces each
+ *    stroke point's occlusion clearance toward the eye into the stroke
  *    buffer. It is view-dependent, so it always runs — the camera stays
- *    interactive while time is paused, and the link render's occlusion
- *    culling and soft fade stay live against the frozen curve geometry.
+ *    interactive while time is paused, and the hatch render's occlusion
+ *    culling and soft fade stay live against the frozen stroke geometry.
  * 5. Begins a render pass that draws the SDF debug view (grayscale
- *    Lambert), then the link curves, and then — when {@link DRAW_POINTS}
+ *    Lambert), then the hatch strokes, and then — when {@link DRAW_POINTS}
  *    is enabled — the stipple points on top.
  * 6. Submits the command buffer.
  * 7. If a still-image export was requested, serializes the canvas's last
@@ -174,11 +173,11 @@ function getCanvas(): HTMLCanvasElement {
  * @param reproject - The reproject compute pipeline.
  * @param relax - The relax compute pipeline.
  * @param normalsRefresh - The normals-refresh compute pipeline.
- * @param link - The link compute pipeline.
+ * @param hatch - The hatch compute pipeline.
  * @param points - The ping-pong point buffer pair.
  * @param debugRender - The debug render pipeline (SDF visualization).
  * @param pointRender - The point render pipeline.
- * @param linkRender - The link render pipeline.
+ * @param hatchRender - The hatch render pipeline.
  * @param controls - Orbit camera controls.
  * @param timeControls - Animation-time playback controls.
  * @param frameCapture - Still-image export controls.
@@ -189,11 +188,11 @@ function startFrameLoop(
     spatialGrid: SpatialGridPipeline,
     relax: RelaxPipeline,
     normalsRefresh: NormalsRefreshPipeline,
-    link: LinkPipeline,
+    hatch: HatchPipeline,
     points: PointBuffers,
     debugRender: DebugRenderPipeline,
     pointRender: PointRenderPipeline,
-    linkRender: LinkRenderPipeline,
+    hatchRender: HatchRenderPipeline,
     controls: OrbitControls,
     timeControls: TimeControls,
     frameCapture: FrameCapture,
@@ -219,10 +218,10 @@ function startFrameLoop(
         const encoder = device.createCommandEncoder();
 
         // While time is paused the surface is static, so the simulation
-        // and link passes are skipped entirely: points, the spatial grid,
-        // the ping-pong direction, and the links are left untouched and
-        // everything resumes exactly where it left off when playback
-        // restarts.
+        // and hatch passes are skipped entirely: points, the spatial
+        // grid, the ping-pong direction, and the strokes are left
+        // untouched and everything resumes exactly where it left off
+        // when playback restarts.
         const playedThisFrame = timeControls.isPlaying;
         if (playedThisFrame) {
             time += dt;
@@ -250,29 +249,25 @@ function startFrameLoop(
             }
 
             // --- Compute pass: normals refresh (from post-relax
-            // positions, for the link pass) ---
+            // positions, for the hatch pass) ---
             // Reads the buffer that relax most recently wrote to; the
-            // grid rebuild and link pass below read the same buffer.
+            // hatch pass below reads the same buffer.
             normalsRefresh.dispatch(encoder, time, readFromA);
 
-            // --- Compute pass: spatial grid rebuild (from post-relax
-            // positions, for the link pass) ---
-            spatialGrid.dispatch(encoder, readFromA);
-
-            // --- Compute pass: link (best-neighbor scan → dedup →
-            // curve emission) ---
-            link.dispatch(encoder, eye, time, readFromA);
+            // --- Compute pass: hatch (grow strokes along the principal
+            // direction field) ---
+            hatch.dispatch(encoder, eye, time, readFromA);
         }
 
-        // --- Compute pass: link clearance (per-curve-point occlusion,
+        // --- Compute pass: hatch clearance (per-stroke-point occlusion,
         // view-dependent) — every frame, including paused frames, so
-        // the link render's occlusion culling and fade keep tracking
-        // the camera against the frozen curve geometry. On playing
-        // frames it follows the link pass and sees the freshly written
-        // curve slices.
-        link.dispatchClearance(encoder, eye, time);
+        // the hatch render's occlusion culling and fade keep tracking
+        // the camera against the frozen stroke geometry. On playing
+        // frames it follows the hatch pass and sees the freshly written
+        // stroke slices.
+        hatch.dispatchClearance(encoder, eye, time);
 
-        // --- Render pass: debug SDF view + draw links + points ---
+        // --- Render pass: debug SDF view + draw hatch strokes + points ---
         const texture = gpu.context.getCurrentTexture();
         const view = texture.createView();
         const pass = encoder.beginRenderPass({
@@ -289,7 +284,7 @@ function startFrameLoop(
         if (DRAW_DEBUG) {
             debugRender.render(pass, eye, target, gpu.canvas, time);
         }
-        linkRender.render(pass, eye, target, gpu.canvas, points.count);
+        hatchRender.render(pass, eye, target, gpu.canvas, points.count);
         if (DRAW_POINTS) {
             pointRender.render(pass, eye, target, gpu.canvas, readFromA, points.count);
         }
@@ -329,7 +324,7 @@ async function bootstrap(): Promise<void> {
     const spatialGrid = new SpatialGridPipeline(gpu.device, points, SCENE_BBOX, RELAX_RADIUS);
     const relax = new RelaxPipeline(gpu.device, points, spatialGrid, RELAX_RADIUS);
     const normalsRefresh = new NormalsRefreshPipeline(gpu.device, points);
-    const link = new LinkPipeline(gpu.device, points, spatialGrid);
+    const hatch = new HatchPipeline(gpu.device, points);
     const debugRender = new DebugRenderPipeline(
         gpu.device,
         cameraConfig,
@@ -337,9 +332,9 @@ async function bootstrap(): Promise<void> {
         SCENE_BBOX,
     );
     const pointRender = new PointRenderPipeline(gpu.device, points, cameraConfig, gpu.format);
-    const linkRender = new LinkRenderPipeline(
+    const hatchRender = new HatchRenderPipeline(
         gpu.device,
-        link.linkCurves,
+        hatch.hatchCurves,
         cameraConfig,
         gpu.format,
     );
@@ -363,11 +358,11 @@ async function bootstrap(): Promise<void> {
         spatialGrid,
         relax,
         normalsRefresh,
-        link,
+        hatch,
         points,
         debugRender,
         pointRender,
-        linkRender,
+        hatchRender,
         controls,
         timeControls,
         frameCapture,

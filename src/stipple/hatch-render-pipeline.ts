@@ -1,32 +1,31 @@
 /**
- * Link render pipeline — draws the link curves connecting stipple
- * points to their best-aligned neighbors as chains of screen-space
- * stroke quads following the subdivided, surface-projected curve.
+ * Hatch render pipeline — draws the hatch strokes grown from the
+ * stipple points as chains of screen-space stroke quads following the
+ * surface-projected polyline written by the hatch compute pass.
  *
  * Each instance draws one `triangle-list` quad (two triangles, six
- * vertices) between two adjacent curve points of the subdivided,
- * surface-projected curve written by the link compute pass. The quad
- * is extruded in screen space around the projected segment and shaded
- * with a 2D capsule distance field sized from the line's world-space
- * half-width, so the line reads with the screen width its 3D tube
- * would project (shrinking with depth) while consecutive sub-segments
- * weld into a continuous stroke at every viewing angle, with a soft
- * `fwidth`-based anti-aliased edge. Occlusion (Step 4 in the
- * the per-curve-point clearance the link compute's clearance stage
- * bakes into the curve buffer's `.w` fields — refreshed every frame,
+ * vertices) between two adjacent stroke points of the polyline. The
+ * quad is extruded in screen space around the projected segment and
+ * shaded with a 2D capsule distance field sized from the line's
+ * world-space half-width, so the line reads with the screen width its
+ * 3D tube would project (shrinking with depth) while consecutive
+ * sub-segments weld into a continuous stroke at every viewing angle,
+ * with a soft `fwidth`-based anti-aliased edge. Occlusion is the
+ * per-stroke-point clearance the hatch compute's clearance stage bakes
+ * into the stroke buffer's `.w` fields — refreshed every frame,
  * including while time is paused, so culling and the geometric
  * retraction of crossing segments stay view-dependent.
  *
- * The curve buffer is not ping-ponged, so a single bind group covers
- * the uniform and the curve data.
+ * The stroke buffer is not ping-ponged, so a single bind group covers
+ * the uniform and the stroke data.
  */
 
 import { viewProjection } from "./camera.js";
 import type { CameraConfig } from "./point-render-pipeline.js";
-import { LINK_N_SEGMENTS, LINK_RENDER_SHADER } from "./shaders/index.js";
+import { HATCH_N_SEGMENTS_HALF, HATCH_RENDER_SHADER } from "./shaders/index.js";
 
 /**
- * Size of the link render uniform buffer in bytes: `mat4x4f` (64) +
+ * Size of the hatch render uniform buffer in bytes: `mat4x4f` (64) +
  * `vec3f` eye (12, 16-aligned) + `vec2f` canvas_size (8) + `f32` pad
  * (4) = 96 (rounded to the struct's 16-byte alignment). The eye
  * provides the view direction for the world-units-per-pixel estimate
@@ -37,9 +36,15 @@ import { LINK_N_SEGMENTS, LINK_RENDER_SHADER } from "./shaders/index.js";
 const UNIFORM_BUFFER_BYTES = 96;
 
 /**
- * Manages the link render pipeline, uniform buffer, and bind group.
+ * Grown sub-segments per stroke (`2 * HATCH_N_SEGMENTS_HALF`) — one
+ * quad instance each.
  */
-export class LinkRenderPipeline {
+const STROKE_SUBSEGMENTS = 2 * HATCH_N_SEGMENTS_HALF;
+
+/**
+ * Manages the hatch render pipeline, uniform buffer, and bind group.
+ */
+export class HatchRenderPipeline {
     private readonly device: GPUDevice;
     private readonly pipeline: GPURenderPipeline;
     private readonly uniformBuffer: GPUBuffer;
@@ -51,16 +56,16 @@ export class LinkRenderPipeline {
      * bind group.
      *
      * @param device - The GPU device.
-     * @param linkCurves - The shared curve buffer written by the link
-     *   compute pass — `.xyz` positions plus per-curve-point occlusion
-     *   clearance in `.w`, refreshed every frame by the clearance
-     *   stage.
+     * @param hatchCurves - The shared stroke buffer written by the
+     *   hatch compute pass — `.xyz` positions plus per-stroke-point
+     *   occlusion clearance in `.w`, refreshed every frame by the
+     *   clearance stage.
      * @param config - Static camera configuration (FOV, up).
      * @param format - The canvas texture format.
      */
     public constructor(
         device: GPUDevice,
-        linkCurves: GPUBuffer,
+        hatchCurves: GPUBuffer,
         config: CameraConfig,
         format: GPUTextureFormat,
     ) {
@@ -68,20 +73,20 @@ export class LinkRenderPipeline {
         this.config = config;
 
         const shaderModule = device.createShaderModule({
-            label: "stipple-link-render-shader",
-            code: LINK_RENDER_SHADER,
+            label: "stipple-hatch-render-shader",
+            code: HATCH_RENDER_SHADER,
         });
 
         this.pipeline = device.createRenderPipeline({
-            label: "stipple-link-render-pipeline",
+            label: "stipple-hatch-render-pipeline",
             layout: "auto",
             vertex: {
                 module: shaderModule,
-                entryPoint: "link_vs",
+                entryPoint: "hatch_vs",
             },
             fragment: {
                 module: shaderModule,
-                entryPoint: "link_fs",
+                entryPoint: "hatch_fs",
                 targets: [
                     {
                         format,
@@ -106,7 +111,7 @@ export class LinkRenderPipeline {
         });
 
         this.uniformBuffer = device.createBuffer({
-            label: "stipple-link-render-uniform",
+            label: "stipple-hatch-render-uniform",
             size: UNIFORM_BUFFER_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
@@ -114,11 +119,11 @@ export class LinkRenderPipeline {
         const layout = this.pipeline.getBindGroupLayout(0);
 
         this.bindGroup = device.createBindGroup({
-            label: "stipple-link-render-bind",
+            label: "stipple-hatch-render-bind",
             layout,
             entries: [
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
-                { binding: 1, resource: { buffer: linkCurves } },
+                { binding: 1, resource: { buffer: hatchCurves } },
             ],
         });
     }
@@ -156,7 +161,7 @@ export class LinkRenderPipeline {
     }
 
     /**
-     * Draws all link curve segments as instanced screen-space stroke
+     * Draws all hatch stroke segments as instanced screen-space stroke
      * quads into the given render pass.
      *
      * Must be called *inside* an active `GPURenderPassEncoder`, before
@@ -168,7 +173,7 @@ export class LinkRenderPipeline {
      * @param canvas - The canvas whose size determines the projection
      *   aspect.
      * @param pointCount - Number of stipple points; each contributes
-     *   `LINK_N_SEGMENTS` quad instances.
+     *   `2 * HATCH_N_SEGMENTS_HALF` quad instances.
      */
     public render(
         pass: GPURenderPassEncoder,
@@ -180,6 +185,6 @@ export class LinkRenderPipeline {
         this.writeUniform(eye, target, canvas);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, this.bindGroup);
-        pass.draw(6, pointCount * LINK_N_SEGMENTS);
+        pass.draw(6, pointCount * STROKE_SUBSEGMENTS);
     }
 }

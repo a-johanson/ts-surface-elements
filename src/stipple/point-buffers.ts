@@ -18,7 +18,7 @@
  * (before relax, from the buffer relax is about to read), and every
  * playing frame by the normals-refresh pass (after relax, from the
  * buffer relax just wrote) — and is shared between relax (tangent-plane
- * projection) and the link pass. It is not ping-ponged because it has no
+ * projection) and the hatch pass. It is not ping-ponged because it has no
  * temporal state of its own; the invariant "normals match whichever
  * buffer relax reads" is preserved because the normals-refresh pass
  * writes normals from the buffer that the *next* relax pass will read.
@@ -71,7 +71,7 @@ export class PointBuffers {
      * the reproject pass (before relax, from the buffer relax is about to
      * read), and every playing frame by the normals-refresh pass (after
      * relax, from the buffer relax just wrote). Read by the relax pass,
-     * the link pass, and the point renderer (to orient tangent-plane
+     * the hatch pass, and the point renderer (to orient tangent-plane
      * quads).
      */
     public readonly normalsBuffer: GPUBuffer;

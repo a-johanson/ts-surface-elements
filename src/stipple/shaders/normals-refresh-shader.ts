@@ -8,11 +8,11 @@
  * position into the shared normals buffer — so the normals buffer always
  * matches the buffer that the *next* reproject + relax cycle will read
  * (preserving the relax invariant that normals match the read-side
- * buffer across the ping-pong swap) and the link pass reads normals
+ * buffer across the ping-pong swap) and the hatch pass reads normals
  * matching the post-relax positions.
  *
  * The pass is view-independent — no eye, no per-point visibility
- * clearance; the link pipeline owns its own per-curve-point clearance
+ * clearance; the hatch pipeline owns its own per-stroke-point clearance
  * traces.
  */
 import { SDF_COMMON } from "./sdf-common.js";

@@ -1,7 +1,7 @@
 export { BBOX_WIREFRAME_SHADER } from "./bbox-wireframe-shader.js";
 export { DEBUG_RENDER_SHADER } from "./debug-render-shader.js";
-export { LINK_RENDER_SHADER } from "./link-render-shader.js";
-export { LINK_N_SEGMENTS, LINK_SHADER } from "./link-shader.js";
+export { HATCH_RENDER_SHADER } from "./hatch-render-shader.js";
+export { HATCH_N_SEGMENTS_HALF, HATCH_SHADER } from "./hatch-shader.js";
 export { NORMALS_REFRESH_SHADER } from "./normals-refresh-shader.js";
 export { POINT_SHADER } from "./point-shader.js";
 export { RELAX_SHADER } from "./relax-shader.js";

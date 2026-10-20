@@ -4,14 +4,14 @@
  *
  * On each frame where the simulation stepped, {@link dispatch} records a
  * single compute pass that runs after the relax substeps and before the
- * link pass. One invocation per point reads the buffer relax most
+ * hatch pass. One invocation per point reads the buffer relax most
  * recently wrote and writes the surface normal at that position into the
  * shared {@link PointBuffers.normalsBuffer}.
  *
  * Because the pass writes normals from the buffer relax just produced,
  * the normals buffer always matches the buffer that the *next* reproject
  * + relax cycle will read — preserving the relax invariant that normals
- * match the read-side buffer across the ping-pong swap — and the link
+ * match the read-side buffer across the ping-pong swap — and the hatch
  * pass reads normals matching the post-relax positions. The pass is
  * view-independent, so it is skipped while time is paused (frozen
  * positions imply frozen normals).
@@ -135,7 +135,7 @@ export class NormalsRefreshPipeline {
      * match the buffer relax most recently wrote — and writes the
      * refreshed normals into the shared normals buffer. Should be called
      * after the final {@link RelaxPipeline.dispatch} substep and before
-     * {@link LinkPipeline.dispatch}.
+     * {@link HatchPipeline.dispatch}.
      *
      * @param encoder - The command encoder to record into.
      * @param time - Current animation time in seconds.

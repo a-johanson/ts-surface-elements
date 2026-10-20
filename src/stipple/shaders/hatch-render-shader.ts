@@ -1,21 +1,21 @@
 /**
- * Link render shader — draws each surviving link as a chain of
- * `N_SEGMENTS` screen-space stroke quads following the subdivided,
- * surface-projected curve written by the link compute pass
+ * Hatch render shader — draws each stipple point's hatch stroke as a
+ * chain of `N_SEGMENTS` screen-space stroke quads following the
+ * surface-projected polyline written by the hatch compute pass
  * (`triangle-list` topology, one quad per sub-segment instance).
  *
  * Each instance maps to point `i = inst / N_SEGMENTS` and sub-segment
- * `s = inst % N_SEGMENTS`; the endpoints are the adjacent curve points
+ * `s = inst % N_SEGMENTS`; the endpoints are the adjacent stroke points
  * `curves[i * STRIDE + s]` and `curves[i * STRIDE + s + 1]`.
  *
  * The stroke is built entirely in screen space. The vertex stage
- * perspective-projects the two endpoint curve points to pixel
+ * perspective-projects the two endpoint stroke points to pixel
  * coordinates and extrudes the quad as the bounding box of the 2D
  * capsule around the projected segment — the larger endpoint stroke
  * radius plus the AA margin on every side. The fragment stage evaluates
  * a 2D segment distance field (clamped closest point on the projected
  * segment) against a per-point stroke radius: the world-space
- * half-width (`LINK_HALF_WIDTH`) converted to pixels at each endpoint's
+ * half-width (`HATCH_HALF_WIDTH`) converted to pixels at each endpoint's
  * own depth and interpolated linearly along the projected segment —
  * the projected cross-section radius of the 3D tube is exactly
  * proportional to the inverse projective depth — and clamped to a
@@ -29,11 +29,11 @@
  * grazing angles. Each capsule's rounded cap extends the stroke radius
  * past the shared endpoint in *every* screen direction, so consecutive
  * sub-segments always overlap at their joints and — with
- * `LINK_ALPHA = 1` (opaque interior, only the ~1px AA edge blends) —
+ * `HATCH_ALPHA = 1` (opaque interior, only the ~1px AA edge blends) —
  * the union renders as a rounded, welded miter with no hairline gaps,
- * at any viewing angle. Shared curve points also share a projected
+ * at any viewing angle. Shared stroke points also share a projected
  * depth, so neighboring capsules agree on the joint's stroke radius
- * from both sides. Chain ends terminate with a rounded cap too —
+ * from both sides. Stroke ends terminate with a rounded cap too —
  * no special handling. A world-space capsule cannot do this: its
  * along-axis reach past the shared endpoint foreshortens by the sine
  * of the angle to the view, which starves exactly those joint overlaps
@@ -51,20 +51,21 @@
  * `fwidth`-based ~1px band — independent of viewing angle and zoom,
  * the same pattern as the point shader's disc SDF.
  *
- * Occlusion is resolved per curve point and geometrically: the link
- * compute's clearance stage stores, in each curve point's `.w`, the
+ * Occlusion is resolved per stroke point and geometrically: the hatch
+ * compute's clearance stage stores, in each stroke point's `.w`, the
  * occlusion clearance of a `rayClearance` trace toward the eye
- * (> 0 visible, < 0 occluded, 0.0 dropped or absent link — its whole
- * slice is zeroed). A sub-segment renders when either of its endpoint
- * curve points is visible: fully occluded ones are pushed offscreen,
- * and partially occluded ones are trimmed at the point where the
- * linearly interpolated endpoint clearances reach zero — the estimated
- * crossing into the occluder's silhouette along the curve.
+ * (> 0 visible, < 0 occluded). A sub-segment renders when either of its
+ * endpoint stroke points is visible: fully occluded ones are pushed
+ * offscreen, and partially occluded ones are trimmed at the point where
+ * the linearly interpolated endpoint clearances reach zero — the
+ * estimated crossing into the occluder's silhouette along the curve.
+ * Before the hatch compute has ever dispatched, the zero-initialized
+ * buffer's `.w = 0.0` culls everything.
  */
-import { LINK_N_SEGMENTS } from "./link-shader.js";
+import { HATCH_N_SEGMENTS_HALF } from "./hatch-shader.js";
 
-export const LINK_RENDER_SHADER = /* wgsl */ `
-struct LinkRenderUniform {
+export const HATCH_RENDER_SHADER = /* wgsl */ `
+struct HatchRenderUniform {
     view_proj: mat4x4f,
     eye: vec3f,
     canvas_size: vec2f,
@@ -72,26 +73,27 @@ struct LinkRenderUniform {
 };
 
 /**
- * Hermite sub-segment count per link — interpolated from the TS
- * constant LINK_N_SEGMENTS (single source of truth, defined in
- * link-shader.ts). Resolves the instance → point/sub-segment mapping.
+ * Grown sub-segments per stroke (2 * the steps per arm) — interpolated
+ * from the TS constant HATCH_N_SEGMENTS_HALF (single source of truth,
+ * defined in hatch-shader.ts). Resolves the instance → point/sub-segment
+ * mapping.
  */
-const N_SEGMENTS: u32 = ${LINK_N_SEGMENTS}u;
+const N_SEGMENTS: u32 = ${2 * HATCH_N_SEGMENTS_HALF}u;
 
-/** Curve points per link (N_SEGMENTS + 1). */
+/** Stroke points per stipple point (N_SEGMENTS + 1). */
 const STRIDE: u32 = N_SEGMENTS + 1u;
 
 /**
  * World-space half-width of the line itself — sized relative to
- * POINT_RADIUS_WORLD (lines read thinner than the dots they connect).
- * Converted to a pixel stroke radius at each endpoint's own depth.
- * Tunable.
+ * POINT_RADIUS_WORLD (lines read thinner than the dots they hatch
+ * from). Converted to a pixel stroke radius at each endpoint's own
+ * depth. Tunable.
  */
-const LINK_HALF_WIDTH: f32 = 0.003;
+const HATCH_HALF_WIDTH: f32 = 0.003;
 
-/** Link color and base alpha (modulated by the AA edge in the fragment). */
-const LINK_COLOR: vec3f = vec3f(0.0, 0.0, 0.0);
-const LINK_ALPHA: f32 = 1.0;
+/** Stroke color and base alpha (modulated by the AA edge in the fragment). */
+const HATCH_COLOR: vec3f = vec3f(0.0, 0.0, 0.0);
+const HATCH_ALPHA: f32 = 1.0;
 
 /**
  * Anti-alias band scale — matches the point shader's AA_WIDTH so line
@@ -112,9 +114,11 @@ const AA_PIXELS: f32 = 2.0;
 /**
  * Projected 2D segment length squared below which the endpoints are
  * treated as coincident on screen and the stroke renders as a disc.
- * Covers both coincident curve points and view-parallel segments whose
- * projection collapses to a point; the distance field degenerates to a
- * plain point distance instead of dividing by a zero-length axis.
+ * Covers both coincident stroke points (e.g. the remaining slots of a
+ * degenerate arm, which all hold the same standing point — rendered as
+ * a rounded cap) and view-parallel segments
+ * whose projection collapses to a point; the distance field degenerates
+ * to a plain point distance instead of dividing by a zero-length axis.
  */
 const DEGENERATE_PX2: f32 = 1e-6;
 
@@ -127,7 +131,7 @@ const DEGENERATE_PX2: f32 = 1e-6;
  */
 const EYE_EPS: f32 = 1e-4;
 
-@group(0) @binding(0) var<uniform> u: LinkRenderUniform;
+@group(0) @binding(0) var<uniform> u: HatchRenderUniform;
 @group(0) @binding(1) var<storage, read> curves: array<vec4f>;
 
 struct VertexOut {
@@ -195,7 +199,7 @@ fn strokeDistance(p: vec2f, a: vec2f, b: vec2f) -> vec2f {
 }
 
 @vertex
-fn link_vs(
+fn hatch_vs(
     @builtin(vertex_index) vid: u32,
     @builtin(instance_index) iid: u32,
 ) -> VertexOut {
@@ -275,8 +279,8 @@ fn link_vs(
     let perp = normalize(cross(view_dir, up));
     let perp_clip = u.view_proj * vec4f(perp, 0.0);
     let px_scale = length(perp_clip.xy * (0.5 * u.canvas_size));
-    var r0_px = LINK_HALF_WIDTH * px_scale / clip0.w;
-    var r1_px = LINK_HALF_WIDTH * px_scale / clip1.w;
+    var r0_px = HATCH_HALF_WIDTH * px_scale / clip0.w;
+    var r1_px = HATCH_HALF_WIDTH * px_scale / clip1.w;
 
     // 2D basis of the projected segment. A collapsed projection
     // (coincident endpoints or a view-parallel segment) falls back to
@@ -326,7 +330,7 @@ fn link_vs(
 }
 
 @fragment
-fn link_fs(in: VertexOut) -> @location(0) vec4f {
+fn hatch_fs(in: VertexOut) -> @location(0) vec4f {
     let dt = strokeDistance(in.frag_px, in.p0_px, in.p1_px);
     // The stroke radius tapers linearly with depth along the segment
     // body; the clamped closest-point parameter holds it constant
@@ -338,7 +342,7 @@ fn link_fs(in: VertexOut) -> @location(0) vec4f {
     if sdist > half_band {
         discard;
     }
-    let alpha = smoothstep(half_band, -half_band, sdist) * LINK_ALPHA;
-    return vec4f(LINK_COLOR, alpha);
+    let alpha = smoothstep(half_band, -half_band, sdist) * HATCH_ALPHA;
+    return vec4f(HATCH_COLOR, alpha);
 }
 `;
