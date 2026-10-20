@@ -13,7 +13,7 @@ import { type SceneBBox, SpatialGridPipeline } from "./stipple/spatial-grid-pipe
 import { TimeControls } from "./time-controls.js";
 import { createGpuContext, type GpuContext, syncCanvasSize } from "./webgpu.js";
 
-/** Background clear color — black. */
+/** Background clear color. */
 const CLEAR_COLOR: GPUColorDict = {
     r: 1,
     g: 1,

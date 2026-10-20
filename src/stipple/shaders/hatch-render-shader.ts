@@ -61,6 +61,15 @@
  * estimated crossing into the occluder's silhouette along the curve.
  * Before the hatch compute has ever dispatched, the zero-initialized
  * buffer's `.w = 0.0` culls everything.
+ *
+ * Each stroke carries its own ink color — a pure function of the point
+ * index `i`. Color and over-draw priority are both stable
+ * across frames without any depth machinery: the whole hatch render is
+ * a single instanced draw, and WebGPU rasterizes and blends primitives
+ * in (instance, vertex) order — at any overlapping pixel the higher
+ * instance index, i.e. the higher point index, always wins. That
+ * priority is arbitrary rather than depth-ordered. All sub-segments of
+ * one stroke share the point's color, so the welded joints stay seamless.
  */
 import { HATCH_N_SEGMENTS_HALF } from "./hatch-shader.js";
 
@@ -91,8 +100,36 @@ const STRIDE: u32 = N_SEGMENTS + 1u;
  */
 const HATCH_HALF_WIDTH: f32 = 0.003;
 
-/** Stroke color and base alpha (modulated by the AA edge in the fragment). */
-const HATCH_COLOR: vec3f = vec3f(0.0, 0.0, 0.0);
+/**
+ * Color palette, sampled by point index modulo its length. Point indices
+ * are spatially uncorrelated (rejection-sampled seeds), so the modulo
+ * assignment reads as random rather than as bands of consecutive
+ * colors.
+ */
+const N_COLORS: u32 = 14u;
+
+const PALETTE: array<vec3f, N_COLORS> = array<vec3f, N_COLORS>(
+    vec3f(0.03, 0.16, 0.31),  // Prussian blue
+    vec3f(0.03, 0.16, 0.31),  // Prussian blue
+    vec3f(0.03, 0.16, 0.31),  // Prussian blue
+
+    vec3f(0.14, 0.19, 0.38),  // Indigo ink
+    vec3f(0.14, 0.19, 0.38),  // Indigo ink
+    vec3f(0.14, 0.19, 0.38),  // Indigo ink
+    vec3f(0.14, 0.19, 0.38),  // Indigo ink
+
+    vec3f(0.07, 0.10, 0.17),  // Blue-black
+    vec3f(0.07, 0.10, 0.17),  // Blue-black
+
+    vec3f(0.16, 0.24, 0.35),  // Slate blue
+    vec3f(0.16, 0.24, 0.35),  // Slate blue
+    vec3f(0.16, 0.24, 0.35),  // Slate blue
+    
+    vec3f(0.36, 0.09, 0.10),  // Oxblood
+    vec3f(0.50, 0.14, 0.10),  // Muted vermilion
+);
+
+/** Base alpha (modulated by the AA edge in the fragment). */
 const HATCH_ALPHA: f32 = 1.0;
 
 /**
@@ -144,6 +181,8 @@ struct VertexOut {
     @location(2) @interpolate(flat) p1_px: vec2f,
     @location(3) @interpolate(flat) r0_px: f32,
     @location(4) @interpolate(flat) r1_px: f32,
+    // Per-stroke ink color, constant across the whole stroke.
+    @location(5) @interpolate(flat) color: vec3f,
 };
 
 // Two-triangle quad covering the projected segment. corner.x is the
@@ -168,6 +207,7 @@ fn offscreen() -> VertexOut {
     out.p1_px = vec2f(0.0);
     out.r0_px = 0.0;
     out.r1_px = 0.0;
+    out.color = vec3f(0.0);
     return out;
 }
 
@@ -326,6 +366,7 @@ fn hatch_vs(
     out.p1_px = px1;
     out.r0_px = r0_px;
     out.r1_px = r1_px;
+    out.color = PALETTE[i % N_COLORS];
     return out;
 }
 
@@ -343,6 +384,6 @@ fn hatch_fs(in: VertexOut) -> @location(0) vec4f {
         discard;
     }
     let alpha = smoothstep(half_band, -half_band, sdist) * HATCH_ALPHA;
-    return vec4f(HATCH_COLOR, alpha);
+    return vec4f(in.color, alpha);
 }
 `;
