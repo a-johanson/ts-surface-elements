@@ -21,12 +21,17 @@
  *     `.w`). Arms that hit a direction degeneracy get a zero direction
  *     and walk nowhere — their remaining slots all hold the same
  *     standing point, so every slot always holds a real surface point.
+ *     The pass also writes each stroke point's surface normal into
+ *     {@link HatchPipeline.hatchCurveNormals} — the center slot gets
+ *     the stipple point's own normal from the shared normals buffer,
+ *     grown points get the fresh surface normals that steered the walk.
  *  2. **Clearance** (`hatch_clearance_cs`) — one invocation per point,
  *     recorded by {@link dispatchClearance} as its own compute pass
  *     every frame. It traces one `rayClearance` per stroke point toward
- *     the eye, with each stroke point's local stroke spacing as the
- *     clearance threshold — writing the clearance into the `.w`
- *     component. Occlusion is view-dependent, so the traces must
+ *     the eye, with each stroke point's surface normal taken from
+ *     {@link HatchPipeline.hatchCurveNormals} and its local stroke
+ *     spacing as the clearance threshold — writing the clearance into
+ *     the `.w` component. Occlusion is view-dependent, so the traces must
  *     refresh even on paused frames — that is what keeps the hatch
  *     render's culling and soft fade tracking the camera while the
  *     stroke geometry is frozen.
@@ -69,7 +74,7 @@ const CURVE_POINT_BYTES = 16;
 
 /**
  * Manages the hatch compute pipeline, its params uniform, the stroke
- * output buffer, and the bind groups.
+ * output buffers, and the bind groups.
  */
 export class HatchPipeline {
     private readonly device: GPUDevice;
@@ -87,6 +92,17 @@ export class HatchPipeline {
      * dispatched (e.g. paused at startup).
      */
     public readonly hatchCurves: GPUBuffer;
+
+    /**
+     * Per-stroke-point surface normals, slot-aligned with
+     * {@link hatchCurves}: one `vec4f` per stroke point — `.xyz` the
+     * surface normal, `.w` unused. Written by the growth stage on
+     * playing frames; read by the clearance stage every frame.
+     * Zero-initialized, so before the first growth dispatch every
+     * normal is zero and the clearance stage's back-face guard
+     * deterministically culls every slot.
+     */
+    private readonly hatchCurveNormals: GPUBuffer;
 
     private readonly pipeline: GPUComputePipeline;
     private readonly layout: GPUBindGroupLayout;
@@ -108,9 +124,15 @@ export class HatchPipeline {
         this.device = device;
         this.points = points;
 
+        const curveBytes = points.count * HATCH_CURVE_STRIDE * CURVE_POINT_BYTES;
         this.hatchCurves = device.createBuffer({
             label: "stipple-hatch-curves",
-            size: points.count * HATCH_CURVE_STRIDE * CURVE_POINT_BYTES,
+            size: curveBytes,
+            usage: GPUBufferUsage.STORAGE,
+        });
+        this.hatchCurveNormals = device.createBuffer({
+            label: "stipple-hatch-curve-normals",
+            size: curveBytes,
             usage: GPUBufferUsage.STORAGE,
         });
 
@@ -153,6 +175,7 @@ export class HatchPipeline {
                 { binding: 1, resource: { buffer: points.bufferA } },
                 { binding: 2, resource: { buffer: points.normalsBuffer } },
                 { binding: 3, resource: { buffer: this.hatchCurves } },
+                { binding: 4, resource: { buffer: this.hatchCurveNormals } },
             ],
         });
         this.bindGroupB = device.createBindGroup({
@@ -163,22 +186,25 @@ export class HatchPipeline {
                 { binding: 1, resource: { buffer: points.bufferB } },
                 { binding: 2, resource: { buffer: points.normalsBuffer } },
                 { binding: 3, resource: { buffer: this.hatchCurves } },
+                { binding: 4, resource: { buffer: this.hatchCurveNormals } },
             ],
         });
 
-        // The clearance stage reads only shared (non-ping-ponged)
-        // buffers — normals and curves — plus the params uniform, so a
-        // single static bind group covers it. It does not read a point
-        // buffer at all: stroke positions come from the stroke buffer
-        // itself. Its derived layout omits the growth stage's points_in
-        // binding, which the clearance entry point does not use.
+        // The clearance stage reads only the growth stage's outputs —
+        // stroke points and their per-slot surface normals — plus the
+        // params uniform, so a single static bind group covers it. It
+        // reads no ping-ponged point buffer and not the shared normals
+        // buffer either: the growth stage snapshots the stipple point's
+        // own normal into the slot-normals buffer. Its derived layout
+        // omits the growth stage's points_in and normals_in bindings,
+        // which the clearance entry point does not use.
         this.clearanceBindGroup = device.createBindGroup({
             label: "stipple-hatch-clearance-bind",
             layout: clearanceLayout,
             entries: [
                 { binding: 0, resource: { buffer: this.paramsBuffer } },
-                { binding: 2, resource: { buffer: points.normalsBuffer } },
                 { binding: 3, resource: { buffer: this.hatchCurves } },
+                { binding: 4, resource: { buffer: this.hatchCurveNormals } },
             ],
         });
     }
@@ -213,7 +239,9 @@ export class HatchPipeline {
      * Reads one point buffer (depending on `readFromA`) — the buffer
      * relax most recently wrote — plus the shared normals buffer, and
      * writes the surface-projected stroke points (with a validity
-     * placeholder in `.w`) into the shared stroke buffer. Should be
+     * placeholder in `.w`) into the shared stroke buffer, along with
+     * each stroke point's surface normal into the shared slot-normals
+     * buffer. Should be
      * called after the normals-refresh pass (which refreshes the
      * normals buffer from the post-relax positions), before
      * {@link dispatchClearance}, and only on frames where the
@@ -251,9 +279,9 @@ export class HatchPipeline {
      * Records the hatch clearance stage into the given command encoder
      * as its own single-dispatch compute pass. Per point it traces one
      * `rayClearance` per stroke point toward the eye — biased origin,
-     * back-face guard, and the center slot's normal taken from the
-     * shared normals buffer — writing the clearance into the stroke
-     * buffer's `.w` fields.
+     * back-face guard, and each stroke point's surface normal taken
+     * from the slot-normals buffer the growth stage wrote — writing
+     * the clearance into the stroke buffer's `.w` fields.
      *
      * Runs every frame — including while time is paused — because the
      * clearance is view-dependent: on paused frames it refreshes the

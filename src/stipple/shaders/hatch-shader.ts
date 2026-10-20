@@ -34,14 +34,21 @@
  *     the degeneracy, so recomputing it at each step orients the march
  *     without sign-continuity bookkeeping.
  *
- *     Every slot is rewritten each playing frame — the buffer persists
- *     across frames and keeps rendering while time is paused.
+ *     The pass also fills a parallel slot-normals buffer, slot-aligned
+ *     with the stroke buffer: the center slot gets the stipple point's
+ *     own normal from the shared normals buffer, and each grown point
+ *     gets the fresh surface normal the walk computed there — the
+ *     clearance stage consumes those same normals instead of
+ *     re-deriving them. Every slot of both buffers is rewritten each
+ *     playing frame, and the stroke keeps rendering while time is
+ *     paused.
  *
  *  2. `hatch_clearance_cs` — one invocation per point, dispatched every
  *     frame (view-dependent). Traces one `rayClearance` per stroke point
- *     toward the eye — origin biased along the surface normal,
- *     back-facing points short-circuited to an explicitly occluded
- *     value — and writes the clearance into the slot's `.w`, replacing
+ *     toward the eye — origin biased along the slot's surface normal
+ *     from the slot-normals buffer, back-facing points short-circuited
+ *     to an explicitly occluded value — and writes the clearance into
+ *     the slot's `.w`, replacing
  *     the validity placeholder (> 0 visible, < 0 occluded). Each stroke
  *     point's clearance threshold is its local stroke spacing (the
  *     longest adjacent sub-segment length, floored at `PROBE_STEP`), so
@@ -115,6 +122,7 @@ const STRIDE: u32 = 2u * N_SEGMENTS_HALF + 1u;
 @group(0) @binding(1) var<storage, read> points_in: array<Point>;
 @group(0) @binding(2) var<storage, read> normals_in: array<vec4f>;
 @group(0) @binding(3) var<storage, read_write> curves_out: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> curve_normals: array<vec4f>;
 
 /**
  * The principal direction at a surface point: the unit vector in the
@@ -165,13 +173,13 @@ fn hatch_cs(@builtin(global_invocation_id) gid: vec3u) {
     let L = lightDir(params.time);
 
     curves_out[base + N_SEGMENTS_HALF] = vec4f(p0, 1.0);
+    curve_normals[base + N_SEGMENTS_HALF] = vec4f(n0, 0.0);
 
-    var k: u32 = 1u;
     var pF = p0;
     var pB = p0;
     var nF = n0;
     var nB = n0;
-    loop {
+    for (var k: u32 = 1u; k <= N_SEGMENTS_HALF; k += 1u) {
         let dirF = principalDir(pF, nF, L);
         let dirB = -principalDir(pB, nB, L);
         pF = projectToSurface(pF + HATCH_STEP_SIZE * dirF, params.time,
@@ -180,12 +188,10 @@ fn hatch_cs(@builtin(global_invocation_id) gid: vec3u) {
                               HATCH_NEWTON_ITERS, HATCH_NEWTON_ALPHA);
         curves_out[base + N_SEGMENTS_HALF + k] = vec4f(pF, 1.0);
         curves_out[base + N_SEGMENTS_HALF - k] = vec4f(pB, 1.0);
-        if (k >= N_SEGMENTS_HALF) {
-            break;
-        }
         nF = calcNormal(pF, params.time);
         nB = calcNormal(pB, params.time);
-        k += 1u;
+        curve_normals[base + N_SEGMENTS_HALF + k] = vec4f(nF, 0.0);
+        curve_normals[base + N_SEGMENTS_HALF - k] = vec4f(nB, 0.0);
     }
 }
 
@@ -199,16 +205,7 @@ fn hatch_clearance_cs(@builtin(global_invocation_id) gid: vec3u) {
     let base = i * STRIDE;
     for (var k: u32 = 0u; k < STRIDE; k = k + 1u) {
         let p = curves_out[base + k].xyz;
-        // The center slot is the stipple point itself: reuse its stored
-        // normal from the shared normals buffer (it matches the buffer
-        // relax most recently wrote). All other slots get a fresh
-        // surface normal.
-        var n: vec3f;
-        if (k == N_SEGMENTS_HALF) {
-            n = normals_in[i].xyz;
-        } else {
-            n = calcNormal(p, params.time);
-        }
+        let n = curve_normals[base + k].xyz;
         // Clearance threshold: the local stroke spacing — the longest of
         // the adjacent sub-segments (single neighbor at the stroke ends),
         // so the trace's origin ignore-band covers the stroke's own
