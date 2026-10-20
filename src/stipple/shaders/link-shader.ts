@@ -129,7 +129,7 @@ struct GridParams {
 
 const UINT_MAX: u32 = 0xFFFFFFFFu;
 
-const DISTANCE_WEIGHT: f32 = 1.5;
+const DISTANCE_WEIGHT: f32 = 0.85;
 const LINK_RADIUS: f32 = 0.3;
 
 /**
