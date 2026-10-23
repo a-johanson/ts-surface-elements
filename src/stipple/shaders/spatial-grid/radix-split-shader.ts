@@ -2,7 +2,7 @@
  * Radix-split compute shader — the core primitive of the single-workgroup
  * binary radix sort (Step 4).
  *
- * One workgroup of `SUBGROUP_WORKGROUP_SIZE` (256) invocations, each owning
+ * One workgroup of `RADIX_WORKGROUP_SIZE` (256) invocations, each owning
  * `ELEMENTS_PER_THREAD = ceil(POINT_COUNT / 256)` contiguous elements. For a
  * single binary split at bit position `b` (passed via the `RadixBitParams`
  * uniform), the shader computes a stable partition: all elements whose key
@@ -44,7 +44,7 @@
  * alternating the A/B bind group; 32 is even so the sorted result lands back
  * in the A pair.
  */
-import { SUBGROUP_COMMON, SUBGROUP_WORKGROUP_SIZE } from "../subgroup-common.js";
+import { RADIX_WORKGROUP_SIZE, WORKGROUP_COMMON } from "../workgroup-common.js";
 
 /**
  * Builds the radix-split compute shader for a given point count.
@@ -52,14 +52,14 @@ import { SUBGROUP_COMMON, SUBGROUP_WORKGROUP_SIZE } from "../subgroup-common.js"
  * @param pointCount - The total number of points (keys/values). Elements with
  *   `g >= pointCount` are no-ops, so non-multiples of 256 are handled.
  * @param elementsPerThread - Elements owned per thread =
- *   `ceil(pointCount / SUBGROUP_WORKGROUP_SIZE)`. Sized exactly so per-thread
+ *   `ceil(pointCount / RADIX_WORKGROUP_SIZE)`. Sized exactly so per-thread
  *   local arrays have no waste.
- * @returns The WGSL source string, with `SUBGROUP_COMMON`,
+ * @returns The WGSL source string, with `WORKGROUP_COMMON`,
  *   `POINT_COUNT`, and `ELEMENTS_PER_THREAD` interpolated.
  */
 export function buildRadixSplitShader(pointCount: number, elementsPerThread: number): string {
     return /* wgsl */ `
-${SUBGROUP_COMMON}
+${WORKGROUP_COMMON}
 
 const POINT_COUNT: u32 = ${pointCount}u;
 const ELEMENTS_PER_THREAD: u32 = ${elementsPerThread}u;
@@ -79,13 +79,9 @@ struct RadixBitParams {
 
 var<workgroup> w_total_zeros: u32;
 
-@compute @workgroup_size(${SUBGROUP_WORKGROUP_SIZE})
+@compute @workgroup_size(${RADIX_WORKGROUP_SIZE})
 fn radix_split_cs(
     @builtin(local_invocation_index) local_index: u32,
-    @builtin(subgroup_invocation_id) sub_id: u32,
-    @builtin(subgroup_size) sub_size: u32,
-    @builtin(subgroup_id) sub_gid: u32,
-    @builtin(num_subgroups) num_subs: u32,
 ) {
     var local_keys: array<u32, ELEMENTS_PER_THREAD>;
     var local_values: array<u32, ELEMENTS_PER_THREAD>;
@@ -110,9 +106,7 @@ fn radix_split_cs(
     }
     let thread_total = running;
 
-    let thread_excl = workgroupExclusiveScanU32(
-        thread_total, sub_id, sub_size, sub_gid, num_subs, local_index,
-    );
+    let thread_excl = workgroupExclusiveScanU32(thread_total, local_index);
 
     if (local_index == WORKGROUP_SIZE - 1u) {
         w_total_zeros = thread_excl + thread_total;

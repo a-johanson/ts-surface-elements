@@ -9,4 +9,4 @@ export { SHADING_SHADER } from "./shading-shader.js";
 export { CELL_INDEX_SHADER } from "./spatial-grid/cell-index-shader.js";
 export { CELL_RANGES_SHADER } from "./spatial-grid/cell-ranges-shader.js";
 export { buildRadixSplitShader } from "./spatial-grid/radix-split-shader.js";
-export { SUBGROUP_COMMON } from "./subgroup-common.js";
+export { WORKGROUP_COMMON } from "./workgroup-common.js";

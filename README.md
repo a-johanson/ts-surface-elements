@@ -2,7 +2,7 @@
 
 Render textures on the surface of organic shapes using WebGPU.
 
-View a live version [on GitHub Pages](https://a-johanson.github.io/ts-surface-elements/). Note that this project requires WebGPU's `subgroups` feature, which is currently only available in Chromium-based browsers.
+View a live version [on GitHub Pages](https://a-johanson.github.io/ts-surface-elements/).
 
 ## Method
 

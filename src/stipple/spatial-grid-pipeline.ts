@@ -25,7 +25,7 @@ import {
     CELL_INDEX_SHADER,
     CELL_RANGES_SHADER,
 } from "./shaders/index.js";
-import { SUBGROUP_WORKGROUP_SIZE } from "./shaders/subgroup-common.js";
+import { RADIX_WORKGROUP_SIZE } from "./shaders/workgroup-common.js";
 
 /** Workgroup size — must match `@workgroup_size(64)` in the WGSL. */
 const WORKGROUP_SIZE = 64;
@@ -315,10 +315,10 @@ export class SpatialGridPipeline {
         });
         device.queue.writeBuffer(this.radixBitParamsBuffer, 0, radixParamsData);
 
-        const elementsPerThread = Math.ceil(this.pointCount / SUBGROUP_WORKGROUP_SIZE);
-        if (this.pointCount < SUBGROUP_WORKGROUP_SIZE) {
+        const elementsPerThread = Math.ceil(this.pointCount / RADIX_WORKGROUP_SIZE);
+        if (this.pointCount < RADIX_WORKGROUP_SIZE) {
             throw new Error(
-                `Spatial grid radix sort requires pointCount >= ${SUBGROUP_WORKGROUP_SIZE} ` +
+                `Spatial grid radix sort requires pointCount >= ${RADIX_WORKGROUP_SIZE} ` +
                     `(got ${this.pointCount}). The sort runs as a single workgroup; ` +
                     `fewer points would leave threads idle with no owned elements.`,
             );
