@@ -1,10 +1,12 @@
 /**
- * Mouse- and keyboard-driven orbit camera controls.
+ * Mouse-, touch-, and keyboard-driven orbit camera controls.
  *
- * Left-button drag orbits the camera around an adjustable target point
- * using spherical coordinates (azimuth + elevation). Mouse wheel adjusts
- * the orbit radius (zoom). Holding W/S moves the target point along the
- * view heading projected onto the ground plane, A/D strafes it left and
+ * Left-button drag or a one-finger drag orbits the camera around an
+ * adjustable target point using spherical coordinates (azimuth +
+ * elevation). Mouse wheel and two-finger pinch adjust the orbit radius
+ * (zoom), and a two-finger drag pans the target point in the camera's
+ * screen plane. Holding W/S moves the target point along the view
+ * heading projected onto the ground plane, A/D strafes it left and
  * right, and Q/E moves it along the world y axis. Right-click is left
  * untouched so the browser context menu remains available.
  *
@@ -31,6 +33,15 @@ const ROTATE_SENSITIVITY = 0.0025;
 
 /** Radius delta per pixel of wheel scroll. */
 const ZOOM_SENSITIVITY = 0.005;
+
+/** Radius delta per pixel of two-finger pinch distance change. */
+const PINCH_ZOOM_SENSITIVITY = 0.01;
+
+/**
+ * World units of target movement per pixel of two-finger pan, scaled by
+ * the orbit radius so pan speed matches the current zoom level.
+ */
+const PAN_SENSITIVITY = 0.0015;
 
 /** Minimum orbit radius — prevents clipping into the scene. */
 const MIN_RADIUS = 3;
@@ -68,11 +79,12 @@ const TARGET_MAX: readonly [number, number, number] = [3, 3, 3];
 
 /**
  * Maintains spherical camera state and the adjustable target point, and
- * processes mouse and keyboard input to update them.
+ * processes mouse, touch, and keyboard input to update them.
  *
- * Listens to `pointerdown`, `pointermove`, `pointerup`, and `wheel`
- * events on the canvas, and to `keydown`, `keyup`, and `blur` events on
- * the window. Call {@link dispose} to remove all listeners.
+ * Listens to `pointerdown`, `pointermove`, `pointerup`, `pointercancel`,
+ * and `wheel` events on the canvas, and to `keydown`, `keyup`, and
+ * `blur` events on the window. Call {@link dispose} to remove all
+ * listeners.
  */
 export class OrbitControls {
     private readonly canvas: HTMLCanvasElement;
@@ -81,13 +93,15 @@ export class OrbitControls {
     private radius: number;
     private target: [number, number, number];
     private readonly heldTargetKeys: Set<string> = new Set();
-    private dragging: boolean = false;
-    private lastX: number = 0;
-    private lastY: number = 0;
+    /** Active pointers by ID, in the order they went down. */
+    private readonly activePointers: Map<number, { x: number; y: number }> = new Map();
+    private prevPinchDist: number = 0;
+    private prevPinchMidX: number = 0;
+    private prevPinchMidY: number = 0;
 
     private readonly onPointerDown: (e: PointerEvent) => void;
     private readonly onPointerMove: (e: PointerEvent) => void;
-    private readonly onPointerUp: (e: PointerEvent) => void;
+    private readonly onPointerEnd: (e: PointerEvent) => void;
     private readonly onWheel: (e: WheelEvent) => void;
     private readonly onKeyDown: (e: KeyboardEvent) => void;
     private readonly onKeyUp: (e: KeyboardEvent) => void;
@@ -97,7 +111,7 @@ export class OrbitControls {
      * Creates the controls and attaches event listeners to the canvas
      * and the window.
      *
-     * @param canvas - The canvas element to capture mouse input on.
+     * @param canvas - The canvas element to capture pointer input on.
      * @param state - Initial spherical state and target point.
      */
     public constructor(canvas: HTMLCanvasElement, state: OrbitState) {
@@ -108,34 +122,41 @@ export class OrbitControls {
         this.target = [...state.target];
 
         this.onPointerDown = (e: PointerEvent): void => {
-            if (e.button !== 0) {
+            if (e.pointerType === "mouse" && e.button !== 0) {
                 return;
             }
-            this.dragging = true;
-            this.lastX = e.clientX;
-            this.lastY = e.clientY;
+            this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            if (this.activePointers.size === 2) {
+                this.beginPinch();
+            }
             this.canvas.setPointerCapture(e.pointerId);
         };
 
         this.onPointerMove = (e: PointerEvent): void => {
-            if (!this.dragging) {
+            const point = this.activePointers.get(e.pointerId);
+            if (!point) {
                 return;
             }
-            const dx = e.clientX - this.lastX;
-            const dy = e.clientY - this.lastY;
-            this.lastX = e.clientX;
-            this.lastY = e.clientY;
-
-            this.azimuth -= dx * ROTATE_SENSITIVITY;
-            this.elevation += dy * ROTATE_SENSITIVITY;
-            this.elevation = Math.max(-MAX_ELEVATION, Math.min(MAX_ELEVATION, this.elevation));
+            if (this.activePointers.size === 1) {
+                const dx = e.clientX - point.x;
+                const dy = e.clientY - point.y;
+                point.x = e.clientX;
+                point.y = e.clientY;
+                this.rotate(dx, dy);
+            } else {
+                point.x = e.clientX;
+                point.y = e.clientY;
+                this.pinchAndPan();
+            }
         };
 
-        this.onPointerUp = (e: PointerEvent): void => {
-            if (e.button !== 0) {
+        this.onPointerEnd = (e: PointerEvent): void => {
+            if (e.pointerType === "mouse" && e.button !== 0) {
                 return;
             }
-            this.dragging = false;
+            if (!this.activePointers.delete(e.pointerId)) {
+                return;
+            }
             this.canvas.releasePointerCapture(e.pointerId);
         };
 
@@ -164,7 +185,8 @@ export class OrbitControls {
 
         canvas.addEventListener("pointerdown", this.onPointerDown);
         canvas.addEventListener("pointermove", this.onPointerMove);
-        canvas.addEventListener("pointerup", this.onPointerUp);
+        canvas.addEventListener("pointerup", this.onPointerEnd);
+        canvas.addEventListener("pointercancel", this.onPointerEnd);
         canvas.addEventListener("wheel", this.onWheel, { passive: false });
         window.addEventListener("keydown", this.onKeyDown);
         window.addEventListener("keyup", this.onKeyUp);
@@ -219,18 +241,10 @@ export class OrbitControls {
         const moveY = up * step;
         const moveZ = (forward * forwardZ + right * rightZ) * step;
 
-        this.target[0] = Math.max(
-            TARGET_MIN[0],
-            Math.min(TARGET_MAX[0], this.target[0] + moveX),
-        );
-        this.target[1] = Math.max(
-            TARGET_MIN[1],
-            Math.min(TARGET_MAX[1], this.target[1] + moveY),
-        );
-        this.target[2] = Math.max(
-            TARGET_MIN[2],
-            Math.min(TARGET_MAX[2], this.target[2] + moveZ),
-        );
+        this.target[0] += moveX;
+        this.target[1] += moveY;
+        this.target[2] += moveZ;
+        this.clampTarget();
     }
 
     /**
@@ -265,10 +279,83 @@ export class OrbitControls {
     public dispose(): void {
         this.canvas.removeEventListener("pointerdown", this.onPointerDown);
         this.canvas.removeEventListener("pointermove", this.onPointerMove);
-        this.canvas.removeEventListener("pointerup", this.onPointerUp);
+        this.canvas.removeEventListener("pointerup", this.onPointerEnd);
+        this.canvas.removeEventListener("pointercancel", this.onPointerEnd);
         this.canvas.removeEventListener("wheel", this.onWheel);
         window.removeEventListener("keydown", this.onKeyDown);
         window.removeEventListener("keyup", this.onKeyUp);
         window.removeEventListener("blur", this.onBlur);
+    }
+
+    /** Applies an orbit rotation from a single-pointer drag delta. */
+    private rotate(dx: number, dy: number): void {
+        this.azimuth -= dx * ROTATE_SENSITIVITY;
+        this.elevation += dy * ROTATE_SENSITIVITY;
+        this.elevation = Math.max(-MAX_ELEVATION, Math.min(MAX_ELEVATION, this.elevation));
+    }
+
+    /** Records the pinch geometry when the second pointer goes down. */
+    private beginPinch(): void {
+        const [first, second] = this.activePointers.values();
+        this.prevPinchDist = Math.hypot(second.x - first.x, second.y - first.y);
+        this.prevPinchMidX = (first.x + second.x) * 0.5;
+        this.prevPinchMidY = (first.y + second.y) * 0.5;
+    }
+
+    /** Applies pinch zoom and two-finger pan from the current pointer geometry. */
+    private pinchAndPan(): void {
+        const [first, second] = this.activePointers.values();
+        const dist = Math.hypot(second.x - first.x, second.y - first.y);
+        const midX = (first.x + second.x) * 0.5;
+        const midY = (first.y + second.y) * 0.5;
+
+        this.radius = Math.max(
+            MIN_RADIUS,
+            Math.min(
+                MAX_RADIUS,
+                this.radius + (dist - this.prevPinchDist) * PINCH_ZOOM_SENSITIVITY,
+            ),
+        );
+        this.panTarget(midX - this.prevPinchMidX, midY - this.prevPinchMidY);
+
+        this.prevPinchDist = dist;
+        this.prevPinchMidX = midX;
+        this.prevPinchMidY = midY;
+    }
+
+    /**
+     * Moves the target point so the scene follows a two-finger pan by
+     * (`dx`, `dy`) pixels, expressed in the camera's screen-space basis
+     * and scaled by the orbit radius so pan speed matches the current
+     * zoom level.
+     */
+    private panTarget(dx: number, dy: number): void {
+        const scale = PAN_SENSITIVITY * this.radius;
+        const sinAzimuth = Math.sin(this.azimuth);
+        const cosAzimuth = Math.cos(this.azimuth);
+        const sinElevation = Math.sin(this.elevation);
+        const cosElevation = Math.cos(this.elevation);
+
+        // Screen-space basis: the ground-plane right vector and the
+        // screen-up vector perpendicular to the view direction, which
+        // accounts for elevation and stays well-defined everywhere
+        // elevation is clamped away from exactly ±π/2.
+        const rightX = cosAzimuth;
+        const rightZ = -sinAzimuth;
+        const upX = -sinAzimuth * sinElevation;
+        const upY = cosElevation;
+        const upZ = -cosAzimuth * sinElevation;
+
+        this.target[0] += (-dx * rightX + dy * upX) * scale;
+        this.target[1] += dy * upY * scale;
+        this.target[2] += (-dx * rightZ + dy * upZ) * scale;
+        this.clampTarget();
+    }
+
+    /** Clamps the target point to its per-axis bounded range. */
+    private clampTarget(): void {
+        this.target[0] = Math.max(TARGET_MIN[0], Math.min(TARGET_MAX[0], this.target[0]));
+        this.target[1] = Math.max(TARGET_MIN[1], Math.min(TARGET_MAX[1], this.target[1]));
+        this.target[2] = Math.max(TARGET_MIN[2], Math.min(TARGET_MAX[2], this.target[2]));
     }
 }
