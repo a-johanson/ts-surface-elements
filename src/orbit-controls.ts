@@ -29,19 +29,19 @@ export interface OrbitState {
 }
 
 /** Radians of rotation per pixel of drag. */
-const ROTATE_SENSITIVITY = 0.0025;
+const ROTATE_SENSITIVITY = 0.0035;
 
 /** Radius delta per pixel of wheel scroll. */
 const ZOOM_SENSITIVITY = 0.005;
 
 /** Radius delta per pixel of two-finger pinch distance change. */
-const PINCH_ZOOM_SENSITIVITY = 0.01;
+const PINCH_ZOOM_SENSITIVITY = 0.02;
 
 /**
  * World units of target movement per pixel of two-finger pan, scaled by
  * the orbit radius so pan speed matches the current zoom level.
  */
-const PAN_SENSITIVITY = 0.0015;
+const PAN_SENSITIVITY = 0.001;
 
 /** Minimum orbit radius — prevents clipping into the scene. */
 const MIN_RADIUS = 3;
@@ -313,7 +313,7 @@ export class OrbitControls {
             MIN_RADIUS,
             Math.min(
                 MAX_RADIUS,
-                this.radius + (dist - this.prevPinchDist) * PINCH_ZOOM_SENSITIVITY,
+                this.radius + (this.prevPinchDist - dist) * PINCH_ZOOM_SENSITIVITY,
             ),
         );
         this.panTarget(midX - this.prevPinchMidX, midY - this.prevPinchMidY);
