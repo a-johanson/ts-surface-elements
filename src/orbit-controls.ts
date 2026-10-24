@@ -3,9 +3,10 @@
  *
  * Left-button drag orbits the camera around an adjustable target point
  * using spherical coordinates (azimuth + elevation). Mouse wheel adjusts
- * the orbit radius (zoom). Holding A/D, W/S, or Q/E moves the target
- * point along the world x, z, and y axes. Right-click is left untouched
- * so the browser context menu remains available.
+ * the orbit radius (zoom). Holding W/S moves the target point along the
+ * view heading projected onto the ground plane, A/D strafes it left and
+ * right, and Q/E moves it along the world y axis. Right-click is left
+ * untouched so the browser context menu remains available.
  *
  * The controls are passive — they only maintain spherical and target
  * state. The caller is responsible for invoking {@link update} each
@@ -41,17 +42,19 @@ const MAX_RADIUS = 30;
 const MAX_ELEVATION = Math.PI / 2 - 0.01;
 
 /**
- * World-space unit direction the target moves per held physical key:
- * A/D along x, W/S along z (W pushes the target away from the viewer at
- * the default azimuth), and Q/E along y.
+ * Movement weights per held physical key, expressed in the view-relative
+ * basis as [forward, right, up]: W/S move along the view heading
+ * projected onto the ground plane, A/D strafe left and right, and Q/E
+ * move along the world y axis. The basis is resolved against the current
+ * azimuth each time {@link OrbitControls.update} runs.
  */
 const TARGET_KEYS: Readonly<Record<string, readonly [number, number, number]>> = {
-    KeyA: [-1, 0, 0],
-    KeyD: [1, 0, 0],
-    KeyW: [0, 0, -1],
-    KeyS: [0, 0, 1],
-    KeyQ: [0, -1, 0],
-    KeyE: [0, 1, 0],
+    KeyW: [1, 0, 0],
+    KeyS: [-1, 0, 0],
+    KeyA: [0, -1, 0],
+    KeyD: [0, 1, 0],
+    KeyQ: [0, 0, -1],
+    KeyE: [0, 0, 1],
 };
 
 /** Target movement speed, in world units per second. */
@@ -171,39 +174,62 @@ export class OrbitControls {
     /**
      * Advances held-key target movement over the elapsed frame time.
      *
-     * While A/D, W/S, or Q/E is held, the target moves along the world
-     * x, z, or y axis at a fixed speed, clamped to a per-axis bounded
-     * range. Call once per frame, before reading {@link getEye}
-     * or {@link getTarget}.
+     * While W/S or A/D is held, the target moves along (or perpendicular
+     * to) the view heading on the ground plane; while Q/E is held, it
+     * moves along the world y axis. The combined movement direction is
+     * normalized to a fixed speed and clamped to a per-axis bounded
+     * range; no movement is applied when no keys are held or the held
+     * keys cancel out. Call once per frame, before reading
+     * {@link getEye} or {@link getTarget}.
      *
      * @param dt - Elapsed wall-clock time in seconds.
      */
     public update(dt: number): void {
-        let dx = 0;
-        let dy = 0;
-        let dz = 0;
+        let forward = 0;
+        let right = 0;
+        let up = 0;
         for (const code of this.heldTargetKeys) {
-            const direction = TARGET_KEYS[code];
-            dx += direction[0];
-            dy += direction[1];
-            dz += direction[2];
-        }
-        if (dx === 0 && dy === 0 && dz === 0) {
-            return;
+            const weight = TARGET_KEYS[code];
+            forward += weight[0];
+            right += weight[1];
+            up += weight[2];
         }
 
-        const step = TARGET_MOVE_SPEED * dt;
+        // Normalize for constant speed in every direction. The length is
+        // zero when nothing is held or the held keys cancel out (e.g. W
+        // and S together), in which case there is nothing to move.
+        const inputLength = Math.hypot(forward, right, up);
+        if (inputLength === 0) {
+            return;
+        }
+        const step = (TARGET_MOVE_SPEED * dt) / inputLength;
+
+        // Ground-plane view basis from the current azimuth alone:
+        // independent of elevation, so the heading never degenerates
+        // when looking straight down. Forward points from the eye toward
+        // the target, projected onto the xz-plane.
+        const sinAzimuth = Math.sin(this.azimuth);
+        const cosAzimuth = Math.cos(this.azimuth);
+        const forwardX = -sinAzimuth;
+        const forwardZ = -cosAzimuth;
+        const rightX = cosAzimuth;
+        const rightZ = -sinAzimuth;
+
+        const moveX = (forward * forwardX + right * rightX) * step;
+        const moveY = up * step;
+        const moveZ = (forward * forwardZ + right * rightZ) * step;
+
         this.target[0] = Math.max(
             TARGET_MIN[0],
-            Math.min(TARGET_MAX[0], this.target[0] + dx * step),
+            Math.min(TARGET_MAX[0], this.target[0] + moveX),
         );
         this.target[1] = Math.max(
             TARGET_MIN[1],
-            Math.min(TARGET_MAX[1], this.target[1] + dy * step),
+            Math.min(TARGET_MAX[1], this.target[1] + moveY),
         );
         this.target[2] = Math.max(
             TARGET_MIN[2],
-            Math.min(TARGET_MAX[2], this.target[2] + dz * step),
+            Math.min(TARGET_MAX[2], this.target[2] + moveZ),
         );
     }
 
