@@ -41,7 +41,7 @@ export class DebugRenderPipeline {
         this.config = config;
 
         const shaderModule = device.createShaderModule({
-            label: "stipple-debug-render-shader",
+            label: "debug-render-shader",
             code: DEBUG_RENDER_SHADER,
         });
 
@@ -63,14 +63,14 @@ export class DebugRenderPipeline {
         });
 
         this.cameraBuffer = device.createBuffer({
-            label: "stipple-debug-camera",
+            label: "debug-camera",
             size: CAMERA_BUFFER_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
         const layout = this.pipeline.getBindGroupLayout(0);
         this.bindGroup = device.createBindGroup({
-            label: "stipple-debug-render-bind",
+            label: "debug-render-bind",
             layout,
             entries: [{ binding: 0, resource: { buffer: this.cameraBuffer } }],
         });

@@ -88,7 +88,7 @@ struct TangentFrame {
 const PI = radians(180.0);
 const TAU = radians(360.0);
 
-const SURF_EPS: f32 = 0.001;
+const SURF_EPS: f32 = 0.00001;
 const PROBE_STEP: f32 = 5.0 * SURF_EPS;
 
 const RAYMARCH_MAX_DIST: f32 = 50.0;
