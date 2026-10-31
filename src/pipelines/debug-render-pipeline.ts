@@ -13,19 +13,11 @@
  * it aligns with the ray-marched view.
  */
 
-import { viewProjection } from "./camera.js";
-import type { CameraConfig } from "./point-render-pipeline.js";
-import { BBOX_WIREFRAME_SHADER, DEBUG_RENDER_SHADER } from "./shaders/index.js";
-import type { SceneBBox } from "./spatial-grid-pipeline.js";
+import type { CameraConfig } from "./camera.js";
+import { DEBUG_RENDER_SHADER } from "./shaders/debug-render-shader.js";
 
 /** Camera uniform buffer size in bytes (5 × 16-byte aligned members = 80). */
 const CAMERA_BUFFER_BYTES = 80;
-
-/**
- * Bounding-box wireframe uniform buffer size in bytes: `mat4x4f` (64) plus
- * two `vec3f` + pad slots (2 × 16) = 96.
- */
-const BBOX_BUFFER_BYTES = 96;
 
 /**
  * Manages the debug render pipeline and the `CameraRays` uniform.
@@ -38,13 +30,9 @@ const BBOX_BUFFER_BYTES = 96;
 export class DebugRenderPipeline {
     private readonly device: GPUDevice;
     private readonly pipeline: GPURenderPipeline;
-    private readonly bboxPipeline: GPURenderPipeline;
     private readonly cameraBuffer: GPUBuffer;
-    private readonly bboxBuffer: GPUBuffer;
     private readonly bindGroup: GPUBindGroup;
-    private readonly bboxBindGroup: GPUBindGroup;
     private readonly config: CameraConfig;
-    private readonly bbox: SceneBBox;
 
     /**
      * Creates the shader modules, render pipelines, camera and wireframe
@@ -55,28 +43,17 @@ export class DebugRenderPipeline {
      * @param format - The canvas texture format (e.g. `bgra8unorm`).
      * @param bbox - The scene bounding box drawn as a wireframe overlay.
      */
-    public constructor(
-        device: GPUDevice,
-        config: CameraConfig,
-        format: GPUTextureFormat,
-        bbox: SceneBBox,
-    ) {
+    public constructor(device: GPUDevice, config: CameraConfig, format: GPUTextureFormat) {
         this.device = device;
         this.config = config;
-        this.bbox = bbox;
 
         const shaderModule = device.createShaderModule({
             label: "stipple-debug-render-shader",
             code: DEBUG_RENDER_SHADER,
         });
 
-        const bboxModule = device.createShaderModule({
-            label: "stipple-debug-bbox-wireframe-shader",
-            code: BBOX_WIREFRAME_SHADER,
-        });
-
         this.pipeline = device.createRenderPipeline({
-            label: "stipple-debug-render-pipeline",
+            label: "debug-render-pipeline",
             layout: "auto",
             vertex: {
                 module: shaderModule,
@@ -92,32 +69,9 @@ export class DebugRenderPipeline {
             },
         });
 
-        this.bboxPipeline = device.createRenderPipeline({
-            label: "stipple-debug-bbox-wireframe-pipeline",
-            layout: "auto",
-            vertex: {
-                module: bboxModule,
-                entryPoint: "bbox_vs",
-            },
-            fragment: {
-                module: bboxModule,
-                entryPoint: "bbox_fs",
-                targets: [{ format }],
-            },
-            primitive: {
-                topology: "line-list",
-            },
-        });
-
         this.cameraBuffer = device.createBuffer({
             label: "stipple-debug-camera",
             size: CAMERA_BUFFER_BYTES,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        this.bboxBuffer = device.createBuffer({
-            label: "stipple-debug-bbox-wireframe",
-            size: BBOX_BUFFER_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -127,16 +81,12 @@ export class DebugRenderPipeline {
             layout,
             entries: [{ binding: 0, resource: { buffer: this.cameraBuffer } }],
         });
-
-        this.bboxBindGroup = device.createBindGroup({
-            label: "stipple-debug-bbox-wireframe-bind",
-            layout: this.bboxPipeline.getBindGroupLayout(0),
-            entries: [{ binding: 0, resource: { buffer: this.bboxBuffer } }],
-        });
     }
 
     /**
      * Writes the camera rays uniform for the current frame.
+     *
+     * TODO: Shouldn't this reuse parts of ./camera.js?
      *
      * Computes forward/right/up basis vectors and half-FOV extents from
      * the eye position, target point, up vector, FOV, and canvas aspect
@@ -226,47 +176,6 @@ export class DebugRenderPipeline {
     }
 
     /**
-     * Writes the bounding-box wireframe uniform for the current frame.
-     *
-     * Packs the view-projection matrix and the scene bounding box into
-     * three 16-byte aligned struct members:
-     *   `view_proj: mat4x4f`,
-     *   `bbox_min: vec3f + _pad0: f32`,
-     *   `bbox_max: vec3f + _pad1: f32`.
-     *
-     * @param eye - Camera eye position [x, y, z].
-     * @param target - Look-at target point [x, y, z].
-     * @param width - Canvas backing-store width.
-     * @param height - Canvas backing-store height.
-     */
-    private writeBBox(
-        eye: readonly [number, number, number],
-        target: readonly [number, number, number],
-        width: number,
-        height: number,
-    ): void {
-        const viewProj = viewProjection(
-            eye,
-            target,
-            this.config.up,
-            this.config.fov,
-            width / height,
-        );
-
-        const buffer = new ArrayBuffer(BBOX_BUFFER_BYTES);
-        const f32 = new Float32Array(buffer);
-        f32.set(viewProj, 0);
-        f32[16] = this.bbox.min[0];
-        f32[17] = this.bbox.min[1];
-        f32[18] = this.bbox.min[2];
-        f32[20] = this.bbox.max[0];
-        f32[21] = this.bbox.max[1];
-        f32[22] = this.bbox.max[2];
-
-        this.device.queue.writeBuffer(this.bboxBuffer, 0, buffer);
-    }
-
-    /**
      * Draws the SDF debug view (grayscale Lambert) as a full-screen pass,
      * followed by the scene bounding-box wireframe as a line-list overlay.
      *
@@ -288,12 +197,8 @@ export class DebugRenderPipeline {
         time: number,
     ): void {
         this.writeCamera(eye, target, canvas.width, canvas.height, time);
-        this.writeBBox(eye, target, canvas.width, canvas.height);
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, this.bindGroup);
         pass.draw(6);
-        pass.setPipeline(this.bboxPipeline);
-        pass.setBindGroup(0, this.bboxBindGroup);
-        pass.draw(24);
     }
 }

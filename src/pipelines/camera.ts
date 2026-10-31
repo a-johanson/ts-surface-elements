@@ -16,6 +16,13 @@ const NEAR = 0.1;
 /** Far plane for the perspective projection. */
 const FAR = 100;
 
+export interface CameraConfig {
+    /** Vertical field of view in radians. */
+    readonly fov: number;
+    /** World-space up direction. */
+    readonly up: readonly [number, number, number];
+}
+
 /**
  * Builds a column-major look-at view matrix.
  *
