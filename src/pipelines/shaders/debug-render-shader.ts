@@ -62,7 +62,6 @@ fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let t = rayMarch(camera.eye, rd, camera.time);
     // fwidth must be called from uniform control flow, so there is no early
     // return for misses; their pattern result is discarded by the final select.
-    let hit = t >= 0.0;
     let p = camera.eye + rd * max(t, 0.0);
     let n = calcNormal(p, camera.time);
     let light_dir = lightDir(camera.time);
@@ -86,21 +85,23 @@ fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     // derivative carries the local line frequency.
     let phase = dot(p, light_dir) / wavelength;
     let freq = max(fwidth(phase), 1e-6);
-    let spacing_px = 1.0 / freq;
+
+    if t < 0.0 {
+        return vec4f(1.0);
+    }
 
     // Distance to the nearest line (at cycle offset 0.5), linear in phase, so
     // multiplying by spacing_px yields the distance in screen-space pixels.
+    let spacing_px = 1.0 / freq;
     let dist_px = abs(fract(phase) - 0.5) * spacing_px;
 
     // Constant screen-space line thickness, anti-aliased over a one-pixel filter.
-    let coverage = 1.0 - smoothstep(HALF_LINE_WIDTH_PX - AA_FILTER_PX, HALF_LINE_WIDTH_PX + AA_FILTER_PX, dist_px);
-    let shade = mix(1.0, 0.0, coverage);
+    let shade = smoothstep(HALF_LINE_WIDTH_PX - AA_FILTER_PX, HALF_LINE_WIDTH_PX + AA_FILTER_PX, dist_px);
 
     // Regions whose implied line frequency is too high to resolve fall back to
     // solid black instead of aliasing into a Moire pattern.
     let moire_blend = smoothstep(MOIRE_SPACING_PX, MOIRE_SPACING_PX + 0.5, spacing_px);
     let pattern = mix(0.0, shade, moire_blend);
-    let color = select(vec3f(1.0), vec3f(pattern), hit);
-    return vec4f(color, 1.0);
+    return vec4f(vec3f(pattern), 1.0);
 }
 `;
