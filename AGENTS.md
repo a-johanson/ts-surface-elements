@@ -14,6 +14,7 @@ Use this section to orient before opening files. It describes module **responsib
 * `src/pipelines` owns the WebGPU pipelines.
   * `shaders/` owns all WGSL source, with one file per shader plus a shared common block.
   * `shaders/sdf-common.ts` owns the shared WGSL block interpolated into every other shader that touches the SDF: the `Point` and `ShadingSample` storage structs, the time-parameterized scene SDF `map(p, time)`, animated light direction `lightDir(time)`, gradient/normal helpers, a Newton-Raphson `projectToSurface` routine, sphere-tracing `rayMarch` and `rayClearance` helpers, a `softShadow` penumbra estimator, and the canonical splat radius plus tangent-frame construction shared by the shading pass (corner ray sampling) and the point renderer (quad corners).
+  * `shaders/noise.ts` owns the shared WGSL noise block: an integer hash, smooth 4D value noise, and a fractal sum of octaves, for shaders that need procedural variation.
   * `debug-render-pipeline.ts` owns the SDF visualization — a full-screen shader that ray-marches the scene to the canvas and shades it.
 * `public/index.html` is the browser shell. It defines the canvas, loads the stylesheet, and boots the bundled module.
 * `public/style.css` holds the base page and canvas presentation styles.

@@ -12,12 +12,15 @@
  * Lines are drawn black on white with analytic anti-aliasing at a constant
  * screen-space thickness; where the implied line frequency becomes too high
  * to resolve, the region falls back to solid black instead of forming a
- * Moire pattern.
+ * Moire pattern. Each ring is broken into dashes by thresholding a noise
+ * field in object space that is decorrelated between rings.
  */
+import { NOISE_COMMON } from "./noise.js";
 import { SDF_COMMON } from "./sdf-common.js";
 
 export const DEBUG_RENDER_SHADER = /* wgsl */ `
 ${SDF_COMMON}
+${NOISE_COMMON}
 
 struct CameraRays {
     eye: vec3f,
@@ -76,6 +79,8 @@ fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     const HALF_LINE_WIDTH_PX: f32 = 0.5;
     const MOIRE_SPACING_PX: f32 = 2.0;
     const AA_FILTER_PX: f32 = 0.5;
+    const BREAK_FREQUENCY: f32 = 4.0;
+    const BREAK_THRESHOLD: f32 = 0.39;
 
     let wavelength = mix(PATTERN_WAVELENGTH_MIN, PATTERN_WAVELENGTH_MAX, lum);
     // let theta = acos(clamp(ndotl, -1.0, 1.0));
@@ -85,6 +90,12 @@ fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     // derivative carries the local line frequency.
     let phase = dot(p, light_dir) / wavelength;
     let freq = max(fwidth(phase), 1e-6);
+
+    // Break noise: the ring index is an integer on the fourth axis, which
+    // selects an independent noise layer per ring. Computed before the early
+    // return because its screen-space derivative needs uniform control flow.
+    let break_noise = fbm4(vec4f(p * BREAK_FREQUENCY, floor(phase)));
+    let break_rate = max(fwidth(break_noise), 1e-5);
 
     if t < 0.0 {
         return vec4f(1.0);
@@ -96,7 +107,15 @@ fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let dist_px = abs(fract(phase) - 0.5) * spacing_px;
 
     // Constant screen-space line thickness, anti-aliased over a one-pixel filter.
-    let shade = smoothstep(HALF_LINE_WIDTH_PX - AA_FILTER_PX, HALF_LINE_WIDTH_PX + AA_FILTER_PX, dist_px);
+    let line_shade = smoothstep(HALF_LINE_WIDTH_PX - AA_FILTER_PX, HALF_LINE_WIDTH_PX + AA_FILTER_PX, dist_px);
+
+    // Break rings into dashes. Dividing the noise excess over the threshold by
+    // its screen-space rate yields the signed distance in pixels to the gap
+    // edge (positive inside a dash), anti-aliased over the same one-pixel
+    // filter as the line. Gaps show white.
+    let break_dist_px = (break_noise - BREAK_THRESHOLD) / break_rate;
+    let keep = smoothstep(-AA_FILTER_PX, AA_FILTER_PX, break_dist_px);
+    let shade = mix(1.0, line_shade, keep);
 
     // Regions whose implied line frequency is too high to resolve fall back to
     // solid black instead of aliasing into a Moire pattern.
