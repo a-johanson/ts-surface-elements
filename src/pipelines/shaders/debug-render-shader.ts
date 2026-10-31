@@ -77,7 +77,7 @@ fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     const PATTERN_WAVELENGTH_MAX: f32 = 0.15;
     // const PATTERN_POLE_BLEND: f32 = 1.0;
     const HALF_LINE_WIDTH_PX: f32 = 0.5;
-    const MOIRE_SPACING_PX: f32 = 2.0;
+    const MOIRE_SPACING_PX: f32 = 1.1;
     const AA_FILTER_PX: f32 = 0.5;
     const BREAK_FREQUENCY: f32 = 4.0;
     const BREAK_THRESHOLD: f32 = 0.39;
