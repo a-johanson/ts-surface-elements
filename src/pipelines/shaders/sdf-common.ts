@@ -230,6 +230,10 @@ fn sdSegment2D(p: vec2f, a: vec2f, b: vec2f) -> f32 {
     return length(ap - ab * t);
 }
 
+fn sdSphere(p: vec3f, r: f32) -> f32 {
+    return length(p) - r;
+}
+
 fn sdTube(
     p: vec3f,
     a: vec3f,
@@ -290,6 +294,7 @@ fn map(p_in: vec3f, time: f32) -> f32 {
         min_dist = smin(min_dist, sdTube(p, a, b, R_TUBE, r_b, 1.1 * R_TUBE, 0.15), 0.2);
     }
     return min_dist;
+    // return smin(sdSphere(p_in, 1.0), sdSphere(p_in - vec3f(0.8, 0.5, 0.0), 0.5 + 0.1 * (0.5 * sin(time))), 0.1);
 }
 
 fn sdfGradient(p: vec3f, time: f32) -> vec3f {

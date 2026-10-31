@@ -1,10 +1,13 @@
 /**
  * Debug render shader — ray-marches the time-animated SDF per fragment and
- * writes grayscale Lambert shading modulated by soft shadows
- * directly to the canvas color attachment.
+ * writes a 1D periodic pattern evaluated on the surface directly to the
+ * canvas color attachment.
  *
- * Background (ray miss) maps to black; hit fragments map to `[0, 1]` gray
- * via `1 - Lambert`, scaled by the soft-shadow penumbra factor.
+ * The signal's phase is the projection of world position onto the
+ * (animated) light direction, so its iso-lines are slices orthogonal to
+ * the light. Its wavelength is inversely related to the Lambert luminance
+ * modulated by the soft-shadow penumbra — darker fragments show denser
+ * rings.
  */
 import { SDF_COMMON } from "./sdf-common.js";
 
@@ -58,9 +61,21 @@ fn debug_fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let p = camera.eye + rd * t;
     let n = calcNormal(p, camera.time);
     let light_dir = lightDir(camera.time);
-    let lambert = max(dot(n, light_dir), 0.0);
+    let ndotl = dot(n, light_dir);
+    let lambert = max(ndotl, 0.0);
     let shadow = softShadow(p + n * SHADOW_BIAS, light_dir, camera.time);
     let lum = lambert * shadow;
-    return vec4f(lum, lum, lum, 1.0);
+
+    const PATTERN_WAVELENGTH_MIN: f32 = 0.05;
+    const PATTERN_WAVELENGTH_MAX: f32 = 0.2;
+    // const PATTERN_POLE_BLEND: f32 = 1.0;
+
+    let wavelength = mix(PATTERN_WAVELENGTH_MIN, PATTERN_WAVELENGTH_MAX, lum);
+    // let theta = acos(clamp(ndotl, -1.0, 1.0));
+    // let mask = smoothstep(-0.7, -1.0, ndotl);
+    // let phase = TAU * (dot(p, light_dir) + PATTERN_POLE_BLEND * mask * theta) / wavelength;
+    let phase = TAU * dot(p, light_dir) / wavelength;
+    let shade = 0.5 + 0.5 * sin(phase);
+    return vec4f(shade, shade, shade, 1.0);
 }
 `;
