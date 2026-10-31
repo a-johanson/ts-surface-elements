@@ -1,19 +1,14 @@
 /**
  * Debug render pipeline — ray-marches the SDF per fragment and writes
- * grayscale Lambert shading directly to the canvas color attachment, then
- * overlays a line-list wireframe of the scene bounding box on top.
+ * grayscale Lambert shading directly to the canvas color attachment.
  *
- * Replaces the former density-compute + blit pair. With surface-space
- * points nothing consumes a density texture, so the SDF is visualized by a
- * single full-screen fragment shader that ray-marches `map()` and shades
- * by Lambert. The pipeline owns its `CameraRays` uniform (eye + basis +
- * half-FOV extents + resolution), written each frame from the orbit
- * camera's eye position. The wireframe is a draw-order overlay (the pass
- * has no depth attachment), projected with the same camera parameters so
- * it aligns with the ray-marched view.
+ * The SDF is visualized by a single full-screen fragment shader that
+ * ray-marches `map()` and shades by Lambert. The pipeline owns its
+ * `CameraRays` uniform (eye + basis + half-FOV extents + resolution),
+ * written each frame from the orbit camera's eye position.
  */
 
-import type { CameraConfig } from "./camera.js";
+import { type CameraConfig, computeCameraRays } from "./camera.js";
 import { DEBUG_RENDER_SHADER } from "./shaders/debug-render-shader.js";
 
 /** Camera uniform buffer size in bytes (5 × 16-byte aligned members = 80). */
@@ -22,10 +17,9 @@ const CAMERA_BUFFER_BYTES = 80;
 /**
  * Manages the debug render pipeline and the `CameraRays` uniform.
  *
- * The pipelines are created once at construction time. Each frame, the
+ * The pipeline is created once at construction time. Each frame, the
  * caller invokes {@link render} from inside an active render pass; the
- * camera uniform is uploaded beforehand via {@link writeCamera} and the
- * wireframe uniform via {@link writeBBox}.
+ * camera uniform is uploaded beforehand via {@link writeCamera}.
  */
 export class DebugRenderPipeline {
     private readonly device: GPUDevice;
@@ -35,13 +29,12 @@ export class DebugRenderPipeline {
     private readonly config: CameraConfig;
 
     /**
-     * Creates the shader modules, render pipelines, camera and wireframe
-     * uniform buffers, and bind groups.
+     * Creates the shader module, render pipeline, camera uniform buffer,
+     * and bind group.
      *
      * @param device - The GPU device.
      * @param config - Static camera configuration (FOV, up).
      * @param format - The canvas texture format (e.g. `bgra8unorm`).
-     * @param bbox - The scene bounding box drawn as a wireframe overlay.
      */
     public constructor(device: GPUDevice, config: CameraConfig, format: GPUTextureFormat) {
         this.device = device;
@@ -86,11 +79,10 @@ export class DebugRenderPipeline {
     /**
      * Writes the camera rays uniform for the current frame.
      *
-     * TODO: Shouldn't this reuse parts of ./camera.js?
-     *
-     * Computes forward/right/up basis vectors and half-FOV extents from
-     * the eye position, target point, up vector, FOV, and canvas aspect
-     * ratio. Packs the result into five 16-byte aligned struct members:
+     * Derives the orthonormal basis and half-FOV extents via
+     * {@link computeCameraRays}, then packs the basis, the animation
+     * time, and the canvas resolution into five 16-byte aligned struct
+     * members:
      *   `eye: vec3f + half_width: f32`,
      *   `forward: vec3f + half_height: f32`,
      *   `right: vec3f + _pad0: f32`,
@@ -110,43 +102,13 @@ export class DebugRenderPipeline {
         height: number,
         time: number,
     ): void {
-        const { up, fov } = this.config;
-
-        let fx = target[0] - eye[0];
-        let fy = target[1] - eye[1];
-        let fz = target[2] - eye[2];
-        const fLen = Math.hypot(fx, fy, fz);
-        if (fLen === 0) {
-            fx = 0;
-            fy = 0;
-            fz = -1;
-        } else {
-            fx /= fLen;
-            fy /= fLen;
-            fz /= fLen;
-        }
-
-        let rx = fy * up[2] - fz * up[1];
-        let ry = fz * up[0] - fx * up[2];
-        let rz = fx * up[1] - fy * up[0];
-        const rLen = Math.hypot(rx, ry, rz);
-        if (rLen === 0) {
-            rx = 1;
-            ry = 0;
-            rz = 0;
-        } else {
-            rx /= rLen;
-            ry /= rLen;
-            rz /= rLen;
-        }
-
-        const ux = ry * fz - rz * fy;
-        const uy = rz * fx - rx * fz;
-        const uz = rx * fy - ry * fx;
-
-        const aspect = width / height;
-        const halfH = Math.tan(fov / 2);
-        const halfW = halfH * aspect;
+        const camera = computeCameraRays(
+            eye,
+            target,
+            this.config.up,
+            this.config.fov,
+            width / height,
+        );
 
         const buffer = new ArrayBuffer(CAMERA_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);
@@ -154,18 +116,18 @@ export class DebugRenderPipeline {
         f32[0] = eye[0];
         f32[1] = eye[1];
         f32[2] = eye[2];
-        f32[3] = halfW;
-        f32[4] = fx;
-        f32[5] = fy;
-        f32[6] = fz;
-        f32[7] = halfH;
-        f32[8] = rx;
-        f32[9] = ry;
-        f32[10] = rz;
+        f32[3] = camera.halfWidth;
+        f32[4] = camera.forward[0];
+        f32[5] = camera.forward[1];
+        f32[6] = camera.forward[2];
+        f32[7] = camera.halfHeight;
+        f32[8] = camera.right[0];
+        f32[9] = camera.right[1];
+        f32[10] = camera.right[2];
         f32[11] = 0;
-        f32[12] = ux;
-        f32[13] = uy;
-        f32[14] = uz;
+        f32[12] = camera.up[0];
+        f32[13] = camera.up[1];
+        f32[14] = camera.up[2];
         f32[15] = time;
         u32[16] = width;
         u32[17] = height;
@@ -176,8 +138,7 @@ export class DebugRenderPipeline {
     }
 
     /**
-     * Draws the SDF debug view (grayscale Lambert) as a full-screen pass,
-     * followed by the scene bounding-box wireframe as a line-list overlay.
+     * Draws the SDF debug view (grayscale Lambert) as a full-screen pass.
      *
      * Must be called *inside* an active `GPURenderPassEncoder`. Uploads
      * the camera uniform before drawing.
