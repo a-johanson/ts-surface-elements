@@ -13,7 +13,7 @@
  * it aligns with the ray-marched view.
  */
 
-import { viewProjection } from "./camera.js";
+import { cameraBasis, halfExtents, viewProjection } from "./camera.js";
 import type { CameraConfig } from "./point-render-pipeline.js";
 import { BBOX_WIREFRAME_SHADER, DEBUG_RENDER_SHADER } from "./shaders/index.js";
 import type { SceneBBox } from "./spatial-grid-pipeline.js";
@@ -162,41 +162,11 @@ export class DebugRenderPipeline {
     ): void {
         const { up, fov } = this.config;
 
-        let fx = target[0] - eye[0];
-        let fy = target[1] - eye[1];
-        let fz = target[2] - eye[2];
-        const fLen = Math.hypot(fx, fy, fz);
-        if (fLen === 0) {
-            fx = 0;
-            fy = 0;
-            fz = -1;
-        } else {
-            fx /= fLen;
-            fy /= fLen;
-            fz /= fLen;
-        }
-
-        let rx = fy * up[2] - fz * up[1];
-        let ry = fz * up[0] - fx * up[2];
-        let rz = fx * up[1] - fy * up[0];
-        const rLen = Math.hypot(rx, ry, rz);
-        if (rLen === 0) {
-            rx = 1;
-            ry = 0;
-            rz = 0;
-        } else {
-            rx /= rLen;
-            ry /= rLen;
-            rz /= rLen;
-        }
-
-        const ux = ry * fz - rz * fy;
-        const uy = rz * fx - rx * fz;
-        const uz = rx * fy - ry * fx;
-
-        const aspect = width / height;
-        const halfH = Math.tan(fov / 2);
-        const halfW = halfH * aspect;
+        const { forward, right, up: camUp } = cameraBasis(eye, target, up);
+        const { halfW, halfH } = halfExtents(fov, width / height);
+        const [fx, fy, fz] = forward;
+        const [rx, ry, rz] = right;
+        const [ux, uy, uz] = camUp;
 
         const buffer = new ArrayBuffer(CAMERA_BUFFER_BYTES);
         const f32 = new Float32Array(buffer);

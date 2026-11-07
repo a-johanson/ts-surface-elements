@@ -16,6 +16,80 @@ const NEAR = 0.1;
 /** Far plane for the perspective projection. */
 const FAR = 100;
 
+/** Orthonormal camera frame. */
+export interface CameraBasis {
+    /** Unit view direction, from the eye toward the target. */
+    forward: [number, number, number];
+    /** Unit vector pointing to the right of the view. */
+    right: [number, number, number];
+    /** Unit vector pointing up in the view, orthogonal to the others. */
+    up: [number, number, number];
+}
+
+/**
+ * Builds the orthonormal camera frame for a look-at configuration.
+ *
+ * Degenerate inputs (eye coinciding with the target, or view direction
+ * parallel to the world up) fall back to a forward of -Z and a right of +X
+ * respectively.
+ *
+ * @param eye - Camera eye position.
+ * @param target - Look-at target.
+ * @param up - World up direction.
+ * @returns The forward, right, and up unit vectors.
+ */
+export function cameraBasis(
+    eye: readonly [number, number, number],
+    target: readonly [number, number, number],
+    up: readonly [number, number, number],
+): CameraBasis {
+    let fx = target[0] - eye[0];
+    let fy = target[1] - eye[1];
+    let fz = target[2] - eye[2];
+    const fLen = Math.hypot(fx, fy, fz);
+    if (fLen === 0) {
+        fx = 0;
+        fy = 0;
+        fz = -1;
+    } else {
+        fx /= fLen;
+        fy /= fLen;
+        fz /= fLen;
+    }
+
+    let rx = fy * up[2] - fz * up[1];
+    let ry = fz * up[0] - fx * up[2];
+    let rz = fx * up[1] - fy * up[0];
+    const rLen = Math.hypot(rx, ry, rz);
+    if (rLen === 0) {
+        rx = 1;
+        ry = 0;
+        rz = 0;
+    } else {
+        rx /= rLen;
+        ry /= rLen;
+        rz /= rLen;
+    }
+
+    return {
+        forward: [fx, fy, fz],
+        right: [rx, ry, rz],
+        up: [ry * fz - rz * fy, rz * fx - rx * fz, rx * fy - ry * fx],
+    };
+}
+
+/**
+ * Computes the half-extents of the image plane at unit distance.
+ *
+ * @param fov - Vertical field of view in radians.
+ * @param aspect - Canvas width / height.
+ * @returns Half-width and half-height of the image plane.
+ */
+export function halfExtents(fov: number, aspect: number): { halfW: number; halfH: number } {
+    const halfH = Math.tan(fov / 2);
+    return { halfW: halfH * aspect, halfH };
+}
+
 /**
  * Builds a column-major look-at view matrix.
  *
@@ -29,25 +103,10 @@ function lookAt(
     target: readonly [number, number, number],
     up: readonly [number, number, number],
 ): Mat4 {
-    let fx = target[0] - eye[0];
-    let fy = target[1] - eye[1];
-    let fz = target[2] - eye[2];
-    const fLen = Math.hypot(fx, fy, fz) || 1;
-    fx /= fLen;
-    fy /= fLen;
-    fz /= fLen;
-
-    let rx = fy * up[2] - fz * up[1];
-    let ry = fz * up[0] - fx * up[2];
-    let rz = fx * up[1] - fy * up[0];
-    const rLen = Math.hypot(rx, ry, rz) || 1;
-    rx /= rLen;
-    ry /= rLen;
-    rz /= rLen;
-
-    const ux = ry * fz - rz * fy;
-    const uy = rz * fx - rx * fz;
-    const uz = rx * fy - ry * fx;
+    const basis = cameraBasis(eye, target, up);
+    const [fx, fy, fz] = basis.forward;
+    const [rx, ry, rz] = basis.right;
+    const [ux, uy, uz] = basis.up;
 
     return [
         rx,
@@ -77,9 +136,10 @@ function lookAt(
  * @returns Column-major projection matrix (16 floats).
  */
 function perspective(fov: number, aspect: number): Mat4 {
-    const f = 1 / Math.tan(fov / 2);
+    const { halfW, halfH } = halfExtents(fov, aspect);
+    const f = 1 / halfH;
     return [
-        f / aspect,
+        1 / halfW,
         0,
         0,
         0,
